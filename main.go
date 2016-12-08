@@ -1,6 +1,7 @@
 package bt
 
 import "bytes"
+import "time"
 import "encoding/json"
 import "fmt"
 import "os"
@@ -46,23 +47,6 @@ func init() {
 		panic(err)
 	}
 }
-
-// Stack looks like:
-// -----------------
-// goroutine 1 [running]:
-// github.com/backtrace-labs/backtrace-go.stack(0xc82000a301, 0x0, 0x0, 0x0)
-// 	/home/andy/dev/go/src/github.com/backtrace-labs/backtrace-go/main.go:14 +0x84
-// github.com/backtrace-labs/backtrace-go.SendReport(0x7f9afef53028, 0xc82000a360, 0x0)
-// 	/home/andy/dev/go/src/github.com/backtrace-labs/backtrace-go/main.go:7 +0x28
-// main.main()
-// 	/home/andy/dev/go/src/test/test.go:8 +0xea
-//
-// goroutine 5 [runnable]:
-// main.doSomething(0xc82001a0c0)
-// 	/home/andy/dev/go/src/test/test.go:11
-// created by main.main
-// 	/home/andy/dev/go/src/test/test.go:7 +0x52
-// -----------------
 
 type thread struct {
 	id     int
@@ -152,7 +136,7 @@ func SendReport(user_err error, extra_attributes map[string]string) {
 
 	report := map[string]interface{}{}
 	report["uuid"] = "TODO"
-	report["timestamp"] = "TODO"
+	report["timestamp"] = time.Now().Unix()
 	report["lang"] = "go"
 	report["langVersion"] = runtime.Version()
 	report["agent"] = "backtrace-go"
