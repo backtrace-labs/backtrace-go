@@ -1,15 +1,17 @@
 package bt
 
 import "bytes"
-import "time"
+import crypto_rand "crypto/rand"
 import "encoding/json"
 import "fmt"
+import "io/ioutil"
+import math_rand "math/rand"
 import "os"
 import "regexp"
 import "runtime"
 import "strconv"
 import "strings"
-import "io/ioutil"
+import "time"
 
 const VersionMajor = 0
 const VersionMinor = 0
@@ -28,9 +30,11 @@ type OptionsStruct struct {
 
 var Options OptionsStruct
 
+// TODO double check concurrency safety for all these variables
 var thread_regex *regexp.Regexp
 var fn_regex *regexp.Regexp
 var src_regex *regexp.Regexp
+var rng *math_rand.Rand
 
 func init() {
 	var err error
@@ -46,6 +50,25 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	var seed_bytes [8]byte
+	_, err = crypto_rand.Read(seed_bytes[:])
+	if err != nil {
+		panic(err)
+	}
+
+	seed :=
+		(int64(seed_bytes[0]) << 0) |
+			(int64(seed_bytes[1]) << 1) |
+			(int64(seed_bytes[2]) << 2) |
+			(int64(seed_bytes[3]) << 3) |
+			(int64(seed_bytes[4]) << 4) |
+			(int64(seed_bytes[5]) << 5) |
+			(int64(seed_bytes[6]) << 6) |
+			(int64(seed_bytes[7]) << 7)
+
+	rand_source := math_rand.NewSource(seed)
+	rng = math_rand.New(rand_source)
 }
 
 type thread struct {
@@ -135,7 +158,7 @@ func SendReport(user_err error, extra_attributes map[string]string) {
 	threads := map[string]interface{}{}
 
 	report := map[string]interface{}{}
-	report["uuid"] = "TODO"
+	report["uuid"] = createUuid()
 	report["timestamp"] = time.Now().Unix()
 	report["lang"] = "go"
 	report["langVersion"] = runtime.Version()
@@ -239,4 +262,15 @@ func collectSource(source_path string, source_path_to_id map[string]string, sour
 	source_code_json[new_id] = source_code_object
 
 	return new_id
+}
+
+func createUuid() string {
+	var uuid_bytes [16]byte
+	_, _ = rng.Read(uuid_bytes[:]) // This function is documented to never fail.
+	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3],
+		uuid_bytes[4], uuid_bytes[5],
+		uuid_bytes[6], uuid_bytes[7],
+		uuid_bytes[8], uuid_bytes[9],
+		uuid_bytes[10], uuid_bytes[11], uuid_bytes[12], uuid_bytes[13], uuid_bytes[14], uuid_bytes[15])
 }
