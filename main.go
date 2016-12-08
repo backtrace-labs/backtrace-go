@@ -26,6 +26,7 @@ type OptionsStruct struct {
 	CaptureAllGoroutines bool
 	TabWidth             int
 	ContextLineCount     int
+	Attributes           map[string]string
 }
 
 var Options OptionsStruct
@@ -146,6 +147,11 @@ func SendReport(user_err error, extra_attributes map[string]string) {
 	source_code := map[string]interface{}{}
 
 	attributes := map[string]interface{}{}
+
+	for k, v := range Options.Attributes {
+		attributes[k] = v
+	}
+
 	attributes["error.message"] = user_err.Error()
 
 	for k, v := range extra_attributes {
