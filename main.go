@@ -26,16 +26,24 @@ type OptionsStruct struct {
 	CaptureAllGoroutines bool
 	TabWidth             int
 	ContextLineCount     int
-	Attributes           map[string]string
+	Attributes           map[string]interface{}
 }
 
 var Options OptionsStruct
 
-// TODO double check concurrency safety for all these variables
 var thread_regex *regexp.Regexp
 var fn_regex *regexp.Regexp
 var src_regex *regexp.Regexp
 var rng *math_rand.Rand
+
+type reportPayload struct {
+	stack []byte
+	attributes map[string]interface{}
+	annotations map[string]interface{}
+	timestamp int64
+}
+var queue = make(chan interface{}, 50)
+var done_chan = make(chan bool)
 
 func init() {
 	var err error
@@ -70,6 +78,8 @@ func init() {
 
 	rand_source := math_rand.NewSource(seed)
 	rng = math_rand.New(rand_source)
+
+	go sendWorkerMain()
 }
 
 type thread struct {
@@ -136,15 +146,21 @@ func getThread(lines [][]byte, index *int) *thread {
 	return &thread_item
 }
 
-func SendReport(user_err error, extra_attributes map[string]string) {
+func SendReport(object interface{}, extra_attributes map[string]interface{}) {
+	switch value := object.(type) {
+	case nil:
+		return
+	case error:
+		SendReportString(value.Error(), extra_attributes)
+	default:
+		SendReportString(fmt.Sprint(value), extra_attributes)
+	}
+}
+
+func SendReportString(msg string, extra_attributes map[string]interface{}) {
 	checkOptions()
 
-	stack := stack(Options.CaptureAllGoroutines)
-	fmt.Printf("stack: %s\n", stack)
-	lines := bytes.Split(stack, []byte{'\n'})
-
-	source_path_to_id := map[string]string{}
-	source_code := map[string]interface{}{}
+	timestamp := time.Now().Unix()
 
 	attributes := map[string]interface{}{}
 
@@ -152,7 +168,7 @@ func SendReport(user_err error, extra_attributes map[string]string) {
 		attributes[k] = v
 	}
 
-	attributes["error.message"] = user_err.Error()
+	attributes["error.message"] = msg
 
 	for k, v := range extra_attributes {
 		attributes[k] = v
@@ -161,57 +177,19 @@ func SendReport(user_err error, extra_attributes map[string]string) {
 	annotations := map[string]interface{}{}
 	annotations["Environment Variables"] = getEnvVars()
 
-	threads := map[string]interface{}{}
-
-	report := map[string]interface{}{}
-	report["uuid"] = createUuid()
-	report["timestamp"] = time.Now().Unix()
-	report["lang"] = "go"
-	report["langVersion"] = runtime.Version()
-	report["agent"] = "backtrace-go"
-	report["agentVersion"] = Version
-	report["attributes"] = attributes
-	report["threads"] = threads
-	report["sourceCode"] = source_code
-	report["annotations"] = annotations
-
-	next_source_id := 0
-	line_index := 0
-	first := true
-	for line_index < len(lines) {
-		thread_item := getThread(lines, &line_index)
-		if thread_item == nil {
-			break
-		}
-		thread_id := strconv.Itoa(thread_item.id)
-		if first {
-			first = false
-			report["mainThread"] = thread_id
-		}
-		stack_list := []interface{}{}
-		for _, frame_item := range thread_item.frames {
-			source_code_id := collectSource(frame_item.source_path, source_path_to_id, source_code, &next_source_id)
-
-			stack_frame := map[string]interface{}{}
-			stack_frame["funcName"] = frame_item.fn_name
-			stack_frame["library"] = frame_item.library
-			stack_frame["sourceCode"] = source_code_id
-			stack_frame["line"] = frame_item.line
-			stack_list = append(stack_list, stack_frame)
-		}
-
-		thread_map := map[string]interface{}{}
-		threads[thread_id] = thread_map
-		thread_map["name"] = thread_item.name
-		thread_map["stack"] = stack_list
+	payload := &reportPayload {
+		stack: stack(Options.CaptureAllGoroutines),
+		attributes: attributes,
+		annotations: annotations,
+		timestamp: timestamp,
 	}
+	queue <- payload
+}
 
-	var err error
-	payload, err := json.MarshalIndent(report, "", "  ")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(string(payload))
+func SendReportPanic(user_func func(), extra_attributes map[string]interface{}) {
+	checkOptions()
+	defer SendReport(recover(), extra_attributes)
+	user_func()
 }
 
 func stack(all bool) []byte {
@@ -279,4 +257,83 @@ func createUuid() string {
 		uuid_bytes[6], uuid_bytes[7],
 		uuid_bytes[8], uuid_bytes[9],
 		uuid_bytes[10], uuid_bytes[11], uuid_bytes[12], uuid_bytes[13], uuid_bytes[14], uuid_bytes[15])
+}
+
+func sendWorkerMain() {
+	for {
+		queue_item := <-queue
+		switch value := queue_item.(type) {
+		case nil:
+			done_chan <- true
+			return
+		case *reportPayload:
+			processAndSend(value)
+		default:
+			panic(fmt.Sprintf("invalid queue item"))
+		}
+	}
+}
+
+func FinishSendingReports() {
+	queue <- nil
+	<-done_chan
+}
+
+func processAndSend(payload *reportPayload) {
+	lines := bytes.Split(payload.stack, []byte{'\n'})
+
+	source_path_to_id := map[string]string{}
+	source_code := map[string]interface{}{}
+
+	threads := map[string]interface{}{}
+
+	report := map[string]interface{}{}
+	report["uuid"] = createUuid()
+	report["timestamp"] = payload.timestamp
+	report["lang"] = "go"
+	report["langVersion"] = runtime.Version()
+	report["agent"] = "backtrace-go"
+	report["agentVersion"] = Version
+	report["attributes"] = payload.attributes
+	report["annotations"] = payload.annotations
+	report["threads"] = threads
+	report["sourceCode"] = source_code
+
+	next_source_id := 0
+	line_index := 0
+	first := true
+	for line_index < len(lines) {
+		thread_item := getThread(lines, &line_index)
+		if thread_item == nil {
+			break
+		}
+		thread_id := strconv.Itoa(thread_item.id)
+		if first {
+			first = false
+			report["mainThread"] = thread_id
+		}
+		stack_list := []interface{}{}
+		for _, frame_item := range thread_item.frames {
+			source_code_id := collectSource(frame_item.source_path, source_path_to_id, source_code, &next_source_id)
+
+			stack_frame := map[string]interface{}{}
+			stack_frame["funcName"] = frame_item.fn_name
+			stack_frame["library"] = frame_item.library
+			stack_frame["sourceCode"] = source_code_id
+			stack_frame["line"] = frame_item.line
+			stack_list = append(stack_list, stack_frame)
+		}
+
+		thread_map := map[string]interface{}{}
+		threads[thread_id] = thread_map
+		thread_map["name"] = thread_item.name
+		thread_map["stack"] = stack_list
+	}
+
+	var err error
+	json_bytes, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(json_bytes))
 }

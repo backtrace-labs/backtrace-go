@@ -9,6 +9,7 @@ func TestEverything(t *testing.T) {
 	Options.CaptureAllGoroutines = true
 	go doSomething(make(chan int))
 	SendReport(errors.New("it broke"), nil)
+	FinishSendingReports()
 }
 
 func doSomething(ch chan int) {
