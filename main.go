@@ -1,6 +1,8 @@
 package bt
 
 import "bytes"
+import "net/url"
+import "net/http"
 import crypto_rand "crypto/rand"
 import "encoding/json"
 import "fmt"
@@ -27,6 +29,7 @@ type OptionsStruct struct {
 	TabWidth             int
 	ContextLineCount     int
 	Attributes           map[string]interface{}
+	DebugBacktrace       bool
 }
 
 var Options OptionsStruct
@@ -37,11 +40,13 @@ var src_regex *regexp.Regexp
 var rng *math_rand.Rand
 
 type reportPayload struct {
-	stack []byte
-	attributes map[string]interface{}
+	stack       []byte
+	attributes  map[string]interface{}
 	annotations map[string]interface{}
-	timestamp int64
+	timestamp   int64
+	classifier   string
 }
+
 var queue = make(chan interface{}, 50)
 var done_chan = make(chan bool)
 
@@ -151,13 +156,13 @@ func SendReport(object interface{}, extra_attributes map[string]interface{}) {
 	case nil:
 		return
 	case error:
-		SendReportString(value.Error(), extra_attributes)
+		sendReportString(value.Error(), "error", extra_attributes)
 	default:
-		SendReportString(fmt.Sprint(value), extra_attributes)
+		sendReportString(fmt.Sprint(value), "message", extra_attributes)
 	}
 }
 
-func SendReportString(msg string, extra_attributes map[string]interface{}) {
+func sendReportString(msg string, classifier string, extra_attributes map[string]interface{}) {
 	checkOptions()
 
 	timestamp := time.Now().Unix()
@@ -177,11 +182,12 @@ func SendReportString(msg string, extra_attributes map[string]interface{}) {
 	annotations := map[string]interface{}{}
 	annotations["Environment Variables"] = getEnvVars()
 
-	payload := &reportPayload {
-		stack: stack(Options.CaptureAllGoroutines),
-		attributes: attributes,
+	payload := &reportPayload{
+		stack:       stack(Options.CaptureAllGoroutines),
+		attributes:  attributes,
 		annotations: annotations,
-		timestamp: timestamp,
+		timestamp:   timestamp,
+		classifier:   classifier,
 	}
 	queue <- payload
 }
@@ -298,6 +304,7 @@ func processAndSend(payload *reportPayload) {
 	report["annotations"] = payload.annotations
 	report["threads"] = threads
 	report["sourceCode"] = source_code
+	report["classifiers"] = []string{payload.classifier}
 
 	next_source_id := 0
 	line_index := 0
@@ -330,10 +337,38 @@ func processAndSend(payload *reportPayload) {
 		thread_map["stack"] = stack_list
 	}
 
-	var err error
-	json_bytes, err := json.MarshalIndent(report, "", "  ")
-	if err != nil {
-		panic(err)
+	full_url := fmt.Sprintf("%s/post?format=json&token=%s", Options.Endpoint, url.QueryEscape(Options.Token))
+	if Options.DebugBacktrace {
+		fmt.Fprintf(os.Stderr, "POST %s\n", full_url)
+		var err error
+		json_bytes, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			panic(err)
+		}
+		fmt.Fprintf(os.Stderr, "%s\n", string(json_bytes))
 	}
-	fmt.Println(string(json_bytes))
+
+	var err error
+	json_bytes, err := json.Marshal(report)
+	if err != nil {
+		if Options.DebugBacktrace {
+			panic(err)
+		}
+		return
+	}
+	resp, err := http.Post(full_url, "application/json", bytes.NewReader(json_bytes))
+	if err != nil {
+		if Options.DebugBacktrace {
+			panic(err)
+		}
+		return
+	}
+	defer resp.Body.Close()
+	_, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		if Options.DebugBacktrace {
+			panic(err)
+		}
+		return
+	}
 }
