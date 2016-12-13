@@ -10,8 +10,8 @@ import "encoding/json"
 
 func TestEverything(t *testing.T) {
 	var err error
-	addr := net.TCPAddr {
-		IP: []byte{127,0,0,1},
+	addr := net.TCPAddr{
+		IP: []byte{127, 0, 0, 1},
 	}
 	listener, err := net.ListenTCP("tcp4", &addr)
 	if err != nil {
@@ -33,7 +33,7 @@ func TestEverything(t *testing.T) {
 	err = http.Serve(listener, handler)
 }
 
-type myHandler struct{
+type myHandler struct {
 	listener *net.TCPListener
 }
 
@@ -59,7 +59,7 @@ func (h myHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "OK\n");
+	fmt.Fprintf(w, "OK\n")
 }
 
 func doSomething(ch chan int) {

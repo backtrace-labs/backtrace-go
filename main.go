@@ -44,7 +44,7 @@ type reportPayload struct {
 	attributes  map[string]interface{}
 	annotations map[string]interface{}
 	timestamp   int64
-	classifier   string
+	classifier  string
 }
 
 var queue = make(chan interface{}, 50)
@@ -187,7 +187,7 @@ func sendReportString(msg string, classifier string, extra_attributes map[string
 		attributes:  attributes,
 		annotations: annotations,
 		timestamp:   timestamp,
-		classifier:   classifier,
+		classifier:  classifier,
 	}
 	queue <- payload
 }
