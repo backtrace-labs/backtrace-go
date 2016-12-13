@@ -151,7 +151,7 @@ func getThread(lines [][]byte, index *int) *thread {
 	return &thread_item
 }
 
-func SendReport(object interface{}, extra_attributes map[string]interface{}) {
+func Report(object interface{}, extra_attributes map[string]interface{}) {
 	switch value := object.(type) {
 	case nil:
 		return
@@ -163,7 +163,7 @@ func SendReport(object interface{}, extra_attributes map[string]interface{}) {
 }
 
 func sendReportString(msg string, classifier string, extra_attributes map[string]interface{}) {
-	checkOptions()
+	if !checkOptions() {return}
 
 	timestamp := time.Now().Unix()
 
@@ -192,10 +192,23 @@ func sendReportString(msg string, classifier string, extra_attributes map[string
 	queue <- payload
 }
 
-func SendReportPanic(user_func func(), extra_attributes map[string]interface{}) {
-	checkOptions()
-	defer SendReport(recover(), extra_attributes)
-	user_func()
+func ReportPanic(extra_attributes map[string]interface{}) {
+	if !checkOptions() { return }
+
+	err := recover()
+	if err == nil {
+		return
+	}
+
+	Report(err, extra_attributes)
+	FinishSendingReports()
+	panic(err)
+}
+
+func ReportAndRecoverPanic(extra_attributes map[string]interface{}) {
+	if !checkOptions() { return }
+
+	Report(recover(), extra_attributes)
 }
 
 func stack(all bool) []byte {
@@ -219,13 +232,20 @@ func getEnvVars() map[string]string {
 	return result
 }
 
-func checkOptions() {
+func checkOptions() bool {
 	if len(Options.Endpoint) == 0 {
+		if !Options.DebugBacktrace {
+			return false
+		}
 		panic("must set bt.Options.Endpoint")
 	}
 	if len(Options.Token) == 0 {
+		if !Options.DebugBacktrace {
+			return false
+		}
 		panic("must set bt.Options.Token")
 	}
+	return true
 }
 
 func collectSource(source_path string, source_path_to_id map[string]string, source_code_json map[string]interface{}, next_source_id *int) string {

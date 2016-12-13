@@ -68,6 +68,6 @@ func doSomething(ch chan int) {
 
 func causeErrorReport() {
 	go doSomething(make(chan int))
-	SendReport(errors.New("it broke"), nil)
+	Report(errors.New("it broke"), nil)
 	FinishSendingReports()
 }
