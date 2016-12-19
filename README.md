@@ -47,7 +47,35 @@ func init() {
 func foo() {
 	response, err := http.Get("https://doesnotexistexample.com")
     if err != nil {
-        bt.Report(err)
+        bt.Report(err, nil)
     }
 }
 ```
+
+## Documentation
+
+### bt.Report(msg interface{}, attributes map[string]string)
+
+msg can be an `error` or something that can be converted to a `string`.
+`attributes` are added to the report.
+
+### bt.ReportPanic(attributes map[string]string)
+
+Sends an error report in the event of a panic.
+
+```go
+defer bt.ReportPanic(nil)
+somethingThatMightPanic()
+```
+
+### bt.ReportAndRecoverPanic(attributes map[string]string)
+
+This is the same as `bt.ReportPanic` but it recovers from the
+panic and the goroutine lives on.
+
+### bt.FinishSendingReports()
+
+backtrace-go sends reports in a goroutine to avoid blocking.
+When your application shuts down it will abort any ongoing sending of
+reports. Call this function to block until all queued reports are done
+sending.
