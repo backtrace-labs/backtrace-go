@@ -79,3 +79,20 @@ backtrace-go sends reports in a goroutine to avoid blocking.
 When your application shuts down it will abort any ongoing sending of
 reports. Call this function to block until all queued reports are done
 sending.
+
+# bcd
+
+Package provides integration with out of process tracers. Using the provided
+Tracer interface, applications may invoke tracer execution on demand. Panic and
+signal handling integrations are provided.
+
+The Tracer interface is generic and will support any out of process tracer
+implementing it. A default Tracer implementation, which uses the Backtrace I/O
+platform, is provided.
+
+## Usage
+
+See the [godoc page](https://godoc.org/github.com/backtrace-labs/backtrace-go) for
+current documentation;
+see [this](https://github.com/backtrace-labs/backtrace-go/blob/master/examples/main.go)
+for an example application.
