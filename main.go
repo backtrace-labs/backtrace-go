@@ -24,6 +24,8 @@ var Version = fmt.Sprintf("%d.%d.%d", VersionMajor, VersionMinor, VersionPatch)
 type OptionsStruct struct {
 	Endpoint string
 	Token    string
+	// SendEnvVars gathers and sends all environment variables with every report if true. Default false.
+	SendEnvVars bool
 
 	CaptureAllGoroutines bool
 	TabWidth             int
@@ -163,7 +165,9 @@ func Report(object interface{}, extra_attributes map[string]interface{}) {
 }
 
 func sendReportString(msg string, classifier string, extra_attributes map[string]interface{}) {
-	if !checkOptions() {return}
+	if !checkOptions() {
+		return
+	}
 
 	timestamp := time.Now().Unix()
 
@@ -180,7 +184,9 @@ func sendReportString(msg string, classifier string, extra_attributes map[string
 	}
 
 	annotations := map[string]interface{}{}
-	annotations["Environment Variables"] = getEnvVars()
+	if Options.SendEnvVars {
+		annotations["Environment Variables"] = getEnvVars()
+	}
 
 	payload := &reportPayload{
 		stack:       stack(Options.CaptureAllGoroutines),
@@ -193,7 +199,9 @@ func sendReportString(msg string, classifier string, extra_attributes map[string
 }
 
 func ReportPanic(extra_attributes map[string]interface{}) {
-	if !checkOptions() { return }
+	if !checkOptions() {
+		return
+	}
 
 	err := recover()
 	if err == nil {
@@ -206,7 +214,9 @@ func ReportPanic(extra_attributes map[string]interface{}) {
 }
 
 func ReportAndRecoverPanic(extra_attributes map[string]interface{}) {
-	if !checkOptions() { return }
+	if !checkOptions() {
+		return
+	}
 
 	Report(recover(), extra_attributes)
 }
