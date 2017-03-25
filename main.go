@@ -155,6 +155,12 @@ func getThread(lines [][]byte, index *int) *thread {
 }
 
 func Report(object interface{}, extra_attributes map[string]interface{}) {
+	if extra_attributes == nil {
+		extra_attributes = map[string]interface{}{}
+	}
+	if extra_attributes["report_type"] == nil {
+		extra_attributes["report_type"] = "error"
+	}
 	switch value := object.(type) {
 	case nil:
 		return
@@ -209,6 +215,11 @@ func ReportPanic(extra_attributes map[string]interface{}) {
 		return
 	}
 
+	if extra_attributes == nil {
+		extra_attributes = map[string]interface{}{}
+	}
+	extra_attributes["report_type"] = "panic"
+
 	Report(err, extra_attributes)
 	finishSendingReports(false)
 	panic(err)
@@ -218,6 +229,11 @@ func ReportAndRecoverPanic(extra_attributes map[string]interface{}) {
 	if !checkOptions() {
 		return
 	}
+
+	if extra_attributes == nil {
+		extra_attributes = map[string]interface{}{}
+	}
+	extra_attributes["report_type"] = "panic"
 
 	Report(recover(), extra_attributes)
 }
