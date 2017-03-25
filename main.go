@@ -50,7 +50,8 @@ type reportPayload struct {
 }
 
 var queue = make(chan interface{}, 50)
-var done_chan = make(chan bool)
+var done_chan = make(chan struct{})
+var block_chan = make(chan struct{})
 
 func init() {
 	var err error
@@ -209,7 +210,7 @@ func ReportPanic(extra_attributes map[string]interface{}) {
 	}
 
 	Report(err, extra_attributes)
-	FinishSendingReports()
+	finishSendingReports(false)
 	panic(err)
 }
 
@@ -297,21 +298,33 @@ func createUuid() string {
 
 func sendWorkerMain() {
 	for {
-		queue_item := <-queue
-		switch value := queue_item.(type) {
-		case nil:
-			done_chan <- true
-			return
-		case *reportPayload:
-			processAndSend(value)
-		default:
-			panic(fmt.Sprintf("invalid queue item"))
+		select {
+		case queue_item := <-queue:
+			switch value := queue_item.(type) {
+			case nil:
+				done_chan <- struct{}{}
+				return
+			case *reportPayload:
+				processAndSend(value)
+			default:
+				panic(fmt.Sprintf("invalid queue item"))
+			}
+		case <-block_chan:
+			done_chan <- struct{}{}
 		}
+
 	}
 }
 
 func FinishSendingReports() {
-	queue <- nil
+	finishSendingReports(true)
+}
+func finishSendingReports(kill bool) {
+	if kill {
+		queue <- nil
+	} else {
+		block_chan <- struct{}{}
+	}
 	<-done_chan
 }
 

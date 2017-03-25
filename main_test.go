@@ -1,14 +1,17 @@
 package bt
 
-import "fmt"
-import "testing"
-import "errors"
-import "net"
-import "net/http"
-import "io/ioutil"
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"os"
+	"testing"
+)
 
-func TestEverything(t *testing.T) {
+func setupServer() {
 	var err error
 	addr := net.TCPAddr{
 		IP: []byte{127, 0, 0, 1},
@@ -25,45 +28,37 @@ func TestEverything(t *testing.T) {
 	//Options.DebugBacktrace = true
 	Options.ContextLineCount = 2
 
-	go causeErrorReport()
-
-	handler := myHandler{
-		listener: listener,
-	}
-	err = http.Serve(listener, handler)
-}
-
-func TestPanic(t *testing.T) {
-	var err error
-	addr := net.TCPAddr{
-		IP: []byte{127, 0, 0, 1},
-	}
-	listener, err := net.ListenTCP("tcp4", &addr)
-	if err != nil {
-		panic(err)
-	}
 	go func() {
 		handler := myHandler{
 			listener: listener,
 		}
 		err = http.Serve(listener, handler)
 	}()
+}
 
-	port := listener.Addr().(*net.TCPAddr).Port
-	Options.Endpoint = fmt.Sprintf("http://127.0.0.1:%d", port)
-	Options.Token = "fake token"
-	Options.CaptureAllGoroutines = true
-	//Options.DebugBacktrace = true
-	Options.ContextLineCount = 2
+func TestMain(m *testing.M) {
+	setupServer()
+	os.Exit(m.Run())
+}
+
+func TestEverything(t *testing.T) {
+	causeErrorReport()
+}
+
+func TestPanic(t *testing.T) {
 	count := 0
 	for i := 0; i < 5; i++ {
-		defer func() {
-			recover()
-			count++
+		func() {
+			defer func() {
+				recover()
+				count++
+			}()
+			func() {
+				defer ReportPanic(nil)
+				// fire off a panic. this should happen 5 times
+				panic("it broke")
+			}()
 		}()
-		defer ReportPanic(nil)
-		// fire off a panic. this should happen 5 times
-		panic("boom")
 	}
 	if count != 5 {
 		// really this doesn't do much, since it won't be hit if the code above deadlocks
@@ -107,5 +102,5 @@ func doSomething(ch chan int) {
 func causeErrorReport() {
 	go doSomething(make(chan int))
 	Report(errors.New("it broke"), nil)
-	FinishSendingReports()
+	finishSendingReports(false)
 }
