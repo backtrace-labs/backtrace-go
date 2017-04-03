@@ -39,7 +39,7 @@ non-fatal error conditions.
 import (
     "http"
 
-    "bt"
+    "github.com/backtrace-labs/backtrace-go"
 )
 
 func init() {
