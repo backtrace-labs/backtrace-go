@@ -35,9 +35,12 @@ The recommended way to capture error reports in a Go application is to use
 coresnap to handle panics and crashes, and to use backtrace-go to report
 non-fatal error conditions.
 
-```
-import "bt"
-import "http"
+```go
+import (
+    "http"
+
+    "bt"
+)
 
 func init() {
     bt.Options.Endpoint = "https://console.backtrace.io"
@@ -45,7 +48,7 @@ func init() {
 }
 
 func foo() {
-	response, err := http.Get("https://doesnotexistexample.com")
+    response, err := http.Get("https://doesnotexistexample.com")
     if err != nil {
         bt.Report(err, nil)
     }
