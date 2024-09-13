@@ -8,9 +8,10 @@ import (
 )
 
 var (
-	threadRegex = regexp.MustCompile(`^(.*):$`)
-	fnRegex     = regexp.MustCompile(`^(created by )?(.*)\.([^(]+)`)
-	srcRegex    = regexp.MustCompile(`^\s*(.*):(\d+)`)
+	threadRegex      = regexp.MustCompile(`^(.*):$`)
+	fnRegex          = regexp.MustCompile(`^(.*)\.([^(]+)`)
+	createdByFnRegex = regexp.MustCompile(`^created by (.*)\.([^ ]+) in goroutine [0-9]+$`)
+	srcRegex         = regexp.MustCompile(`^\s*(.*):(\d+)`)
 )
 
 type thread struct {
@@ -119,12 +120,17 @@ func getThread(lines [][]byte, index *int) *thread {
 		}
 
 		fnNameMatches := fnRegex.FindSubmatch(fnLine)
+		createdByFnNameMatches := createdByFnRegex.FindSubmatch(fnLine)
 		sourcePathMatches := srcRegex.FindSubmatch(srcLine)
 
 		newFrame := frame{}
-		if fnNameMatches != nil {
-			newFrame.library = string(fnNameMatches[2])
-			newFrame.fnName = string(fnNameMatches[3])
+		if createdByFnNameMatches != nil {
+			newFrame.library = string(createdByFnNameMatches[1])
+			newFrame.fnName = string(createdByFnNameMatches[2])
+
+		} else if fnNameMatches != nil {
+			newFrame.library = string(fnNameMatches[1])
+			newFrame.fnName = string(fnNameMatches[2])
 		}
 		if sourcePathMatches != nil {
 			newFrame.sourcePath = string(sourcePathMatches[1])
