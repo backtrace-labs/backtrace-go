@@ -2,15 +2,13 @@ package bt
 
 import (
 	"bytes"
-	"net/http"
-	"net/url"
-
-	crypto_rand "crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-
-	math_rand "math/rand"
+	mathrand "math/rand"
+	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -38,7 +36,7 @@ type OptionsStruct struct {
 
 var Options OptionsStruct
 
-var rng *math_rand.Rand
+var rng *mathrand.Rand
 
 type reportPayload struct {
 	stack       []byte
@@ -56,7 +54,7 @@ func init() {
 	var err error
 
 	var seed_bytes [8]byte
-	_, err = crypto_rand.Read(seed_bytes[:])
+	_, err = cryptorand.Read(seed_bytes[:])
 	if err != nil {
 		panic(err)
 	}
@@ -71,8 +69,8 @@ func init() {
 			(int64(seed_bytes[6]) << 6) |
 			(int64(seed_bytes[7]) << 7)
 
-	rand_source := math_rand.NewSource(seed)
-	rng = math_rand.New(rand_source)
+	rand_source := mathrand.NewSource(seed)
+	rng = mathrand.New(rand_source)
 
 	go sendWorkerMain()
 }
