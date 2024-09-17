@@ -2,7 +2,7 @@ package bt
 
 import (
 	"bytes"
-	"io/ioutil"
+	"os"
 	"regexp"
 	"strconv"
 )
@@ -81,7 +81,7 @@ func collectSource(sourcePath string, sourcePathToID map[string]string, sourceCo
 
 	sourceCodeObject := map[string]interface{}{}
 
-	bytes, err := ioutil.ReadFile(sourcePath)
+	bytes, err := os.ReadFile(sourcePath)
 	if err == nil {
 		sourceCodeObject["text"] = string(bytes)
 		sourceCodeObject["startLine"] = 1

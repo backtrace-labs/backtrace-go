@@ -271,7 +271,7 @@ func (s *signalError) Error() string {
 // be resent to the default Go handler for that signal.
 func Register(t TracerSig) {
 	ss := t.Sigset()
-	if ss == nil || len(ss) == 0 {
+	if ss == nil {
 		t.Logf(LogError, "Failed to register signal handler: empty "+
 			"sigset\n")
 		return
@@ -297,7 +297,7 @@ func Register(t TracerSig) {
 		for s := range c {
 			t.Logf(LogDebug, "Received %v; executing tracer\n", s)
 
-			Trace(t, &signalError{s}, nil)
+			_ = Trace(t, &signalError{s}, nil)
 
 			if !rs {
 				continue
@@ -314,13 +314,11 @@ func Register(t TracerSig) {
 				return
 			}
 
-			p.Signal(s)
+			_ = p.Signal(s)
 		}
 
 		t.Logf(LogDebug, "Signal channel closed; exiting goroutine\n")
 	}(t)
-
-	return
 }
 
 // Stops the specified TracerSig from handling any signals it was previously
@@ -522,7 +520,7 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 		return
 	}
 
-	if t.PutOnTrace() == false {
+	if !t.PutOnTrace() {
 		t.Logf(LogDebug, "Trace request complete\n")
 
 		return
@@ -557,7 +555,7 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 				defer traceOptions.SpawnedGs.Done()
 			}
 
-			putFn()
+			_ = putFn()
 		}()
 	}
 
@@ -598,7 +596,7 @@ func Recover(t Tracer, repanic bool, options *TraceOptions) {
 			err = &panicError{r}
 		}
 
-		Trace(t, err, options)
+		_ = Trace(t, err, options)
 
 		if repanic {
 			panic(r)

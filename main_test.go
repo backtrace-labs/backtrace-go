@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -50,7 +50,7 @@ func TestPanic(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		func() {
 			defer func() {
-				recover()
+				_ = recover()
 				count++
 			}()
 			func() {
@@ -74,7 +74,7 @@ func (h myHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.listener.Close()
 
 	var err error
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		panic(err)
 	}
@@ -96,7 +96,7 @@ func (h myHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func doSomething(ch chan int) {
-	_ = <-ch
+	<-ch
 }
 
 func causeErrorReport() {
