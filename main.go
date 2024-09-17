@@ -242,7 +242,6 @@ func finishSendingReports(kill bool) {
 }
 
 func processAndSend(payload *reportPayload) {
-	var err error
 	threads, mainThread, sourceCode := ParseThreadsFromStack(payload.stack)
 
 	report := map[string]interface{}{}
