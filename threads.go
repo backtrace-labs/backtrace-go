@@ -27,7 +27,7 @@ type frame struct {
 	line       int
 }
 
-func ParseThreadsFromStack(goStack []byte) (map[string]interface{}, string, map[string]interface{}, error) {
+func ParseThreadsFromStack(goStack []byte) (map[string]interface{}, string, map[string]interface{}) {
 	lines := bytes.Split(goStack, []byte{'\n'})
 
 	sourcePathToID := map[string]string{}
@@ -67,7 +67,7 @@ func ParseThreadsFromStack(goStack []byte) (map[string]interface{}, string, map[
 		threads[threadID] = threadMap
 	}
 
-	return threads, mainThread, sourceCode, nil
+	return threads, mainThread, sourceCode
 }
 
 func collectSource(sourcePath string, sourcePathToID map[string]string, sourceCodeJSON map[string]interface{}, nextSourceID *int) string {

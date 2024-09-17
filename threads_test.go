@@ -89,8 +89,7 @@ func TestParseThreadsFromStack(t *testing.T) {
 			},
 		}
 
-		threads, mainThread, sourceCode, err := ParseThreadsFromStack([]byte(stackExample1))
-		requireNoErr(t, err)
+		threads, mainThread, sourceCode := ParseThreadsFromStack([]byte(stackExample1))
 		requireJSONEqual(t, expectedThreads, threads)
 		requireEqual(t, expectedMainThread, mainThread)
 		requireEqual(t, expectedSourceCode, sourceCode)
