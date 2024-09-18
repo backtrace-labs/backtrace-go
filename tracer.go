@@ -214,7 +214,7 @@ func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) erro
 		url.Scheme = defaultCoronerScheme
 	}
 
-	if strings.IndexAny(url.Host, ":") == -1 {
+	if !strings.ContainsAny(url.Host, ":") {
 		url.Host += ":" + defaultCoronerPort
 	}
 
@@ -275,7 +275,7 @@ func putDirWalk(t *BTTracer) filepath.WalkFunc {
 		}
 
 		if !strings.HasSuffix(info.Name(), ".btt") {
-			t.Logf(LogDebug, "Ignoring file %s: suffix '.btt' " +
+			t.Logf(LogDebug, "Ignoring file %s: suffix '.btt' "+
 				"is required\n", info.Name())
 			return nil
 		}
@@ -392,13 +392,13 @@ func (t *BTTracer) AddOptions(options []string, v ...string) []string {
 // Append to an option with given prefix
 func AppendOptionWithPrefix(options []string, prefix string, v string) []string {
 	for i, opt := range options {
-		if strings.HasPrefix(opt, prefix) == true {
+		if strings.HasPrefix(opt, prefix) {
 			new_opt := opt + "," + v
 			options[i] = new_opt
 			return options
 		}
 	}
-	return append(options, prefix + v)
+	return append(options, prefix+v)
 }
 
 func (t *BTTracer) AppendOptionWithPrefix(options []string, prefix string, v string) []string {
