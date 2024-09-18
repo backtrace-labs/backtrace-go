@@ -1,3 +1,4 @@
+//go:build darwin
 // +build darwin
 
 package bt
@@ -13,11 +14,13 @@ import (
 	"sync"
 )
 
+//nolint:all
 type pipes struct {
 	stdin  io.Reader
 	stderr io.Writer
 }
 
+//nolint:all
 type uploader struct {
 	endpoint string
 	options  PutOptions
@@ -28,31 +31,31 @@ type BTTracer struct {
 	cmd string
 
 	// Output directory for generated snapshots.
-	outputDir string
+	outputDir string //nolint:all
 
 	// Generic options to pass to the tracer.
 	options []string
 
 	// Prefix for key-value options.
-	kvp string
+	kvp string //nolint:all
 
 	// Delimeter between key and value for key-value options.
-	kvd string
+	kvd string //nolint:all
 
 	// Channel which receives signal notifications.
 	sigs chan os.Signal
 
 	// The set of signals the tracer will monitor.
-	ss []os.Signal
+	ss []os.Signal //nolint:all
 
 	// The pipes to use for tracer I/O.
-	p pipes
+	p pipes //nolint:all
 
 	// Protects tracer state modification.
 	m sync.RWMutex
 
 	// Logs tracer execution status messages.
-	logger Log
+	logger Log //nolint:all
 
 	// Default trace options to use if none are specified to bt.Trace().
 	defaultTraceOptions TraceOptions
@@ -61,14 +64,17 @@ type BTTracer struct {
 	put uploader
 }
 
+//nolint:all
 type defaultLogger struct {
 	logger *log.Logger
 	level  LogPriority
 }
 
+//nolint:all
 func (d *defaultLogger) Logf(level LogPriority, format string, v ...interface{}) {
 }
 
+//nolint:all
 func (d *defaultLogger) SetLogLevel(level LogPriority) {
 }
 
@@ -117,10 +123,12 @@ func (t *BTTracer) PutDir(path string) error {
 	return nil
 }
 
+//nolint:all
 func putDirWalk(t *BTTracer) filepath.WalkFunc {
 	return nil
 }
 
+//nolint:all
 func (t *BTTracer) putSnapshotFile(path string) error {
 	return nil
 }

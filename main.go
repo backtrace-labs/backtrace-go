@@ -5,7 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
@@ -218,7 +218,7 @@ func sendWorkerMain() {
 			case *reportPayload:
 				processAndSend(value)
 			default:
-				panic(fmt.Sprintf("invalid queue item"))
+				panic("invalid queue item")
 			}
 		case <-block_chan:
 			done_chan <- struct{}{}
@@ -282,8 +282,8 @@ func processAndSend(payload *reportPayload) {
 		return
 	}
 	defer resp.Body.Close()
-	_, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
+
+	if _, err = io.ReadAll(resp.Body); err != nil {
 		if Options.DebugBacktrace {
 			panic(err)
 		}
