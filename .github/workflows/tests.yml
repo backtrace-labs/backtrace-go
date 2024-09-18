@@ -1,4 +1,4 @@
-name: Tests
+name: Lint and Test
 
 on:
   push:
@@ -7,21 +7,23 @@ on:
   pull_request:
 
 jobs:
-  test:
+  run-tests:
+    name: lint-and-test
     strategy:
       matrix:
         go-version: [1.18, 1.22]
         os: [ubuntu-latest, macos-latest, windows-latest]
-
     runs-on: ${{ matrix.os }}
-
     steps:
+      - uses: actions/checkout@v4
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
-
-      - uses: actions/checkout@v3
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.60
       - name: Run Unit Tests
-        run: | 
+        run: |
           go test
