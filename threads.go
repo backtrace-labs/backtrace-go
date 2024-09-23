@@ -1,153 +1,135 @@
 package bt
 
 import (
-	"bytes"
+	"fmt"
 	"os"
-	"regexp"
-	"strconv"
+	"strings"
 )
 
-var (
-	threadRegex      = regexp.MustCompile(`^(.*):$`)
-	fnRegex          = regexp.MustCompile(`^(.*)\.([^(]+)`)
-	createdByFnRegex = regexp.MustCompile(`^created by (.*)\.([^ ]+) in goroutine [0-9]+$`)
-	srcRegex         = regexp.MustCompile(`^\s*(.*):(\d+)`)
-)
-
-type thread struct {
-	id     int
-	name   string
-	frames []frame
+type Thread struct {
+	Name   string       `json:"name"`
+	Stacks []StackFrame `json:"stack"`
 }
 
-type frame struct {
-	fnName     string
-	library    string
-	sourcePath string
-	line       int
+type StackFrame struct {
+	FuncName      string `json:"funcName"`
+	Library       string `json:"library"`
+	SourceCodeID  string `json:"sourceCode"`
+	Line          string `json:"line"`
+	skipBacktrace bool
 }
 
-func ParseThreadsFromStack(goStack []byte) (map[string]interface{}, string, map[string]interface{}) {
-	lines := bytes.Split(goStack, []byte{'\n'})
+type SourceCode struct {
+	Text        string `json:"text"`
+	Path        string `json:"path"`
+	StartLine   int    `json:"startLine"`
+	StartColumn int    `json:"startColumn"`
+	StartPos    int    `json:"startPos"`
+	TabWidth    int    `json:"tabWidth"`
+}
 
-	sourcePathToID := map[string]string{}
-	sourceCode := map[string]interface{}{}
+func ParseThreadsFromStack(stackTrace []byte) (map[string]Thread, map[string]SourceCode) {
+	splitThreads := strings.Split(string(stackTrace), "\n\n")
 
-	threads := map[string]interface{}{}
-	var mainThread string
+	sourceCodeID := 0
 
-	nextSourceID := 0
-	lineIndex := 0
-	first := true
-	for lineIndex < len(lines) {
-		threadItem := getThread(lines, &lineIndex)
-		if threadItem == nil {
-			break
+	sourcesPath := make(map[string]int)        // key: path, value: unique path number starting from 0.
+	threads := make(map[string]Thread)         // key: index of split string, starting from 0.
+	sourceCodes := make(map[string]SourceCode) // key: unique path number starting from 0.
+
+	for threadID, stackText := range splitThreads {
+		lines := strings.Split(stackText, "\n")
+
+		sf := StackFrame{}
+		thread := Thread{Name: strings.TrimSuffix(lines[0], ":")}
+		for i := 1; i < len(lines); i++ {
+			line := strings.TrimSpace(lines[i])
+			if line == "" {
+				continue
+			}
+
+			if i == 0 {
+				thread.Name = strings.TrimSuffix(line, ":")
+			} else {
+				if i%2 != 0 { // odd lines are function paths
+					if strings.HasPrefix(line, "github.com/backtrace-labs/backtrace-go") {
+						sf.skipBacktrace = true
+						continue
+					}
+					sf.skipBacktrace = false
+
+					line = trimCreatedBy(line)
+
+					lastIndex, function := getLastPathIndexAndFunction(line)
+
+					if function == "panic" {
+						sf.FuncName = "panic"
+						sf.Library = "runtime"
+						continue
+					}
+
+					sf.FuncName = function
+					sf.Library = line[:lastIndex]
+				} else {
+					if sf.skipBacktrace {
+						continue
+					}
+
+					line = strings.TrimSpace(line)
+					line, _, _ = strings.Cut(line, " +")
+
+					path := ""
+					path, sf.Line, _ = strings.Cut(line, ":")
+
+					if scID, ok := sourcesPath[path]; ok {
+						sf.SourceCodeID = fmt.Sprintf("%d", scID)
+					} else {
+						strSourceCodeID := fmt.Sprintf("%d", sourceCodeID)
+						sourcesPath[path] = sourceCodeID
+
+						sourceCodes[strSourceCodeID] = readFileGetSourceCode(path)
+
+						sf.SourceCodeID = strSourceCodeID
+
+						sourceCodeID++
+					}
+					thread.Stacks = append(thread.Stacks, sf)
+					sf = StackFrame{}
+				}
+			}
 		}
-		threadID := strconv.Itoa(threadItem.id)
-		if first {
-			first = false
-			mainThread = threadID
-		}
-		stackList := []interface{}{}
-		for _, frameItem := range threadItem.frames {
-			sourceCodeID := collectSource(frameItem.sourcePath, sourcePathToID, sourceCode, &nextSourceID)
 
-			stackFrame := map[string]interface{}{}
-			stackFrame["funcName"] = frameItem.fnName
-			stackFrame["library"] = frameItem.library
-			stackFrame["sourceCode"] = sourceCodeID
-			stackFrame["line"] = frameItem.line
-			stackList = append(stackList, stackFrame)
-		}
-
-		threadMap := map[string]interface{}{}
-		threadMap["name"] = threadItem.name
-		threadMap["stack"] = stackList
-		threads[threadID] = threadMap
+		threads[fmt.Sprintf("%d", threadID)] = thread
 	}
 
-	return threads, mainThread, sourceCode
+	return threads, sourceCodes
 }
 
-func collectSource(sourcePath string, sourcePathToID map[string]string, sourceCodeJSON map[string]interface{}, nextSourceID *int) string {
-	existingID, present := sourcePathToID[sourcePath]
-	if present {
-		return existingID
-	}
-	newID := strconv.Itoa(*nextSourceID)
-	*nextSourceID += 1
-	sourcePathToID[sourcePath] = newID
-
-	sourceCodeObject := map[string]interface{}{}
-
-	bytes, err := os.ReadFile(sourcePath)
+func readFileGetSourceCode(path string) SourceCode {
+	sc := SourceCode{}
+	bytes, err := os.ReadFile(path)
 	if err == nil {
-		sourceCodeObject["text"] = string(bytes)
-		sourceCodeObject["startLine"] = 1
-		sourceCodeObject["startColumn"] = 1
-		sourceCodeObject["startPos"] = 0
-		sourceCodeObject["tabWidth"] = Options.TabWidth
+		sc.Text = string(bytes)
+		sc.StartLine = 1
+		sc.StartColumn = 1
+		sc.StartPos = 0
+		sc.TabWidth = Options.TabWidth
 	}
-	sourceCodeObject["path"] = sourcePath
+	sc.Path = path
 
-	sourceCodeJSON[newID] = sourceCodeObject
-
-	return newID
+	return sc
 }
 
-func getThread(lines [][]byte, index *int) *thread {
-	threadLine := getNextLine(lines, index)
-	if threadLine == nil {
-		return nil
-	}
-	threadMatches := threadRegex.FindSubmatch(threadLine)
-	if threadMatches == nil {
-		return nil
-	}
-	threadItem := thread{
-		id:   *index,
-		name: string(threadMatches[1]),
-	}
-	for {
-		fnLine := getNextLine(lines, index)
-		if fnLine == nil {
-			break
-		}
-		srcLine := getNextLine(lines, index)
-		if srcLine == nil {
-			break
-		}
-
-		fnNameMatches := fnRegex.FindSubmatch(fnLine)
-		createdByFnNameMatches := createdByFnRegex.FindSubmatch(fnLine)
-		sourcePathMatches := srcRegex.FindSubmatch(srcLine)
-
-		newFrame := frame{}
-		if createdByFnNameMatches != nil {
-			newFrame.library = string(createdByFnNameMatches[1])
-			newFrame.fnName = string(createdByFnNameMatches[2])
-
-		} else if fnNameMatches != nil {
-			newFrame.library = string(fnNameMatches[1])
-			newFrame.fnName = string(fnNameMatches[2])
-		}
-		if sourcePathMatches != nil {
-			newFrame.sourcePath = string(sourcePathMatches[1])
-			newFrame.line, _ = strconv.Atoi(string(sourcePathMatches[2]))
-		}
-
-		threadItem.frames = append(threadItem.frames, newFrame)
-	}
-	return &threadItem
+func getLastPathIndexAndFunction(line string) (int, string) {
+	lastIndex := strings.LastIndex(line, ".")
+	function, _, _ := strings.Cut(line[lastIndex+1:], "(")
+	return lastIndex, function
 }
 
-func getNextLine(lines [][]byte, index *int) []byte {
-	if *index < len(lines) && len(lines[*index]) != 0 {
-		result := lines[*index]
-		*index += 1
-		return result
+func trimCreatedBy(line string) string {
+	if strings.HasPrefix(line, "created by") {
+		_, line, _ = strings.Cut(line, " by ")
+		line, _, _ = strings.Cut(line, " in ")
 	}
-	*index += 1
-	return nil
+	return line
 }

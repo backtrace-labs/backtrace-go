@@ -1,123 +1,197 @@
 package bt
 
 import (
-	"encoding/json"
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-const stackExample1 = `goroutine 1 [running]:
+const stackTrace = `goroutine 1 [running]:
+github.com/backtrace-labs/backtrace-go.TestMain(0x1400011a960)
+	/Users/test-user/Documents/Work/backtrace-go/main_test.go:41 +0x28
 main.GetStack()
-	/tmp/sandbox889685435/prog.go:30 +0x5f
+    /tmp/sandbox889685435/prog.go:30 +0x5f
 main.main()
-	/tmp/sandbox889685435/prog.go:15 +0x2f
+    /tmp/sandbox889685435/prog.go:15 +0x2f
 
 goroutine 6 [runnable]:
 main.testFunc()
-	/tmp/sandbox889685435/prog.go:22
+    /tmp/sandbox889685435/prog.go:22
 created by main.main in goroutine 1
-	/tmp/sandbox889685435/prog.go:13 +0x1e
+    /tmp/sandbox889685435/prog.go:13 +0x1e
 
 goroutine 7 [runnable]:
 main.testFunc()
-	/tmp/sandbox889685435/prog.go:22
+    /tmp/sandbox889685435/prog.go:22
 created by main.main in goroutine 1
-	/tmp/sandbox889685435/prog.go:14 +0x2a
+    /tmp/sandbox889685435/prog.go:14 +0x2a
+
+goroutine 8 [running]:
+main.test.main(0x9)
+        /Users/root/Library/Application Support/JetBrains/GoLand2024.1/scratches/scratch_19.go:74 +0xa0c
+
+goroutine 9 [running]:
+testing.(*T).Run(0x14000110680, {0x1012116ab, 0x9}, 0x1012ff428)
+        /Users/some_file.go:12 +0xa0c
+panic({0x100b3f360?, 0x100bb0860?})
+	/usr/local/go/src/runtime/panic.go:770 +0xf0
+created by testing.(*T).Run in goroutine 1
+	/usr/local/go/src/testing/testing.go:1742 +0x668
 `
 
 func TestParseThreadsFromStack(t *testing.T) {
-	t.Run("example1_ok", func(t *testing.T) {
-		expectedThreads := map[string]interface{}{
-			"1": map[string]interface{}{
-				"name": "goroutine 1 [running]",
-				"stack": []map[string]interface{}{
-					{
-						"funcName":   "GetStack",
-						"library":    "main",
-						"line":       30,
-						"sourceCode": "0",
-					},
-					{
-						"funcName":   "main",
-						"library":    "main",
-						"line":       15,
-						"sourceCode": "0",
-					},
-				},
-			},
-
-			"7": map[string]interface{}{
-				"name": "goroutine 6 [runnable]",
-				"stack": []map[string]interface{}{
-					{
-						"funcName":   "testFunc",
-						"library":    "main",
-						"line":       22,
-						"sourceCode": "0",
-					},
-					{
-						"funcName":   "main",
-						"library":    "main",
-						"line":       13,
-						"sourceCode": "0",
-					},
-				},
-			},
-
-			"13": map[string]interface{}{
-				"name": "goroutine 7 [runnable]",
-				"stack": []map[string]interface{}{
-					{
-						"funcName":   "testFunc",
-						"library":    "main",
-						"line":       22,
-						"sourceCode": "0",
-					},
-					{
-						"funcName":   "main",
-						"library":    "main",
-						"line":       14,
-						"sourceCode": "0",
-					},
-				},
-			},
-		}
-		expectedMainThread := "1"
-		expectedSourceCode := map[string]interface{}{
-			"0": map[string]interface{}{
-				"path": "/tmp/sandbox889685435/prog.go",
-			},
-		}
-
-		threads, mainThread, sourceCode := ParseThreadsFromStack([]byte(stackExample1))
-		requireJSONEqual(t, expectedThreads, threads)
-		requireEqual(t, expectedMainThread, mainThread)
-		requireEqual(t, expectedSourceCode, sourceCode)
-	})
-}
-
-func requireJSONEqual(t *testing.T, expectedVal interface{}, val interface{}) {
-	expectedValJSON, err := json.Marshal(expectedVal)
-	requireNoErr(t, err)
-	valJSON, err := json.Marshal(val)
-	requireNoErr(t, err)
-
-	expectedValJSONStr := string(expectedValJSON)
-	valJSONStr := string(valJSON)
-
-	if expectedValJSONStr != valJSONStr {
-		t.Fatalf("unexpected JSON inequality; following values are not equal:\n%v\n%v", expectedValJSONStr, valJSONStr)
+	type args struct {
+		stackTrace []byte
 	}
-}
-
-func requireEqual(t *testing.T, expectedVal interface{}, val interface{}) {
-	if !reflect.DeepEqual(expectedVal, val) {
-		t.Fatalf("unexpected inequality; following values are not equal:\n%v (%T)\n%v (%T)", expectedVal, expectedVal, val, val)
+	tests := []struct {
+		name           string
+		args           args
+		wantThreads    map[string]Thread
+		wantSourceCode map[string]SourceCode
+	}{
+		{
+			name: "ShouldParseThreadsFromStack",
+			args: args{
+				stackTrace: []byte(stackTrace),
+			},
+			wantThreads: map[string]Thread{
+				"0": {
+					Name: "goroutine 1 [running]",
+					Stacks: []StackFrame{
+						{
+							FuncName:     "GetStack",
+							Library:      "main",
+							SourceCodeID: "0",
+							Line:         "30",
+						},
+						{
+							FuncName:     "main",
+							Library:      "main",
+							SourceCodeID: "0",
+							Line:         "15",
+						},
+					},
+				},
+				"1": {
+					Name: "goroutine 6 [runnable]",
+					Stacks: []StackFrame{
+						{
+							FuncName:     "testFunc",
+							Library:      "main",
+							SourceCodeID: "0",
+							Line:         "22",
+						},
+						{
+							FuncName:     "main",
+							Library:      "main",
+							SourceCodeID: "0",
+							Line:         "13",
+						},
+					},
+				},
+				"2": {
+					Name: "goroutine 7 [runnable]",
+					Stacks: []StackFrame{
+						{
+							FuncName:     "testFunc",
+							Library:      "main",
+							SourceCodeID: "0",
+							Line:         "22",
+						},
+						{
+							FuncName:     "main",
+							Library:      "main",
+							SourceCodeID: "0",
+							Line:         "14",
+						},
+					},
+				},
+				"3": {
+					Name: "goroutine 8 [running]",
+					Stacks: []StackFrame{
+						{
+							FuncName:     "main",
+							Library:      "main.test",
+							SourceCodeID: "1",
+							Line:         "74",
+						},
+					},
+				},
+				"4": {
+					Name: "goroutine 9 [running]",
+					Stacks: []StackFrame{
+						{
+							FuncName:     "Run",
+							Library:      "testing.(*T)",
+							SourceCodeID: "2",
+							Line:         "12",
+						},
+						{
+							FuncName:     "panic",
+							Library:      "runtime",
+							SourceCodeID: "3",
+							Line:         "770",
+						},
+						{
+							FuncName:     "Run",
+							Library:      "testing.(*T)",
+							SourceCodeID: "4",
+							Line:         "1742",
+						},
+					},
+				},
+			},
+			wantSourceCode: map[string]SourceCode{
+				"0": {
+					Path: "/tmp/sandbox889685435/prog.go",
+				},
+				"1": {
+					Path: "/Users/root/Library/Application Support/JetBrains/GoLand2024.1/scratches/scratch_19.go",
+				},
+				"2": {
+					Path: "/Users/some_file.go",
+				},
+				"3": {
+					Text:        "",
+					Path:        "/usr/local/go/src/runtime/panic.go",
+					StartLine:   1,
+					StartColumn: 1,
+					StartPos:    0,
+					TabWidth:    0,
+				},
+				"4": {
+					Text:        "",
+					Path:        "/usr/local/go/src/testing/testing.go",
+					StartLine:   1,
+					StartColumn: 1,
+					StartPos:    0,
+					TabWidth:    0,
+				},
+			},
+		},
 	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotThreads, gotSourceCodes := ParseThreadsFromStack(tt.args.stackTrace)
 
-func requireNoErr(t *testing.T, err error) {
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+			waitChan := make(chan int)
+			go func() {
+				for k, v := range gotSourceCodes {
+					gotSourceCodes[k] = SourceCode{
+						Text:        "", // remove text check.
+						Path:        v.Path,
+						StartLine:   v.StartLine,
+						StartColumn: v.StartColumn,
+						StartPos:    v.StartPos,
+						TabWidth:    v.TabWidth,
+					}
+				}
+				waitChan <- 1
+			}()
+			<-waitChan
+
+			assert.Equal(t, tt.wantThreads, gotThreads)
+			assert.Equal(t, tt.wantSourceCode, gotSourceCodes)
+		})
 	}
 }
