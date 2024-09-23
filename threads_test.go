@@ -34,9 +34,9 @@ goroutine 9 [running]:
 testing.(*T).Run(0x14000110680, {0x1012116ab, 0x9}, 0x1012ff428)
         /Users/some_file.go:12 +0xa0c
 panic({0x100b3f360?, 0x100bb0860?})
-	/usr/local/go/src/runtime/panic.go:770 +0xf0
+	/usr/local/go/src/runtime/something.go:770 +0xf0
 created by testing.(*T).Run in goroutine 1
-	/usr/local/go/src/testing/testing.go:1742 +0x668
+	/usr/local/go/src/testing/foobar.go:1742 +0x668
 `
 
 func TestParseThreadsFromStack(t *testing.T) {
@@ -152,20 +152,12 @@ func TestParseThreadsFromStack(t *testing.T) {
 					Path: "/Users/some_file.go",
 				},
 				"3": {
-					Text:        "",
-					Path:        "/usr/local/go/src/runtime/panic.go",
-					StartLine:   1,
-					StartColumn: 1,
-					StartPos:    0,
-					TabWidth:    0,
+					Text: "",
+					Path: "/usr/local/go/src/runtime/something.go",
 				},
 				"4": {
-					Text:        "",
-					Path:        "/usr/local/go/src/testing/testing.go",
-					StartLine:   1,
-					StartColumn: 1,
-					StartPos:    0,
-					TabWidth:    0,
+					Text: "",
+					Path: "/usr/local/go/src/testing/foobar.go",
 				},
 			},
 		},
