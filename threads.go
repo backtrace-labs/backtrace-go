@@ -48,58 +48,55 @@ func ParseThreadsFromStack(stackTrace []byte) (map[string]Thread, map[string]Sou
 				continue
 			}
 
-			if i == 0 {
-				thread.Name = strings.TrimSuffix(line, ":")
-			} else {
-				if i%2 != 0 { // odd lines are function paths
-					if strings.HasPrefix(line, "github.com/backtrace-labs/backtrace-go") {
-						sf.skipBacktrace = true
-						continue
-					}
-					sf.skipBacktrace = false
-
-					line = trimCreatedBy(line)
-
-					lastIndex, function := getLastPathIndexAndFunction(line)
-
-					if function == "panic" {
-						sf.FuncName = "panic"
-						sf.Library = "runtime"
-						continue
-					}
-
-					sf.FuncName = function
-					sf.Library = line[:lastIndex]
-				} else {
-					if sf.skipBacktrace {
-						continue
-					}
-
-					line = strings.TrimSpace(line)
-					line, _, _ = strings.Cut(line, " +")
-
-					path := ""
-					path, sf.Line, _ = strings.Cut(line, ":")
-
-					if scID, ok := sourcesPath[path]; ok {
-						sf.SourceCodeID = fmt.Sprintf("%d", scID)
-					} else {
-						strSourceCodeID := fmt.Sprintf("%d", sourceCodeID)
-						sourcesPath[path] = sourceCodeID
-
-						sourceCodes[strSourceCodeID] = readFileGetSourceCode(path)
-
-						sf.SourceCodeID = strSourceCodeID
-
-						sourceCodeID++
-					}
-					thread.Stacks = append(thread.Stacks, sf)
-					sf = StackFrame{}
+			if i%2 != 0 { // odd lines are function paths
+				line = trimCreatedBy(line)
+				if strings.HasPrefix(line, "github.com/backtrace-labs/backtrace-go") {
+					sf.skipBacktrace = true
+					continue
 				}
+				sf.skipBacktrace = false
+
+				lastIndex, function := getLastPathIndexAndFunction(line)
+
+				if function == "panic" {
+					sf.FuncName = "panic"
+					sf.Library = "runtime"
+					continue
+				}
+
+				sf.FuncName = function
+				sf.Library = line[:lastIndex]
+			} else {
+				if sf.skipBacktrace {
+					continue
+				}
+
+				line = strings.TrimSpace(line)
+				line, _, _ = strings.Cut(line, " +")
+
+				path := ""
+				path, sf.Line, _ = strings.Cut(line, ":")
+
+				if scID, ok := sourcesPath[path]; ok {
+					sf.SourceCodeID = fmt.Sprintf("%d", scID)
+				} else {
+					strSourceCodeID := fmt.Sprintf("%d", sourceCodeID)
+					sourcesPath[path] = sourceCodeID
+
+					sourceCodes[strSourceCodeID] = readFileGetSourceCode(path)
+
+					sf.SourceCodeID = strSourceCodeID
+
+					sourceCodeID++
+				}
+				thread.Stacks = append(thread.Stacks, sf)
+				sf = StackFrame{}
 			}
 		}
 
-		threads[fmt.Sprintf("%d", threadID)] = thread
+		if len(thread.Stacks) > 0 {
+			threads[fmt.Sprintf("%d", threadID)] = thread
+		}
 	}
 
 	return threads, sourceCodes
