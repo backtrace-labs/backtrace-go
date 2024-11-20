@@ -187,11 +187,14 @@ func checkOptions() bool {
 		}
 		panic("must set bt.Options.Endpoint")
 	}
-	if len(Options.Token) == 0 {
-		if !Options.DebugBacktrace {
-			return false
+
+	if !strings.HasPrefix(Options.Endpoint, "https://submit.backtrace.io") {
+		if len(Options.Token) == 0 {
+			if !Options.DebugBacktrace {
+				return false
+			}
+			panic("must set bt.Options.Token")
 		}
-		panic("must set bt.Options.Token")
 	}
 	return true
 }
@@ -256,7 +259,12 @@ func processAndSend(payload *reportPayload) {
 	report["sourceCode"] = sourceCode
 	report["classifiers"] = []string{payload.classifier}
 
-	fullUrl := fmt.Sprintf("%s/post?format=json&token=%s", Options.Endpoint, url.QueryEscape(Options.Token))
+	fullUrl := Options.Endpoint
+
+	if len(Options.Token) != 0 { // if token is set that means its old URL.
+		fullUrl = fmt.Sprintf("%s/post?format=json&token=%s", Options.Endpoint, url.QueryEscape(Options.Token))
+	}
+
 	if Options.DebugBacktrace {
 		fmt.Fprintf(os.Stderr, "POST %s\n", fullUrl)
 		var err error
