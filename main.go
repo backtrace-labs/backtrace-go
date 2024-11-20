@@ -47,52 +47,52 @@ type reportPayload struct {
 }
 
 var queue = make(chan interface{}, 50)
-var done_chan = make(chan struct{})
-var block_chan = make(chan struct{})
+var doneChan = make(chan struct{})
+var blockChan = make(chan struct{})
 
 func init() {
 	var err error
 
-	var seed_bytes [8]byte
-	_, err = cryptorand.Read(seed_bytes[:])
+	var seedBytes [8]byte
+	_, err = cryptorand.Read(seedBytes[:])
 	if err != nil {
 		panic(err)
 	}
 
 	seed :=
-		(int64(seed_bytes[0]) << 0) |
-			(int64(seed_bytes[1]) << 1) |
-			(int64(seed_bytes[2]) << 2) |
-			(int64(seed_bytes[3]) << 3) |
-			(int64(seed_bytes[4]) << 4) |
-			(int64(seed_bytes[5]) << 5) |
-			(int64(seed_bytes[6]) << 6) |
-			(int64(seed_bytes[7]) << 7)
+		(int64(seedBytes[0]) << 0) |
+			(int64(seedBytes[1]) << 1) |
+			(int64(seedBytes[2]) << 2) |
+			(int64(seedBytes[3]) << 3) |
+			(int64(seedBytes[4]) << 4) |
+			(int64(seedBytes[5]) << 5) |
+			(int64(seedBytes[6]) << 6) |
+			(int64(seedBytes[7]) << 7)
 
-	rand_source := mathrand.NewSource(seed)
-	rng = mathrand.New(rand_source)
+	randSource := mathrand.NewSource(seed)
+	rng = mathrand.New(randSource)
 
 	go sendWorkerMain()
 }
 
-func Report(object interface{}, extra_attributes map[string]interface{}) {
-	if extra_attributes == nil {
-		extra_attributes = map[string]interface{}{}
+func Report(object interface{}, extraAttributes map[string]interface{}) {
+	if extraAttributes == nil {
+		extraAttributes = map[string]interface{}{}
 	}
-	if extra_attributes["report_type"] == nil {
-		extra_attributes["report_type"] = "error"
+	if extraAttributes["report_type"] == nil {
+		extraAttributes["report_type"] = "error"
 	}
 	switch value := object.(type) {
 	case nil:
 		return
 	case error:
-		sendReportString(value.Error(), "error", extra_attributes)
+		sendReportString(value.Error(), "error", extraAttributes)
 	default:
-		sendReportString(fmt.Sprint(value), "message", extra_attributes)
+		sendReportString(fmt.Sprint(value), "message", extraAttributes)
 	}
 }
 
-func sendReportString(msg string, classifier string, extra_attributes map[string]interface{}) {
+func sendReportString(msg string, classifier string, extraAttributes map[string]interface{}) {
 	if !checkOptions() {
 		return
 	}
@@ -107,7 +107,7 @@ func sendReportString(msg string, classifier string, extra_attributes map[string
 
 	attributes["error.message"] = msg
 
-	for k, v := range extra_attributes {
+	for k, v := range extraAttributes {
 		attributes[k] = v
 	}
 
@@ -126,7 +126,7 @@ func sendReportString(msg string, classifier string, extra_attributes map[string
 	queue <- payload
 }
 
-func ReportPanic(extra_attributes map[string]interface{}) {
+func ReportPanic(extraAttributes map[string]interface{}) {
 	if !checkOptions() {
 		return
 	}
@@ -136,27 +136,27 @@ func ReportPanic(extra_attributes map[string]interface{}) {
 		return
 	}
 
-	if extra_attributes == nil {
-		extra_attributes = map[string]interface{}{}
+	if extraAttributes == nil {
+		extraAttributes = map[string]interface{}{}
 	}
-	extra_attributes["report_type"] = "panic"
+	extraAttributes["report_type"] = "panic"
 
-	Report(err, extra_attributes)
+	Report(err, extraAttributes)
 	finishSendingReports(false)
 	panic(err)
 }
 
-func ReportAndRecoverPanic(extra_attributes map[string]interface{}) {
+func ReportAndRecoverPanic(extraAttributes map[string]interface{}) {
 	if !checkOptions() {
 		return
 	}
 
-	if extra_attributes == nil {
-		extra_attributes = map[string]interface{}{}
+	if extraAttributes == nil {
+		extraAttributes = map[string]interface{}{}
 	}
-	extra_attributes["report_type"] = "panic"
+	extraAttributes["report_type"] = "panic"
 
-	Report(recover(), extra_attributes)
+	Report(recover(), extraAttributes)
 }
 
 func stack(all bool) []byte {
@@ -197,31 +197,31 @@ func checkOptions() bool {
 }
 
 func createUuid() string {
-	var uuid_bytes [16]byte
-	_, _ = rng.Read(uuid_bytes[:]) // This function is documented to never fail.
+	var uuidBytes [16]byte
+	_, _ = rng.Read(uuidBytes[:]) // This function is documented to never fail.
 	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-		uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3],
-		uuid_bytes[4], uuid_bytes[5],
-		uuid_bytes[6], uuid_bytes[7],
-		uuid_bytes[8], uuid_bytes[9],
-		uuid_bytes[10], uuid_bytes[11], uuid_bytes[12], uuid_bytes[13], uuid_bytes[14], uuid_bytes[15])
+		uuidBytes[0], uuidBytes[1], uuidBytes[2], uuidBytes[3],
+		uuidBytes[4], uuidBytes[5],
+		uuidBytes[6], uuidBytes[7],
+		uuidBytes[8], uuidBytes[9],
+		uuidBytes[10], uuidBytes[11], uuidBytes[12], uuidBytes[13], uuidBytes[14], uuidBytes[15])
 }
 
 func sendWorkerMain() {
 	for {
 		select {
-		case queue_item := <-queue:
-			switch value := queue_item.(type) {
+		case queueItem := <-queue:
+			switch value := queueItem.(type) {
 			case nil:
-				done_chan <- struct{}{}
+				doneChan <- struct{}{}
 				return
 			case *reportPayload:
 				processAndSend(value)
 			default:
 				panic("invalid queue item")
 			}
-		case <-block_chan:
-			done_chan <- struct{}{}
+		case <-blockChan:
+			doneChan <- struct{}{}
 		}
 
 	}
@@ -234,13 +234,13 @@ func finishSendingReports(kill bool) {
 	if kill {
 		queue <- nil
 	} else {
-		block_chan <- struct{}{}
+		blockChan <- struct{}{}
 	}
-	<-done_chan
+	<-doneChan
 }
 
 func processAndSend(payload *reportPayload) {
-	threads, mainThread, sourceCode := ParseThreadsFromStack(payload.stack)
+	threads, sourceCode := ParseThreadsFromStack(payload.stack)
 
 	report := map[string]interface{}{}
 	report["uuid"] = createUuid()
@@ -252,29 +252,29 @@ func processAndSend(payload *reportPayload) {
 	report["attributes"] = payload.attributes
 	report["annotations"] = payload.annotations
 	report["threads"] = threads
-	report["mainThread"] = mainThread
+	report["mainThread"] = "0"
 	report["sourceCode"] = sourceCode
 	report["classifiers"] = []string{payload.classifier}
 
-	full_url := fmt.Sprintf("%s/post?format=json&token=%s", Options.Endpoint, url.QueryEscape(Options.Token))
+	fullUrl := fmt.Sprintf("%s/post?format=json&token=%s", Options.Endpoint, url.QueryEscape(Options.Token))
 	if Options.DebugBacktrace {
-		fmt.Fprintf(os.Stderr, "POST %s\n", full_url)
+		fmt.Fprintf(os.Stderr, "POST %s\n", fullUrl)
 		var err error
-		json_bytes, err := json.MarshalIndent(report, "", "  ")
+		jsonBytes, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
 			panic(err)
 		}
-		fmt.Fprintf(os.Stderr, "%s\n", string(json_bytes))
+		fmt.Fprintf(os.Stderr, "%s\n", string(jsonBytes))
 	}
 
-	json_bytes, err := json.Marshal(report)
+	jsonBytes, err := json.Marshal(report)
 	if err != nil {
 		if Options.DebugBacktrace {
 			panic(err)
 		}
 		return
 	}
-	resp, err := http.Post(full_url, "application/json", bytes.NewReader(json_bytes))
+	resp, err := http.Post(fullUrl, "application/json", bytes.NewReader(jsonBytes))
 	if err != nil {
 		if Options.DebugBacktrace {
 			panic(err)
