@@ -56,7 +56,8 @@ func TestParseThreadsFromStack(t *testing.T) {
 			},
 			wantThreads: map[string]Thread{
 				"0": {
-					Name: "goroutine 1 [running]",
+					Name:  "goroutine 1 [running]",
+					Fault: true,
 					Stacks: []StackFrame{
 						{
 							FuncName:     "GetStack",
