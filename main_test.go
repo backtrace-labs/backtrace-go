@@ -103,4 +103,11 @@ func causeErrorReport() {
 	go doSomething(make(chan int))
 	Report(errors.New("it broke"), nil)
 	finishSendingReports(false)
+
+	for _, v := range []string{"backtrace.version", "backtrace.agent", "hostname", "uname.sysname", "cpu.arch", "process.id", "application.session", "application"} {
+		if _, ok := Options.Attributes[v]; !ok {
+			panic(v + " - attribute not set")
+		}
+	}
+
 }

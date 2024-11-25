@@ -6,20 +6,43 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-const VersionMajor = 0
-const VersionMinor = 0
-const VersionPatch = 0
+const (
+	VersionMajor = 1
+	VersionMinor = 0
+	VersionPatch = 0
+)
 
-var Version = fmt.Sprintf("%d.%d.%d", VersionMajor, VersionMinor, VersionPatch)
+var (
+	Version = fmt.Sprintf("%d.%d.%d", VersionMajor, VersionMinor, VersionPatch)
+
+	windowsGUIDCommand = []string{"reg", "query", "\"HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Cryptography\"", "/v", "MachineGuid"}
+	linuxGUIDCommand   = []string{"sh", "-c", "( cat /var/lib/dbus/machine-id /etc/machine-id 2> /dev/null || hostname ) | head -n 1 || :"}
+	freebsdGUIDCommand = []string{"sh", "-c", "kenv -q smbios.system.uuid || sysctl -n kern.hostuuid"}
+	darwinGUIDCommand  = []string{"sh", "-c", "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | awk -F'= \"' '{print $2}' | tr -d '\"'"}
+
+	windowsCPUCommand = []string{"wmic", "CPU", "get", "NAME"}
+	linuxCPUCommand   = []string{"sh", "-c", "lscpu | grep \"Model name\" | awk -F':' '{print $2}' | sed 's/^[[:space:]]*//'"}
+	darwinCPUCommand  = []string{"sh", "-c", "sysctl -n machdep.cpu.brand_string"}
+	freebsdCPUCommand = []string{"sh", "-c", "sysctl -n hw.model"}
+
+	linuxOSVersionCommand   = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
+	darwinOSVersionCommand  = []string{"sh", "-c", "sw_vers | grep ProductVersion | awk -F':' '{print $2}' | tr -d '\t'"}
+	freebsdOSVersionCommand = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
+)
 
 type OptionsStruct struct {
 	Endpoint string
@@ -72,7 +95,95 @@ func init() {
 	randSource := mathrand.NewSource(seed)
 	rng = mathrand.New(randSource)
 
+	setDefaultAttributes()
+
 	go sendWorkerMain()
+}
+
+func setDefaultAttributes() {
+	if Options.Attributes == nil {
+		Options.Attributes = make(map[string]interface{})
+	}
+
+	hostName, _ := os.Hostname()
+	Options.Attributes["backtrace.version"] = Version
+	Options.Attributes["backtrace.agent"] = "backtrace-go"
+	Options.Attributes["hostname"] = hostName
+	Options.Attributes["uname.sysname"] = runtime.GOOS
+	Options.Attributes["cpu.arch"] = runtime.GOARCH
+	Options.Attributes["process.id"] = os.Getpid()
+	Options.Attributes["application.session"] = uuid.New()
+	Options.Attributes["application"] = filepath.Base(os.Args[0])
+
+	guiCommand := []string{}
+	cpuCommand := []string{}
+	osCommand := []string{}
+	switch runtime.GOOS {
+	case "windows":
+		guiCommand = windowsGUIDCommand
+		cpuCommand = windowsCPUCommand
+	case "linux":
+		guiCommand = linuxGUIDCommand
+		cpuCommand = linuxCPUCommand
+		osCommand = linuxOSVersionCommand
+	case "darwin":
+		guiCommand = darwinGUIDCommand
+		cpuCommand = darwinCPUCommand
+		osCommand = darwinOSVersionCommand
+	case "freebsd":
+		guiCommand = freebsdGUIDCommand
+		cpuCommand = freebsdCPUCommand
+		osCommand = freebsdOSVersionCommand
+	}
+
+	if len(guiCommand) > 0 {
+		if output := execCommand(guiCommand); output != "" {
+			if runtime.GOOS == "windows" {
+				// windows gives:
+				// HKEY_LOCAL_MACHINE\Software\Microsoft\Cryptography
+				//    MachineGuid    REG_SZ    {XXXX-XXXX-XXXX-XXXX-XXXX}
+				if splitOutput := strings.Split(output, "{"); len(splitOutput) > 1 {
+					output = strings.TrimSuffix(splitOutput[1], "}")
+				}
+			}
+
+			Options.Attributes["guid"] = output
+		}
+	}
+
+	if len(cpuCommand) > 0 {
+		if output := execCommand(cpuCommand); output != "" {
+			if runtime.GOOS == "windows" {
+				// windows gives:
+				//NAME
+				//Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz
+				if splitOutput := strings.Split(output, "\n"); len(splitOutput) > 1 {
+					output = splitOutput[1]
+				}
+			}
+
+			Options.Attributes["cpu.brand"] = output
+		}
+	}
+
+	if len(osCommand) > 0 {
+		if output := execCommand(osCommand); output != "" {
+			Options.Attributes["uname.version"] = output
+		}
+	}
+}
+
+// first value in array is command to exec, rest are arguments.
+// e.g. []string{"sh", "-c", "sysctl -n foo_bar | grep foo_bar | tr -d "foo_var" "}
+func execCommand(commands []string) string {
+	out, err := exec.Command(commands[0], commands[1:]...).Output()
+	if err != nil {
+		if Options.DebugBacktrace {
+			log.Println(err)
+		}
+	}
+
+	return string(out)
 }
 
 func Report(object interface{}, extraAttributes map[string]interface{}) {
