@@ -2,9 +2,11 @@ package bt
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -78,8 +80,29 @@ func readFile(path string) {
 		values := strings.Split(string(l), ":")
 		if len(values) == 2 {
 			if attr, exists := mapper[values[0]]; exists {
-				Options.Attributes[attr] = strings.TrimSuffix(strings.TrimSpace(values[1]), " kB")
+				value, err := getValue(values[1])
+				if err != nil {
+					continue
+				}
+				Options.Attributes[attr] = value
 			}
 		}
 	}
+}
+
+func getValue(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if strings.HasSuffix(value, "kB") {
+		value = strings.TrimSuffix(value, " kB")
+
+		atoi, err := strconv.ParseInt(value, 10, 64)
+		if err != nil && Options.DebugBacktrace {
+			log.Printf("readFile err: %v", err)
+			return "", err
+		}
+		atoi *= 1024
+		return fmt.Sprintf("%d", atoi), err
+	}
+
+	return value, nil
 }
