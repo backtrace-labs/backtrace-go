@@ -32,15 +32,15 @@ var (
 	windowsGUIDCommand = []string{"reg", "query", "\"HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Cryptography\"", "/v", "MachineGuid"}
 	linuxGUIDCommand   = []string{"sh", "-c", "( cat /var/lib/dbus/machine-id /etc/machine-id 2> /dev/null || hostname ) | head -n 1 || :"}
 	freebsdGUIDCommand = []string{"sh", "-c", "kenv -q smbios.system.uuid || sysctl -n kern.hostuuid"}
-	darwinGUIDCommand  = []string{"sh", "-c", "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | awk -F'= \"' '{print $2}' | tr -d '\"'"}
+	darwinGUIDCommand  = []string{"sh", "-c", "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | awk -F'= \"' '{print $2}' | tr -d '\"' | tr -d '\n'"}
 
 	windowsCPUCommand = []string{"wmic", "CPU", "get", "NAME"}
 	linuxCPUCommand   = []string{"sh", "-c", "lscpu | grep \"Model name\" | awk -F':' '{print $2}' | sed 's/^[[:space:]]*//'"}
-	darwinCPUCommand  = []string{"sh", "-c", "sysctl -n machdep.cpu.brand_string"}
+	darwinCPUCommand  = []string{"sh", "-c", "sysctl -n machdep.cpu.brand_string | tr -d '\n'"}
 	freebsdCPUCommand = []string{"sh", "-c", "sysctl -n hw.model"}
 
 	linuxOSVersionCommand   = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
-	darwinOSVersionCommand  = []string{"sh", "-c", "sw_vers | grep ProductVersion | awk -F':' '{print $2}' | tr -d '\t'"}
+	darwinOSVersionCommand  = []string{"sh", "-c", "sw_vers | grep ProductVersion | awk -F':' '{print $2}' | tr -d '\t' | tr -d '\n'"}
 	freebsdOSVersionCommand = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
 )
 
@@ -369,6 +369,10 @@ func processAndSend(payload *reportPayload) {
 	report["mainThread"] = "0"
 	report["sourceCode"] = sourceCode
 	report["classifiers"] = []string{payload.classifier}
+
+	if runtime.GOOS == "linux" {
+		readMemProcInfo()
+	}
 
 	fullUrl := Options.Endpoint
 
