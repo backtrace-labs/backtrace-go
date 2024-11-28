@@ -3,6 +3,7 @@ module github.com/backtrace-labs/backtrace-go
 go 1.22
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/sys v0.25.0
 )
