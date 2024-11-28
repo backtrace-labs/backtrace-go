@@ -8,6 +8,7 @@ import (
 
 type Thread struct {
 	Name   string       `json:"name"`
+	Fault  bool         `json:"fault"`
 	Stacks []StackFrame `json:"stack"`
 }
 
@@ -41,7 +42,7 @@ func ParseThreadsFromStack(stackTrace []byte) (map[string]Thread, map[string]Sou
 		lines := strings.Split(stackText, "\n")
 
 		sf := StackFrame{}
-		thread := Thread{Name: strings.TrimSuffix(lines[0], ":")}
+		thread := Thread{Name: strings.TrimSuffix(lines[0], ":"), Fault: threadID == 0}
 		for i := 1; i < len(lines); i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
