@@ -15,27 +15,24 @@ const (
 
 var (
 	paths  = []string{memPath, procPath}
-	memMap = map[string]string{
-		"MemTotal":     "system.memory.total",
-		"MemFree":      "system.memory.free",
-		"MemAvailable": "system.memory.available",
-		"Buffers":      "system.memory.buffers",
-		"Cached":       "system.memory.cached",
-		"SwapCached":   "system.memory.swap.cached",
-		"Active":       "system.memory.active",
-		"Inactive":     "system.memory.inactive",
-		"SwapTotal":    "system.memory.swap.total",
-		"SwapFree":     "system.memory.swap.free",
-		"Dirty":        "system.memory.dirty",
-		"Writeback":    "system.memory.writeback",
-		"Slab":         "system.memory.slab",
-		"VmallocTotal": "system.memory.vmalloc.total",
-		"VmallocUsed":  "system.memory.vmalloc.used",
-		"VmallocChunk": "system.memory.vmalloc.chunk",
-	}
-
-	procMap = map[string]string{
-		"nonvoluntary_ctxt_switches": " sched.cs.involuntary",
+	mapper = map[string]string{
+		"MemTotal":                   "system.memory.total",
+		"MemFree":                    "system.memory.free",
+		"MemAvailable":               "system.memory.available",
+		"Buffers":                    "system.memory.buffers",
+		"Cached":                     "system.memory.cached",
+		"SwapCached":                 "system.memory.swap.cached",
+		"Active":                     "system.memory.active",
+		"Inactive":                   "system.memory.inactive",
+		"SwapTotal":                  "system.memory.swap.total",
+		"SwapFree":                   "system.memory.swap.free",
+		"Dirty":                      "system.memory.dirty",
+		"Writeback":                  "system.memory.writeback",
+		"Slab":                       "system.memory.slab",
+		"VmallocTotal":               "system.memory.vmalloc.total",
+		"VmallocUsed":                "system.memory.vmalloc.used",
+		"VmallocChunk":               "system.memory.vmalloc.chunk",
+		"nonvoluntary_ctxt_switches": "sched.cs.involuntary",
 		"voluntary_ctxt_switches":    "sched.cs.voluntary",
 		"FDSize":                     "descriptor.count",
 		"VmData":                     "vm.data.size",
@@ -80,18 +77,9 @@ func readFile(path string) {
 
 		values := strings.Split(string(l), ":")
 		if len(values) == 2 {
-			trimmedValue := strings.TrimSpace(values[1])
-			if path == memPath {
-				mapValues(values[0], trimmedValue, memMap)
-			} else {
-				mapValues(values[0], trimmedValue, procMap)
+			if attr, exists := mapper[values[0]]; exists {
+				Options.Attributes[attr] = strings.TrimSuffix(strings.TrimSpace(values[1]), " kB")
 			}
 		}
-	}
-}
-
-func mapValues(key string, value string, mapper map[string]string) {
-	if attr, exists := mapper[key]; exists {
-		Options.Attributes[attr] = value
 	}
 }
