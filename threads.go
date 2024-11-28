@@ -119,6 +119,13 @@ func readFileGetSourceCode(path string) SourceCode {
 }
 
 func getLastPathIndexAndFunction(line string) (int, string) {
+	if strings.HasSuffix(line, ")") {
+		lastIndex := strings.LastIndex(line, "(")
+		if lastIndex != -1 {
+			line = line[:lastIndex]
+		}
+	}
+
 	lastIndex := strings.LastIndex(line, ".")
 	function, _, _ := strings.Cut(line[lastIndex+1:], "(")
 	return lastIndex, function
