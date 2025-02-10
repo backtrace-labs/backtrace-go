@@ -212,6 +212,8 @@ func sendReportString(msg string, classifier string, extraAttributes map[string]
 
 	attributes := map[string]interface{}{}
 
+	updateAttrsWithProcMemInfo(attributes)
+
 	for k, v := range Options.Attributes {
 		attributes[k] = v
 	}
@@ -369,10 +371,6 @@ func processAndSend(payload *reportPayload) {
 	report["mainThread"] = "0"
 	report["sourceCode"] = sourceCode
 	report["classifiers"] = []string{payload.classifier}
-
-	if runtime.GOOS == "linux" {
-		readMemProcInfo()
-	}
 
 	fullUrl := Options.Endpoint
 
