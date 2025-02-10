@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -50,20 +51,32 @@ var (
 	}
 )
 
-func readMemProcInfo() {
-	for _, path := range paths {
-		readFile(path)
+func updateAttrsWithProcMemInfo(attributes map[string]interface{}) {
+	if runtime.GOOS == "linux" {
+		updateAttrsWithProcMemInfoLinux(attributes)
 	}
 }
 
-func readFile(path string) {
+func updateAttrsWithProcMemInfoLinux(attributes map[string]interface{}) {
+	for _, path := range paths {
+		readFileIntoAttrs(path, attributes)
+	}
+}
+
+func readFileIntoAttrs(path string, attributes map[string]interface{}) {
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatal(err)
+		if Options.DebugBacktrace {
+			log.Printf("readFileIntoAttrs err: %v", err)
+		}
+		return
 	}
 	defer file.Close()
+	readKeyValueLinesIntoAttrs(file, attributes)
+}
 
-	reader := bufio.NewReader(file)
+func readKeyValueLinesIntoAttrs(r io.Reader, attributes map[string]interface{}) {
+	reader := bufio.NewReader(r)
 	for {
 		l, _, err := reader.ReadLine()
 		if err != nil {
@@ -71,7 +84,7 @@ func readFile(path string) {
 				break
 			} else {
 				if Options.DebugBacktrace {
-					log.Printf("readFile err: %v", err)
+					log.Printf("readKeyValueLinesIntoAttrs err: %v", err)
 				}
 				break
 			}
@@ -79,30 +92,33 @@ func readFile(path string) {
 
 		values := strings.Split(string(l), ":")
 		if len(values) == 2 {
-			if attr, exists := mapper[values[0]]; exists {
-				value, err := getValue(values[1])
-				if err != nil {
-					continue
+			attr := values[0]
+			value, err := getNormalizedValue(values[1])
+			if err != nil {
+				if Options.DebugBacktrace {
+					log.Printf("readKeyValueLinesIntoAttrs err: %v", err)
 				}
-				Options.Attributes[attr] = value
+				continue
+			}
+
+			if btAttr, exists := mapper[attr]; exists {
+				attributes[btAttr] = value
 			}
 		}
 	}
 }
 
-func getValue(value string) (string, error) {
+func getNormalizedValue(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if strings.HasSuffix(value, "kB") {
 		value = strings.TrimSuffix(value, " kB")
 
 		atoi, err := strconv.ParseInt(value, 10, 64)
-		if err != nil && Options.DebugBacktrace {
-			log.Printf("readFile err: %v", err)
+		if err != nil {
 			return "", err
 		}
 		atoi *= 1024
 		return fmt.Sprintf("%d", atoi), err
 	}
-
 	return value, nil
 }
