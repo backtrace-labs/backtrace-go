@@ -44,7 +44,7 @@ func TestTransportPause(t *testing.T) {
 	if !tr.rateLimited() {
 		t.Error("pause not applied")
 	}
-	if err := tr.send("http://127.0.0.1:1/unused", []byte("{}"), nil, diag{}); err != errRateLimited {
+	if err := tr.send("http://127.0.0.1:1/unused", []byte("{}"), nil, nil, diag{}); err != errRateLimited {
 		t.Errorf("send while paused = %v, want errRateLimited", err)
 	}
 }
@@ -61,6 +61,10 @@ func TestRedactURL(t *testing.T) {
 	// submit.backtrace.io embeds the token as the second path segment.
 	if got := redactURL("https://submit.backtrace.io/universe/secret-token/json"); got != "https://submit.backtrace.io/universe/REDACTED/json" {
 		t.Errorf("submit path token not redacted: %q", got)
+	}
+	// Two-segment form (no trailing /json) still carries the token.
+	if got := redactURL("https://submit.backtrace.io/universe/secret-token"); got != "https://submit.backtrace.io/universe/REDACTED" {
+		t.Errorf("2-segment submit path token not redacted: %q", got)
 	}
 	// Other tokenless URLs pass through unchanged.
 	if got := redactURL("https://uni.sp.backtrace.io/api/post"); got != "https://uni.sp.backtrace.io/api/post" {

@@ -233,6 +233,9 @@ func (c *Client) Flush(timeout time.Duration) bool {
 // Subsequent reports are dropped (and counted). Close is idempotent.
 // Call Flush first if you need a bounded wait; Close waits for the full
 // drain (each send is bounded by the configured timeout).
+//
+// Close and Flush must not be called from inside a BeforeSend hook: the
+// hook runs on the worker goroutine those calls wait on.
 func (c *Client) Close() {
 	c.qmu.Lock()
 	if !c.closed {
@@ -431,23 +434,37 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		return
 	}
 
+	// Breadcrumbs also travel as the bt-breadcrumbs-0 attachment, the file
+	// the Backtrace UI's breadcrumb view reads (same format as the other
+	// Backtrace SDKs). Sourced from the annotation so a BeforeSend hook
+	// that scrubbed or removed breadcrumbs is respected.
+	var inline []inlinePart
+	if crumbs, ok := report.Annotations["breadcrumbs"].([]Breadcrumb); ok && len(crumbs) > 0 {
+		if data, err := json.Marshal(crumbs); err == nil {
+			inline = append(inline, inlinePart{name: "bt-breadcrumbs-0", data: data})
+		}
+	}
+
 	if cfg.Debug {
 		pretty, _ := json.MarshalIndent(report.toWire(), "", "  ")
 		d.logf("sending report %s to %s\n%s", report.UUID, redactURL(cfg.submissionURL()), pretty)
 	}
 
-	if err := c.transport.send(cfg.submissionURL(), body, report.Attachments, d); err != nil {
+	if err := c.transport.send(cfg.submissionURL(), body, report.Attachments, inline, d); err != nil {
 		c.dropped.Add(1)
 		d.logf("report %s dropped: %v", report.UUID, err)
 	}
 }
 
-// runBeforeSend isolates user hook panics from the worker.
+// runBeforeSend isolates user hook panics from the worker. A panicking hook
+// drops the report (fail closed): hooks exist to scrub sensitive data, and a
+// report in a half-scrubbed state must never leave the process.
 func (c *Client) runBeforeSend(hook func(*ReportData) *ReportData, report *ReportData, d diag) (out *ReportData) {
 	defer func() {
 		if r := recover(); r != nil {
-			d.logf("BeforeSend panicked (%v); sending report unmodified", r)
-			out = report
+			c.dropped.Add(1)
+			d.logf("BeforeSend panicked (%v); dropping report %s", r, report.UUID)
+			out = nil
 		}
 	}()
 	return hook(report)

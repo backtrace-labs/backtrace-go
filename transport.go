@@ -59,12 +59,18 @@ func (t *httpTransport) pause(d time.Duration) {
 // skipped with a diagnostic.
 const maxAttachmentSize = 10 << 20 // 10 MiB
 
+// inlinePart is an in-memory attachment (e.g. the bt-breadcrumbs-0 file).
+type inlinePart struct {
+	name string
+	data []byte
+}
+
 // send POSTs body to url. Attachments, when present, switch the request to
 // the documented multipart form ("upload_file" part for the report JSON,
 // "attachment_<name>" parts for files). A non-2xx response is an error; a
 // 429 additionally pauses future sends until the server's Retry-After
 // deadline.
-func (t *httpTransport) send(url string, body []byte, attachments []string, d diag) error {
+func (t *httpTransport) send(url string, body []byte, attachments []string, inline []inlinePart, d diag) error {
 	if t.rateLimited() {
 		return errRateLimited
 	}
@@ -73,8 +79,8 @@ func (t *httpTransport) send(url string, body []byte, attachments []string, d di
 		reqBody     io.Reader = bytes.NewReader(body)
 		contentType           = "application/json"
 	)
-	if len(attachments) > 0 {
-		multipartBody, multipartType, err := buildMultipart(body, attachments, d)
+	if len(attachments) > 0 || len(inline) > 0 {
+		multipartBody, multipartType, err := buildMultipart(body, attachments, inline, d)
 		if err != nil {
 			return fmt.Errorf("bt: building multipart request: %w", err)
 		}
@@ -118,9 +124,11 @@ func (t *httpTransport) send(url string, body []byte, attachments []string, d di
 
 // buildMultipart assembles the multipart body documented for Backtrace
 // submissions: the report JSON in an "upload_file" part plus one
-// "attachment_<basename>" part per readable attachment. Unreadable or
-// oversized files are skipped, never failing the report itself.
-func buildMultipart(body []byte, attachments []string, d diag) (io.Reader, string, error) {
+// "attachment_<basename>" part per readable attachment. Unreadable,
+// non-regular, or oversized files are skipped, never failing the report
+// itself. The size cap is enforced at read time (a file may grow between
+// stat and copy).
+func buildMultipart(body []byte, attachments []string, inline []inlinePart, d diag) (io.Reader, string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 
@@ -132,11 +140,27 @@ func buildMultipart(body []byte, attachments []string, d diag) (io.Reader, strin
 		return nil, "", err
 	}
 
-	seen := map[string]int{}
+	used := map[string]bool{}
+	for _, p := range inline {
+		used[p.name] = true
+		part, err := w.CreateFormFile("attachment_"+p.name, p.name)
+		if err == nil {
+			_, err = part.Write(p.data)
+		}
+		if err != nil {
+			return nil, "", err
+		}
+	}
+
 	for _, path := range attachments {
 		info, err := os.Stat(path)
 		if err != nil {
 			d.logf("attachment %q skipped: %v", path, err)
+			continue
+		}
+		// FIFOs and devices would block or read unbounded data.
+		if !info.Mode().IsRegular() {
+			d.logf("attachment %q skipped: not a regular file", path)
 			continue
 		}
 		if info.Size() > maxAttachmentSize {
@@ -152,18 +176,38 @@ func buildMultipart(body []byte, attachments []string, d diag) (io.Reader, strin
 		// Attachments from different directories may share a
 		// basename; uniquify so no part overwrites another.
 		name := filepath.Base(path)
-		if n := seen[name]; n > 0 {
+		if used[name] {
 			ext := filepath.Ext(name)
-			name = fmt.Sprintf("%s_%d%s", strings.TrimSuffix(name, ext), n, ext)
+			stem := strings.TrimSuffix(name, ext)
+			for i := 1; ; i++ {
+				candidate := fmt.Sprintf("%s_%d%s", stem, i, ext)
+				if !used[candidate] {
+					name = candidate
+					break
+				}
+			}
 		}
-		seen[filepath.Base(path)]++
+		used[name] = true
+
+		// Remember the buffer position so an over-limit file can be
+		// rolled back cleanly (part boundaries are only written by
+		// CreateFormFile/Close, so truncating to the mark removes the
+		// whole part).
+		mark := buf.Len()
 		part, err := w.CreateFormFile("attachment_"+name, name)
+		var copied int64
 		if err == nil {
-			_, err = io.Copy(part, file)
+			copied, err = io.Copy(part, io.LimitReader(file, maxAttachmentSize+1))
 		}
 		file.Close()
 		if err != nil {
 			return nil, "", err
+		}
+		if copied > maxAttachmentSize {
+			buf.Truncate(mark)
+			delete(used, name)
+			d.logf("attachment %q skipped: grew beyond the %d byte limit while reading",
+				path, maxAttachmentSize)
 		}
 	}
 
@@ -188,7 +232,9 @@ func redactURL(u string) string {
 	}
 	if strings.EqualFold(parsed.Hostname(), "submit.backtrace.io") {
 		segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-		if len(segments) >= 3 {
+		// The token is always the second path segment
+		// ({universe}/{token}[/{format}]).
+		if len(segments) >= 2 {
 			segments[1] = "REDACTED"
 			parsed.Path = "/" + strings.Join(segments, "/")
 		}

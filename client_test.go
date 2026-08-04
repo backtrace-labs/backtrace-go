@@ -230,15 +230,23 @@ func TestBeforeSendDrops(t *testing.T) {
 	}
 }
 
-func TestBeforeSendPanicIsContained(t *testing.T) {
+// TestBeforeSendPanicDropsReport: a panicking hook must fail closed — the
+// report may be half-scrubbed, so it is dropped and counted, never sent.
+func TestBeforeSendPanicDropsReport(t *testing.T) {
 	c, rs := newTestClient(t, func(cfg *Config) {
-		cfg.BeforeSend = func(r *ReportData) *ReportData { panic("hook bug") }
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			r.Attributes["half"] = "scrubbed"
+			panic("hook bug")
+		}
 	})
-	c.ReportMessage("survives", nil)
+	c.ReportMessage("must not leave the process", nil)
 	c.Flush(5 * time.Second)
 
-	if rs.count() != 1 {
-		t.Fatalf("report lost to BeforeSend panic: %d", rs.count())
+	if rs.count() != 0 {
+		t.Fatalf("half-scrubbed report was sent despite BeforeSend panic: %d", rs.count())
+	}
+	if c.DroppedReports() != 1 {
+		t.Errorf("dropped counter = %d, want 1", c.DroppedReports())
 	}
 }
 
@@ -309,6 +317,111 @@ func TestBreadcrumbsRingAndAnnotation(t *testing.T) {
 	if first["level"] != "info" || first["type"] != "manual" {
 		t.Errorf("breadcrumb defaults not applied: %v", first)
 	}
+
+	// Breadcrumbs also ship as the bt-breadcrumbs-0 attachment the
+	// Backtrace UI reads (same schema as the other Backtrace SDKs).
+	atts := rs.lastAttachments()
+	raw, ok := atts["attachment_bt-breadcrumbs-0"]
+	if !ok {
+		t.Fatalf("bt-breadcrumbs-0 attachment missing; parts: %v", atts)
+	}
+	var fileCrumbs []map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &fileCrumbs); err != nil {
+		t.Fatalf("breadcrumb attachment is not a JSON array: %v", err)
+	}
+	if len(fileCrumbs) != 8 || fileCrumbs[0]["message"] != "crumb 4" {
+		t.Errorf("breadcrumb attachment content wrong: %d entries, first %v",
+			len(fileCrumbs), fileCrumbs[0])
+	}
+}
+
+// TestPanicReportRetriesFullQueue pins the bounded blocking enqueue for
+// panic reports: with the queue full they retry instead of dropping.
+func TestPanicReportRetriesFullQueue(t *testing.T) {
+	block := make(chan struct{})
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.QueueSize = 1
+	})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+
+	rs.mu.Lock()
+	rs.block = block
+	rs.mu.Unlock()
+
+	c.ReportMessage("occupies the worker", nil)
+	select {
+	case <-rs.entered: // worker is now stuck inside the handler
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never reached the transport")
+	}
+	c.ReportMessage("fills the queue", nil)
+
+	done := make(chan struct{})
+	go func() {
+		c.ReportPanicValue("panic while queue full", nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("panic report returned immediately: dropped instead of retrying")
+	case <-time.After(100 * time.Millisecond):
+		// Still retrying, as intended.
+	}
+
+	unblock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic report never enqueued after queue freed")
+	}
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if rs.count() != 3 {
+		t.Errorf("reports delivered = %d, want 3 (panic report lost?)", rs.count())
+	}
+}
+
+// TestFlushSucceedsAfterQueueFullRetry pins Flush's retry loop: a queue that
+// is full when Flush is called must not produce a false negative once it
+// drains within the timeout.
+func TestFlushSucceedsAfterQueueFullRetry(t *testing.T) {
+	block := make(chan struct{})
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.QueueSize = 1
+	})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+
+	rs.mu.Lock()
+	rs.block = block
+	rs.mu.Unlock()
+
+	c.ReportMessage("occupies the worker", nil)
+	select {
+	case <-rs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never reached the transport")
+	}
+	c.ReportMessage("fills the queue", nil)
+
+	res := make(chan bool, 1)
+	go func() { res <- c.Flush(10 * time.Second) }()
+	time.Sleep(50 * time.Millisecond) // let Flush hit the queue-full retry path
+	unblock()
+
+	select {
+	case ok := <-res:
+		if !ok {
+			t.Error("Flush returned false although the queue drained within the timeout")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Flush stuck")
+	}
 }
 
 func TestServerErrorCountsAsDropped(t *testing.T) {
@@ -374,6 +487,22 @@ func TestAttachmentsMultipartSubmission(t *testing.T) {
 	if err := os.WriteFile(attachmentPath, []byte("log line 1\nlog line 2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Same basename in another directory: must arrive under a distinct
+	// part name instead of overwriting the first attachment.
+	dupDir := filepath.Join(dir, "dup")
+	if err := os.MkdirAll(dupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dupPath := filepath.Join(dupDir, "app.log")
+	if err := os.WriteFile(dupPath, []byte("other content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A file whose NATURAL basename collides with a generated candidate:
+	// uniquification must probe past it instead of overwriting.
+	natPath := filepath.Join(dir, "app_1.log")
+	if err := os.WriteFile(natPath, []byte("natural\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	type received struct {
 		reportJSON  map[string]interface{}
@@ -412,7 +541,7 @@ func TestAttachmentsMultipartSubmission(t *testing.T) {
 	c, err := NewClient(Config{
 		Endpoint:        srv.URL,
 		Token:           "attach-test",
-		AttachmentPaths: []string{attachmentPath, filepath.Join(dir, "missing.txt")},
+		AttachmentPaths: []string{attachmentPath, natPath, dupPath, filepath.Join(dir, "missing.txt")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -435,8 +564,14 @@ func TestAttachmentsMultipartSubmission(t *testing.T) {
 		if rec.attachments["attachment_app.log"] != "log line 1\nlog line 2\n" {
 			t.Errorf("attachment content = %q", rec.attachments["attachment_app.log"])
 		}
-		if len(rec.attachments) != 1 {
-			t.Errorf("unreadable attachment not skipped: %v", rec.attachments)
+		if rec.attachments["attachment_app_1.log"] != "natural\n" {
+			t.Errorf("natural basename lost its name: %v", rec.attachments)
+		}
+		if rec.attachments["attachment_app_2.log"] != "other content\n" {
+			t.Errorf("duplicate basename not uniquified past natural collision: %v", rec.attachments)
+		}
+		if len(rec.attachments) != 3 {
+			t.Errorf("attachments = %v (unreadable file not skipped, or parts collided)", rec.attachments)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no submission received")

@@ -8,22 +8,26 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// recordingServer captures submitted reports for assertions.
+// recordingServer captures submitted reports (JSON or multipart) for
+// assertions.
 type recordingServer struct {
-	mu       sync.Mutex
-	payloads []map[string]interface{}
-	status   int
-	block    chan struct{} // when non-nil, handler blocks until closed
-	srv      *httptest.Server
+	mu          sync.Mutex
+	payloads    []map[string]interface{}
+	attachments []map[string]string // parallel to payloads; part name -> content
+	status      int
+	block       chan struct{} // when non-nil, handler blocks until closed
+	entered     chan struct{} // signaled when a handler starts blocking
+	srv         *httptest.Server
 }
 
 func newRecordingServer() *recordingServer {
-	rs := &recordingServer{status: http.StatusOK}
+	rs := &recordingServer{status: http.StatusOK, entered: make(chan struct{}, 64)}
 	rs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rs.mu.Lock()
 		block := rs.block
@@ -31,21 +35,58 @@ func newRecordingServer() *recordingServer {
 		rs.mu.Unlock()
 
 		if block != nil {
+			select {
+			case rs.entered <- struct{}{}:
+			default:
+			}
 			<-block
 		}
 
-		body, err := io.ReadAll(r.Body)
-		if err == nil {
-			payload := map[string]interface{}{}
-			if json.Unmarshal(body, &payload) == nil {
-				rs.mu.Lock()
-				rs.payloads = append(rs.payloads, payload)
-				rs.mu.Unlock()
+		var payload map[string]interface{}
+		atts := map[string]string{}
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+			if err := r.ParseMultipartForm(64 << 20); err == nil {
+				for field, headers := range r.MultipartForm.File {
+					f, err := headers[0].Open()
+					if err != nil {
+						continue
+					}
+					content, _ := io.ReadAll(f)
+					f.Close()
+					if field == "upload_file" {
+						m := map[string]interface{}{}
+						if json.Unmarshal(content, &m) == nil {
+							payload = m
+						}
+					} else {
+						atts[field] = string(content)
+					}
+				}
 			}
+		} else if body, err := io.ReadAll(r.Body); err == nil {
+			m := map[string]interface{}{}
+			if json.Unmarshal(body, &m) == nil {
+				payload = m
+			}
+		}
+		if payload != nil {
+			rs.mu.Lock()
+			rs.payloads = append(rs.payloads, payload)
+			rs.attachments = append(rs.attachments, atts)
+			rs.mu.Unlock()
 		}
 		w.WriteHeader(status)
 	}))
 	return rs
+}
+
+func (rs *recordingServer) lastAttachments() map[string]string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.attachments) == 0 {
+		return nil
+	}
+	return rs.attachments[len(rs.attachments)-1]
 }
 
 func (rs *recordingServer) count() int {
@@ -67,6 +108,7 @@ func (rs *recordingServer) reset() {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.payloads = nil
+	rs.attachments = nil
 }
 
 func attrsOf(t *testing.T, payload map[string]interface{}) map[string]interface{} {
