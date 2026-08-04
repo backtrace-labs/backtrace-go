@@ -1,0 +1,14 @@
+# OS artifacts
+.DS_Store
+
+# Test and coverage artifacts
+*.test
+coverage.out
+
+# Example tracer output
+tracedir/
+tracelog
+
+# Editor directories
+.idea/
+.vscode/

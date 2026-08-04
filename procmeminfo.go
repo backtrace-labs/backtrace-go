@@ -2,9 +2,7 @@ package bt
 
 import (
 	"bufio"
-	"fmt"
 	"io"
-	"log"
 	"os"
 	"runtime"
 	"strconv"
@@ -17,8 +15,8 @@ const (
 )
 
 var (
-	paths  = []string{memPath, procPath}
-	mapper = map[string]string{
+	procPaths  = []string{memPath, procPath}
+	procMapper = map[string]string{
 		"MemTotal":                   "system.memory.total",
 		"MemFree":                    "system.memory.free",
 		"MemAvailable":               "system.memory.available",
@@ -51,74 +49,58 @@ var (
 	}
 )
 
-func updateAttrsWithProcMemInfo(attributes map[string]interface{}) {
-	if runtime.GOOS == "linux" {
-		updateAttrsWithProcMemInfoLinux(attributes)
+// updateAttrsWithProcMemInfo adds memory and scheduler attributes from
+// /proc on Linux; it is a no-op elsewhere.
+func updateAttrsWithProcMemInfo(attributes map[string]interface{}, d diag) {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	for _, path := range procPaths {
+		readFileIntoAttrs(path, attributes, d)
 	}
 }
 
-func updateAttrsWithProcMemInfoLinux(attributes map[string]interface{}) {
-	for _, path := range paths {
-		readFileIntoAttrs(path, attributes)
-	}
-}
-
-func readFileIntoAttrs(path string, attributes map[string]interface{}) {
+func readFileIntoAttrs(path string, attributes map[string]interface{}, d diag) {
 	file, err := os.Open(path)
 	if err != nil {
-		if Options.DebugBacktrace {
-			log.Printf("readFileIntoAttrs err: %v", err)
-		}
+		d.logf("readFileIntoAttrs: %v", err)
 		return
 	}
 	defer file.Close()
 	readKeyValueLinesIntoAttrs(file, attributes)
 }
 
+// readKeyValueLinesIntoAttrs parses "Key:   value [kB]" lines, mapping known
+// keys to Backtrace attribute names. Values are emitted as numbers where
+// possible (kB values converted to bytes) so the Backtrace query engine can
+// aggregate them.
 func readKeyValueLinesIntoAttrs(r io.Reader, attributes map[string]interface{}) {
-	reader := bufio.NewReader(r)
-	for {
-		l, _, err := reader.ReadLine()
-		if err != nil {
-			if err == io.EOF {
-				break
-			} else {
-				if Options.DebugBacktrace {
-					log.Printf("readKeyValueLinesIntoAttrs err: %v", err)
-				}
-				break
-			}
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), ":")
+		if !ok {
+			continue
 		}
-
-		values := strings.Split(string(l), ":")
-		if len(values) == 2 {
-			attr := values[0]
-			value, err := getNormalizedValue(values[1])
-			if err != nil {
-				if Options.DebugBacktrace {
-					log.Printf("readKeyValueLinesIntoAttrs err: %v", err)
-				}
-				continue
-			}
-
-			if btAttr, exists := mapper[attr]; exists {
-				attributes[btAttr] = value
-			}
+		btAttr, known := procMapper[key]
+		if !known {
+			continue
 		}
+		attributes[btAttr] = normalizeProcValue(value)
 	}
 }
 
-func getNormalizedValue(value string) (string, error) {
+// normalizeProcValue converts proc values to int64 where possible; " kB"
+// suffixed values become bytes.
+func normalizeProcValue(value string) interface{} {
 	value = strings.TrimSpace(value)
-	if strings.HasSuffix(value, "kB") {
-		value = strings.TrimSuffix(value, " kB")
-
-		atoi, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return "", err
+	if kb, found := strings.CutSuffix(value, " kB"); found {
+		if n, err := strconv.ParseInt(strings.TrimSpace(kb), 10, 64); err == nil {
+			return n * 1024
 		}
-		atoi *= 1024
-		return fmt.Sprintf("%d", atoi), err
+		return value
 	}
-	return value, nil
+	if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return n
+	}
+	return value
 }

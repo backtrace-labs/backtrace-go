@@ -6,12 +6,38 @@ on:
       - master
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  run-tests:
-    name: lint-and-test
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Check gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required for:"; echo "$unformatted"; exit 1
+          fi
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  test:
+    name: test (go ${{ matrix.go-version }}, ${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        go-version: [1.18, 1.22]
+        # Support policy: the two most recent Go releases (go.mod
+        # declares the minimum).
+        go-version: ['1.25.x', '1.26.x']
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -20,10 +46,34 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+      - name: Vet
+        run: go vet ./...
+      - name: Run unit tests (race detector)
+        run: go test -race -count=1 ./...
+
+  cross-compile:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - linux/amd64
+          - linux/arm
+          - linux/arm64
+          - windows/amd64
+          - darwin/arm64
+          - freebsd/amd64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          version: v1.60
-      - name: Run Unit Tests
+          go-version: stable
+      - name: Build
         run: |
-          go test
+          export GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}"
+          go build ./...
+          go vet ./...
+        env:
+          TARGET: ${{ matrix.target }}

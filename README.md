@@ -1,6 +1,9 @@
 # backtrace-go
 
-[Backtrace](http://backtrace.io/) error reporting tool for Go.
+[Backtrace](https://backtrace.io/) error reporting SDK for Go.
+
+Reports errors, messages, and panics — with goroutine stacks, source context, rich attributes, breadcrumbs, and file attachments to the Backtrace (Sauce Labs) platform.
+The package also ships an integration with out-of-process tracers ([bcd](#bcd-out-of-process-tracing)).
 
 ## Installation
 
@@ -8,94 +11,166 @@
 go get github.com/backtrace-labs/backtrace-go
 ```
 
-## Usage
+Requires Go 1.25+. The only dependency is `golang.org/x/sys`.
 
-In Go there are three ways errors can happen:
-
- * An operation produces an `error` return value.
- * A goroutine calls `panic`.
- * A native library crashes or the Go runtime itself crashes.
-
-backtrace-go handles `error` and `panic` situations. However, there are some
-caveats with handling panics:
-
- * In order to capture error reports in a panic scenario, every goroutine must
-   make an API call to set up panic handling.
- * It's possible to forget to do this setup, and you might not know when a
-   callback is executed as a goroutine.
- * If a Go application makes any calls into native libraries, a crash in a
-   native library will crash without causing a panic.
-
-Fortunately, there is a robust solution which can capture an error report
-in all of these circumstances. This is a Backtrace product called
-[Coresnap](https://documentation.backtrace.io/coresnapintro/) which supports
-deep introspection into the state of Go applications.
-
-The recommended way to capture error reports in a Go application is to use
-coresnap to handle panics and crashes, and to use backtrace-go to report
-non-fatal error conditions.
+## Quick start
 
 ```go
-import (
-    "http"
+package main
 
-    "github.com/backtrace-labs/backtrace-go"
+import (
+	"errors"
+
+	bt "github.com/backtrace-labs/backtrace-go"
 )
 
+func main() {
+	client, err := bt.NewClient(bt.Config{
+		Endpoint: "https://submit.backtrace.io/{universe}/{token}/json",
+	})
+	if err != nil {
+		// Endpoint missing or malformed.
+		panic(err)
+	}
+	defer client.Close()
+
+	client.Report(errors.New("something went wrong"), map[string]interface{}{
+		"request.id": "abc-123",
+	})
+}
+```
+
+Two endpoint forms are supported:
+
+- `https://submit.backtrace.io/{universe}/{token}/json` | `Endpoint` only |
+- `https://{universe}.sp.backtrace.io` | `Endpoint` + `Token` |
+
+`BACKTRACE_ENDPOINT` and `BACKTRACE_TOKEN` environment variables are used as fallbacks when the corresponding fields are empty.
+
+## Reporting
+
+```go
+client.Report(err, nil)                          // error (type + unwrap chain captured)
+client.ReportMessage("cache warmup skipped", nil) // plain message
+client.ReportPanicValue(recovered, nil)           // recovered panic value
+
+// Panic capture with defer:
+defer bt.ReportPanic(nil)           // reports, flushes, re-panics
+defer bt.ReportAndRecoverPanic(nil) // reports and swallows the panic
+```
+
+Reporting never blocks the caller on network I/O: reports are queued to a background worker, and when the queue is full new reports are dropped and counted (`client.DroppedReports()`) instead of stalling the application.
+
+Delivery lifecycle:
+
+```go
+client.Flush(5 * time.Second) // wait for queued reports; client stays usable
+client.Close()                // drain, stop the worker, release the client
+```
+
+## Configuration
+
+```go
+client, err := bt.NewClient(bt.Config{
+	Endpoint:             "https://submit.backtrace.io/{universe}/{token}/json",
+	CaptureAllGoroutines: true,                 // include every goroutine's stack
+	SourceCode:           bt.SourceCodeContext, // context lines (default), File, or None
+	ContextLineCount:     8,                    // lines above/below each frame
+	Attributes: map[string]interface{}{         // stamped on every report
+		"application.environment": "production",
+	},
+	AttachmentPaths: []string{"/var/log/app.log"}, // uploaded with every report
+	SendEnvVars:     true,  // env vars as annotation, secrets redacted
+	SampleRate:      1.0,   // fraction of reports sent (0 == 1.0)
+	BeforeSend: func(r *bt.ReportData) *bt.ReportData {
+		delete(r.Attributes, "secret") // scrub, enrich, or return nil to drop
+		return r
+	},
+	Debug: false, // diagnostic logging; the SDK never panics either way
+})
+```
+
+All zero values are sensible defaults: 30s HTTP timeout, queue of 128, 8 context lines, 64 breadcrumbs, error chains capped at 100.
+
+### Attributes, breadcrumbs
+
+```go
+client.SetAttribute("user.id", "u-42")        // safe from any goroutine
+client.AddBreadcrumb(bt.Breadcrumb{
+	Message: "checkout started",
+	Level:   bt.BreadcrumbInfo,
+})
+```
+
+Every report automatically includes: hostname, process ID and age, Go version, goroutine count, heap statistics, GC count, CPU architecture and model, OS version, machine GUID, `application.version` / `vcs.revision` (from Go build info), the Go module dependency list, and — on Linux —`/proc` memory and scheduler attributes.
+
+### net/http middleware
+
+```go
+import "github.com/backtrace-labs/backtrace-go/bthttp"
+
+handler := bthttp.New(bthttp.Options{
+	Client:          client, // omit to use the global reporter
+	Repanic:         false,  // re-raise after reporting
+	WaitForDelivery: true,   // block the failing request until delivered
+})
+http.ListenAndServe(":8080", handler.Handle(mux))
+```
+
+Panics in handlers are reported with `request.url`, `request.method`,
+`request.remote_addr`, and `request.user_agent` attributes.
+
+## Legacy global API
+
+The historical package-level API keeps working unchanged:
+
+```go
+import bt "github.com/backtrace-labs/backtrace-go"
+
 func init() {
-    bt.Options.Endpoint = "https://console.backtrace.io"
-    bt.Options.Token = "51cc8e69c5b62fa8c72dc963e730f1e8eacbd243aeafc35d08d05ded9a024121"
+	bt.Options.Endpoint = "https://submit.backtrace.io/{universe}/{token}/json"
 }
 
 func foo() {
-    response, err := http.Get("https://doesnotexistexample.com")
-    if err != nil {
-        bt.Report(err, nil)
-    }
+	if err := doWork(); err != nil {
+		bt.Report(err, nil)
+	}
 }
 ```
 
-## Documentation
+Notes:
 
-### bt.Report(msg interface{}, attributes map[string]string)
+- Configure `bt.Options` before the first report. For attribute changes at runtime use `bt.SetAttribute` / `bt.SetAttributes`, which are safe for concurrent use.
+- `bt.FinishSendingReports()` now waits for queued reports **without** stopping the reporter (historically it killed the sender permanently): prefer `bt.Flush(timeout)`.
+- Source capture now defaults to context lines around each frame instead of whole files: opt back in with `Options.SourceCode = bt.SourceCodeFile`.
+- The SDK never panics. `DebugBacktrace` only controls diagnostic logging.
 
-msg can be an `error` or something that can be converted to a `string`.
-`attributes` are added to the report.
+## Thread-safety contract
 
-### bt.ReportPanic(attributes map[string]string)
+`Client` methods, the package-level reporting functions, `SetAttribute`,
+`AddBreadcrumb`, `Flush`, and `Close` are safe for concurrent use. The
+`Options` struct and `Config` maps are read when reports are captured;
+mutate them only before reporting starts (or via `SetAttribute`).
 
-Sends an error report in the event of a panic.
+# bcd (out-of-process tracing)
 
-```go
-defer bt.ReportPanic(nil)
-somethingThatMightPanic()
+The `bt` package also provides integration with out-of-process tracers.
+Using the provided `Tracer` interface, applications may invoke tracer execution on demand: panic and signal handling integrations are provided.
+A default `Tracer` implementation for the Backtrace platform (`BTTracer`, Linux/FreeBSD) is included.
+
+See the [godoc](https://pkg.go.dev/github.com/backtrace-labs/backtrace-go)
+and [examples/bcd/main.go](examples/bcd/main.go).
+
+## Examples
+
+- [examples/report](examples/report/main.go) — error reporting, breadcrumbs, BeforeSend, middleware.
+- [examples/bcd](examples/bcd/main.go) — tracer integration: signals, panic recovery, snapshot upload.
+
+## Development
+
 ```
-
-### bt.ReportAndRecoverPanic(attributes map[string]string)
-
-This is the same as `bt.ReportPanic` but it recovers from the
-panic and the goroutine lives on.
-
-### bt.FinishSendingReports()
-
-backtrace-go sends reports in a goroutine to avoid blocking.
-When your application shuts down it will abort any ongoing sending of
-reports. Call this function to block until all queued reports are done
-sending.
-
-# bcd
-
-Package provides integration with out of process tracers. Using the provided
-Tracer interface, applications may invoke tracer execution on demand. Panic and
-signal handling integrations are provided.
-
-The Tracer interface is generic and will support any out of process tracer
-implementing it. A default Tracer implementation, which uses the Backtrace I/O
-platform, is provided.
-
-## Usage
-
-See the [godoc page](https://godoc.org/github.com/backtrace-labs/backtrace-go) for
-current documentation;
-see [this](https://github.com/backtrace-labs/backtrace-go/blob/master/examples/main.go)
-for an example application.
+make help    # list targets
+make race    # go test -race ./...
+make lint    # golangci-lint v2
+make cross   # cross-compile all supported platforms
+```

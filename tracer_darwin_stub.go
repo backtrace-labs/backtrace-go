@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 //nolint:all
@@ -85,9 +86,17 @@ type NewOptions struct {
 }
 
 // Returns a new object implementing the bt.Tracer and bt.TracerSig interfaces
-// using the Backtrace debugging platform.
+// using the Backtrace debugging platform. On macOS the tracer is a stub:
+// methods are no-ops and Trace requests fail gracefully.
 func New(options NewOptions) *BTTracer {
-	return &BTTracer{}
+	return &BTTracer{
+		defaultTraceOptions: TraceOptions{
+			Faulted:           true,
+			CallerOnly:        false,
+			ErrClassification: true,
+			Timeout:           time.Second * 120,
+		},
+	}
 }
 
 type PutOptions struct {
@@ -152,8 +161,12 @@ func (t *BTTracer) SetPipes(stdin io.Reader, stderr io.Writer) {
 func (t *BTTracer) SetLogger(logger Log) {
 }
 
-// See bt.Tracer.AddOptions().
+// See bt.Tracer.AddOptions(). Honors the interface contract: a non-nil
+// options slice is extended and returned.
 func (t *BTTracer) AddOptions(options []string, v ...string) []string {
+	if options != nil {
+		return append(options, v...)
+	}
 	return nil
 }
 

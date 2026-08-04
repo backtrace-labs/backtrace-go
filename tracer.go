@@ -1,4 +1,4 @@
-// +build linux freebsd
+//go:build linux || freebsd
 
 package bt
 
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -58,6 +59,11 @@ type BTTracer struct {
 	// Protects tracer state modification.
 	m sync.RWMutex
 
+	// Protects the logger reference independently of m: Logf is called
+	// from paths that hold m (recursively read-locking a sync.RWMutex
+	// deadlocks once a writer is queued).
+	logMu sync.RWMutex
+
 	// Logs tracer execution status messages.
 	logger Log
 
@@ -69,12 +75,17 @@ type BTTracer struct {
 }
 
 type defaultLogger struct {
+	mu     sync.Mutex
 	logger *log.Logger
 	level  LogPriority
 }
 
 func (d *defaultLogger) Logf(level LogPriority, format string, v ...interface{}) {
-	if (d.level & level) == 0 {
+	d.mu.Lock()
+	enabled := (d.level & level) != 0
+	d.mu.Unlock()
+
+	if !enabled {
 		return
 	}
 
@@ -82,6 +93,9 @@ func (d *defaultLogger) Logf(level LogPriority, format string, v ...interface{})
 }
 
 func (d *defaultLogger) SetLogLevel(level LogPriority) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.level = level
 }
 
@@ -187,11 +201,14 @@ type PutOptions struct {
 // options: Modifies behavior of the Put action; see PutOptions documentation
 // for more details.
 func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) error {
-	if endpoint == "" || token == "" {
-		return errors.New("Endpoint must be non-empty")
+	if endpoint == "" {
+		return errors.New("endpoint must be non-empty")
+	}
+	if token == "" {
+		return errors.New("token must be non-empty")
 	}
 
-	url, err := url.Parse(endpoint)
+	u, err := url.Parse(endpoint)
 	if err != nil {
 		return err
 	}
@@ -201,27 +218,30 @@ func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) erro
 	// (unlikely) case of an unspecified scheme. We won't allow other
 	// cases, like a port specified without a scheme, though, as per
 	// RFC 3986.
-	if url.Host == "" {
-		if url.Path == "" {
+	if u.Host == "" {
+		if u.Path == "" {
 			return errors.New("invalid URL specification: host " +
 				"or path must be non-empty")
 		}
 
-		url.Host = url.Path
+		u.Host = u.Path
+		u.Path = ""
 	}
 
-	if url.Scheme == "" {
-		url.Scheme = defaultCoronerScheme
+	if u.Scheme == "" {
+		u.Scheme = defaultCoronerScheme
 	}
 
-	if !strings.ContainsAny(url.Host, ":") {
-		url.Host += ":" + defaultCoronerPort
+	// Apply the default port IPv6-safely: Hostname() strips any
+	// brackets and JoinHostPort restores them as needed.
+	if _, _, portErr := net.SplitHostPort(u.Host); portErr != nil {
+		u.Host = net.JoinHostPort(u.Hostname(), defaultCoronerPort)
 	}
 
-	url.Path = "post"
-	url.RawQuery = fmt.Sprintf("token=%s", token)
+	u.Path = "post"
+	u.RawQuery = url.Values{"token": {token}}.Encode()
 
-	t.put.endpoint = url.String()
+	t.put.endpoint = u.String()
 	t.put.options = options
 
 	t.Logf(LogDebug, "Put enabled (endpoint: %s, unlink: %v)\n",
@@ -303,9 +323,14 @@ func (t *BTTracer) putSnapshotFile(path string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain (bounded) so the keep-alive connection can be reused
+		// across PutDir loops.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+	}()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("failed to upload: %s", resp.Status)
 	}
 
@@ -373,6 +398,9 @@ func (t *BTTracer) SetPipes(stdin io.Reader, stderr io.Writer) {
 
 // Sets the logger for the tracer.
 func (t *BTTracer) SetLogger(logger Log) {
+	t.logMu.Lock()
+	defer t.logMu.Unlock()
+
 	t.logger = logger
 }
 
@@ -462,13 +490,19 @@ func (t *BTTracer) DefaultTraceOptions() *TraceOptions {
 
 // See bt.Tracer.Finalize().
 func (t *BTTracer) Finalize(options []string) *exec.Cmd {
+	// Snapshot under the lock, then build and log without holding it:
+	// Logf must never run while m is held (recursive RLock).
 	t.m.RLock()
-	defer t.m.RUnlock()
+	cmd := t.cmd
+	dir := t.outputDir
+	stdin := t.p.stdin
+	stderr := t.p.stderr
+	t.m.RUnlock()
 
-	tracer := exec.Command(t.cmd, options...)
-	tracer.Dir = t.outputDir
-	tracer.Stdin = t.p.stdin
-	tracer.Stderr = t.p.stderr
+	tracer := exec.Command(cmd, options...)
+	tracer.Dir = dir
+	tracer.Stdin = stdin
+	tracer.Stderr = stderr
 
 	t.Logf(LogDebug, "Command: %v\n", tracer)
 
@@ -476,17 +510,25 @@ func (t *BTTracer) Finalize(options []string) *exec.Cmd {
 }
 
 func (t *BTTracer) Logf(level LogPriority, format string, v ...interface{}) {
-	t.m.RLock()
-	defer t.m.RUnlock()
+	t.logMu.RLock()
+	logger := t.logger
+	t.logMu.RUnlock()
 
-	t.logger.Logf(level, format, v...)
+	if logger != nil {
+		// Called outside any BTTracer lock: format arguments may
+		// re-enter the tracer (e.g. %s on the tracer itself).
+		logger.Logf(level, format, v...)
+	}
 }
 
 func (t *BTTracer) SetLogLevel(level LogPriority) {
-	t.m.RLock()
-	defer t.m.RUnlock()
+	t.logMu.RLock()
+	logger := t.logger
+	t.logMu.RUnlock()
 
-	t.logger.SetLogLevel(level)
+	if logger != nil {
+		logger.SetLogLevel(level)
+	}
 }
 
 func (t *BTTracer) String() string {

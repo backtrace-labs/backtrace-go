@@ -1,4 +1,4 @@
-// +build !linux arm
+//go:build !linux
 
 package bt
 

@@ -8,6 +8,7 @@
 package bt
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -289,15 +290,17 @@ func Register(t TracerSig) {
 
 	t.Logf(LogDebug, "Registered tracer %s (signal set: %v)\n", t, ss)
 
-	state.m.RLock()
-	rs := state.c.ResendSignal
-	state.m.RUnlock()
-
 	go func(t TracerSig) {
 		for s := range c {
 			t.Logf(LogDebug, "Received %v; executing tracer\n", s)
 
 			_ = Trace(t, &signalError{s}, nil)
+
+			// Read the configuration at signal time so that
+			// UpdateConfig calls made after Register are honored.
+			state.m.RLock()
+			rs := state.c.ResendSignal
+			state.m.RUnlock()
 
 			if !rs {
 				continue
@@ -463,6 +466,7 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 	}()
 
 	done := make(chan tracerResult, 1)
+	started := make(chan struct{})
 	tracer := t.Finalize(options)
 
 	if traceOptions.SpawnedGs != nil {
@@ -477,8 +481,19 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 		t.Logf(LogDebug, "Starting tracer %v\n", tracer)
 
 		var res tracerResult
+		var stdOut bytes.Buffer
 
-		res.stdOut, res.err = tracer.Output()
+		tracer.Stdout = &stdOut
+
+		if startErr := tracer.Start(); startErr != nil {
+			res.err = startErr
+			done <- res
+			return
+		}
+		close(started)
+
+		res.err = tracer.Wait()
+		res.stdOut = stdOut.Bytes()
 		done <- res
 
 		t.Logf(LogDebug, "Tracer finished execution\n")
@@ -490,23 +505,43 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 
 	select {
 	case <-timeout:
-		if err = tracer.Process.Kill(); err != nil {
-			t.Logf(LogError,
-				"Failed to kill tracer upon timeout: %v\n",
-				err)
+		// Only kill once the subprocess is known to have started;
+		// tracer.Process is nil before that (kill would panic). A
+		// result that is already available wins over the timeout.
+		select {
+		case res = <-done:
+			// The tracer failed to start or finished just as the
+			// timeout fired; fall through to result handling.
+			break
+		case <-started:
+			// One more non-blocking check: the tracer may have
+			// completed successfully between the two signals.
+			select {
+			case res = <-done:
+				break
+			default:
+				// A process that exited on its own just as
+				// the timeout fired is not a kill failure.
+				if err = tracer.Process.Kill(); err != nil &&
+					!errors.Is(err, os.ErrProcessDone) {
+					t.Logf(LogError,
+						"Failed to kill tracer upon timeout: %v\n",
+						err)
 
-			if kfPanic {
-				t.Logf(LogWarning,
-					"PanicOnKillFailure set; "+
-						"panicking\n")
-				panic(err)
+					if kfPanic {
+						t.Logf(LogWarning,
+							"PanicOnKillFailure set; "+
+								"panicking\n")
+						panic(err)
+					}
+				}
+
+				err = errors.New("Tracer execution timed out")
+				t.Logf(LogError, "%v; process killed\n", err)
+
+				return
 			}
 		}
-
-		err = errors.New("Tracer execution timed out")
-		t.Logf(LogError, "%v; process killed\n", err)
-
-		return
 	case res = <-done:
 		break
 	}
