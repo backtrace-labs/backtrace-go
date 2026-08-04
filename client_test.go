@@ -578,6 +578,26 @@ func TestAttachmentsMultipartSubmission(t *testing.T) {
 	}
 }
 
+// TestNilClientIsSafe pins the documented contract: every method on a nil
+// *Client (ignored NewClient error) is a safe no-op.
+func TestNilClientIsSafe(t *testing.T) {
+	var c *Client
+	c.Report(errors.New("ignored"), nil)
+	c.ReportError(errors.New("ignored"), nil)
+	c.ReportMessage("ignored", nil)
+	c.ReportPanicValue("ignored", nil)
+	c.SetAttribute("k", "v")
+	c.SetAttributes(map[string]interface{}{"k": "v"})
+	c.AddBreadcrumb(Breadcrumb{Message: "ignored"})
+	if got := c.DroppedReports(); got != 0 {
+		t.Errorf("DroppedReports on nil = %d", got)
+	}
+	if !c.Flush(time.Millisecond) {
+		t.Error("Flush on nil client should trivially succeed")
+	}
+	c.Close()
+}
+
 func TestUUID4Format(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 1000; i++ {

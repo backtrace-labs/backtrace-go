@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -214,16 +215,26 @@ func buildInfoAttributes() (map[string]interface{}, []string) {
 }
 
 // defaultEnvScrubPatterns match environment variable names whose values are
-// redacted before submission. Case-insensitive substring match.
+// redacted before submission. Case-insensitive substring match. For a crash
+// reporter over-redaction beats leaking, so the patterns are deliberately
+// broad: PASS covers PASSWORD/PASSWD/PASSPHRASE/DB_PASS, KEY covers
+// APIKEY/API_KEY/*_KEY, CONN covers CONNECTION_STRING/CONN_STR, DSN covers
+// database and telemetry DSNs.
 var defaultEnvScrubPatterns = []string{
-	"TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY",
-	"ACCESS_KEY", "SECRET_KEY", "PRIVATE_KEY", "CREDENTIAL", "AUTH",
+	"TOKEN", "SECRET", "PASS", "KEY", "CREDENTIAL", "AUTH",
+	"DSN", "COOKIE", "SESSION", "SIGNATURE", "BEARER", "CONN",
 }
+
+// urlUserinfoPattern matches connection-string values with embedded
+// credentials (scheme://user:password@host), regardless of the variable
+// name (DATABASE_URL, REDIS_URL, MONGODB_URI, ...).
+var urlUserinfoPattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^/@\s]+:[^/@\s]+@`)
 
 const redactedValue = "[REDACTED]"
 
 // getEnvVars returns the process environment with secret-looking values
-// redacted. extraPatterns extends the built-in pattern list.
+// redacted: variable names matching the scrub patterns, plus any value that
+// embeds URL credentials. extraPatterns extends the built-in pattern list.
 func getEnvVars(extraPatterns []string) map[string]string {
 	patterns := make([]string, 0, len(defaultEnvScrubPatterns)+len(extraPatterns))
 	patterns = append(patterns, defaultEnvScrubPatterns...)
@@ -241,6 +252,9 @@ func getEnvVars(extraPatterns []string) map[string]string {
 				value = redactedValue
 				break
 			}
+		}
+		if value != redactedValue && urlUserinfoPattern.MatchString(value) {
+			value = redactedValue
 		}
 		result[key] = value
 	}

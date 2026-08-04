@@ -12,7 +12,9 @@ import (
 
 // Client is an instance-based Backtrace reporter. Multiple independent
 // clients may coexist in one process. All methods are safe for concurrent
-// use, never block the caller on network I/O, and never panic.
+// use, never block the caller on network I/O, and never panic — including
+// on a nil *Client (e.g. when a NewClient error was ignored), where every
+// method is a no-op.
 //
 // Reports are queued to a background worker; when the queue is full new
 // reports are dropped and counted (see DroppedReports) instead of blocking.
@@ -91,6 +93,9 @@ func (c *Client) diag() diag {
 // (reported as a message). A nil object is ignored. extraAttributes are
 // added to this report only; the map is not retained or mutated.
 func (c *Client) Report(object interface{}, extraAttributes map[string]interface{}) {
+	if c == nil {
+		return
+	}
 	switch v := object.(type) {
 	case nil:
 		return
@@ -103,7 +108,7 @@ func (c *Client) Report(object interface{}, extraAttributes map[string]interface
 
 // ReportError sends a report for err, capturing its type and unwrap chain.
 func (c *Client) ReportError(err error, extraAttributes map[string]interface{}) {
-	if err == nil {
+	if c == nil || err == nil {
 		return
 	}
 	c.capture(captureInput{
@@ -117,6 +122,9 @@ func (c *Client) ReportError(err error, extraAttributes map[string]interface{}) 
 
 // ReportMessage sends a plain message report.
 func (c *Client) ReportMessage(msg string, extraAttributes map[string]interface{}) {
+	if c == nil {
+		return
+	}
 	c.capture(captureInput{
 		message:    msg,
 		classifier: "message",
@@ -134,7 +142,7 @@ func (c *Client) ReportMessage(msg string, extraAttributes map[string]interface{
 // DefaultFlushTimeout before being dropped: it is likely the process's
 // last report.
 func (c *Client) ReportPanicValue(value interface{}, extraAttributes map[string]interface{}) {
-	if value == nil {
+	if c == nil || value == nil {
 		return
 	}
 	in := captureInput{
@@ -153,6 +161,9 @@ func (c *Client) ReportPanicValue(value interface{}, extraAttributes map[string]
 // SetAttribute sets a client-wide attribute included in every subsequent
 // report. Safe for concurrent use.
 func (c *Client) SetAttribute(key string, value interface{}) {
+	if c == nil {
+		return
+	}
 	c.amu.Lock()
 	defer c.amu.Unlock()
 	c.attributes[key] = value
@@ -160,6 +171,9 @@ func (c *Client) SetAttribute(key string, value interface{}) {
 
 // SetAttributes sets multiple client-wide attributes atomically.
 func (c *Client) SetAttributes(attrs map[string]interface{}) {
+	if c == nil {
+		return
+	}
 	c.amu.Lock()
 	defer c.amu.Unlock()
 	for k, v := range attrs {
@@ -170,12 +184,18 @@ func (c *Client) SetAttributes(attrs map[string]interface{}) {
 // AddBreadcrumb records a breadcrumb attached to every subsequent report as
 // part of the "breadcrumbs" annotation. Safe for concurrent use.
 func (c *Client) AddBreadcrumb(b Breadcrumb) {
+	if c == nil {
+		return
+	}
 	c.crumbs.add(b)
 }
 
 // DroppedReports returns the number of reports dropped because the queue was
 // full, the client was closed, or delivery failed.
 func (c *Client) DroppedReports() uint64 {
+	if c == nil {
+		return 0
+	}
 	return c.dropped.Load()
 }
 
@@ -188,6 +208,9 @@ const flushPollInterval = 10 * time.Millisecond
 // completed in time. Unlike the legacy FinishSendingReports, Flush never
 // stops the worker: the client remains fully usable afterwards.
 func (c *Client) Flush(timeout time.Duration) bool {
+	if c == nil {
+		return true
+	}
 	marker := make(chan struct{})
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -237,6 +260,9 @@ func (c *Client) Flush(timeout time.Duration) bool {
 // Close and Flush must not be called from inside a BeforeSend hook: the
 // hook runs on the worker goroutine those calls wait on.
 func (c *Client) Close() {
+	if c == nil {
+		return
+	}
 	c.qmu.Lock()
 	if !c.closed {
 		c.closed = true

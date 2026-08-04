@@ -315,6 +315,9 @@ func TestSetAttributeIsConcurrencySafe(t *testing.T) {
 func TestLegacyEnvVarAnnotations(t *testing.T) {
 	legacyServer.reset()
 	t.Setenv("BT_TEST_SECRET_TOKEN", "hunter2")
+	// Multi-'=' value without credentials: must survive intact.
+	t.Setenv("BT_TEST_JAVA_OPTS", "-Da=b -Dc=d")
+	// Connection string with embedded credentials: redacted by value shape.
 	t.Setenv("BT_TEST_DATABASE_URL", "postgres://u:p@h/db?sslmode=require")
 
 	Options.SendEnvVars = true
@@ -331,7 +334,10 @@ func TestLegacyEnvVarAnnotations(t *testing.T) {
 	if env["BT_TEST_SECRET_TOKEN"] != redactedValue {
 		t.Errorf("secret env var not redacted: %v", env["BT_TEST_SECRET_TOKEN"])
 	}
-	if env["BT_TEST_DATABASE_URL"] != "postgres://u:p@h/db?sslmode=require" {
-		t.Errorf("env value truncated at '=': %v", env["BT_TEST_DATABASE_URL"])
+	if env["BT_TEST_JAVA_OPTS"] != "-Da=b -Dc=d" {
+		t.Errorf("env value truncated at '=': %v", env["BT_TEST_JAVA_OPTS"])
+	}
+	if env["BT_TEST_DATABASE_URL"] != redactedValue {
+		t.Errorf("connection string with credentials not redacted: %v", env["BT_TEST_DATABASE_URL"])
 	}
 }

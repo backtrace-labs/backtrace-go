@@ -52,8 +52,10 @@ const (
 	// DefaultTabWidth is reported to the Backtrace UI for source rendering.
 	DefaultTabWidth = 8
 
-	// DefaultFlushTimeout is used by panic handlers and the legacy
-	// FinishSendingReports to bound how long delivery is awaited.
+	// DefaultFlushTimeout bounds how long panic handlers (ReportPanic,
+	// ReportAndRecoverPanic) wait for delivery before re-panicking or
+	// returning, and how long a panic report retries a full queue.
+	// (FinishSendingReports uses the larger DefaultTimeout.)
 	DefaultFlushTimeout = 5 * time.Second
 )
 
@@ -98,8 +100,12 @@ type Config struct {
 	Attributes map[string]interface{}
 
 	// SendEnvVars attaches the process environment to every report as an
-	// annotation. Values of variables whose names look secret-bearing
-	// (TOKEN, SECRET, PASSWORD, KEY, ...) are redacted; see ScrubEnvVars.
+	// annotation. Values are redacted when the variable name contains
+	// any of: TOKEN, SECRET, PASS, KEY, CREDENTIAL, AUTH, DSN, COOKIE,
+	// SESSION, SIGNATURE, BEARER, CONN (case-insensitive), or when the
+	// value embeds URL credentials (scheme://user:pass@...). Extend the
+	// list with ScrubEnvVars; use BeforeSend for anything beyond
+	// name/shape matching.
 	SendEnvVars bool
 
 	// ScrubEnvVars adds case-insensitive substrings to the built-in list
@@ -208,10 +214,12 @@ func (c Config) validate() error {
 		return fmt.Errorf("bt: invalid Config.Endpoint: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("bt: Config.Endpoint must be an http(s) URL, got %q", c.Endpoint)
+		// Redact the endpoint in errors: it may embed a token, and
+		// NewClient errors flow into user logs.
+		return fmt.Errorf("bt: Config.Endpoint must be an http(s) URL, got %q", redactURL(c.Endpoint))
 	}
 	if c.Token != "" && u.RawQuery != "" {
-		return fmt.Errorf("bt: Config.Endpoint must not carry a query string when Token is set, got %q", c.Endpoint)
+		return fmt.Errorf("bt: Config.Endpoint must not carry a query string when Token is set, got %q", redactURL(c.Endpoint))
 	}
 	return nil
 }

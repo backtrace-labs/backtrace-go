@@ -10,6 +10,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,11 @@ var errRateLimited = errors.New("bt: rate limited by server, report dropped")
 // rateLimitFallback is the pause applied after a 429 without a parsable
 // Retry-After header.
 const rateLimitFallback = time.Minute
+
+// rateLimitMaxPause caps server-supplied Retry-After values so one
+// malformed or hostile response cannot disable reporting for the process
+// lifetime.
+const rateLimitMaxPause = 5 * time.Minute
 
 // httpTransport delivers serialized reports over HTTP. It is safe for
 // concurrent use, applies the configured timeout, verifies response status,
@@ -230,33 +236,59 @@ func redactURL(u string) string {
 		q.Set("token", "REDACTED")
 		parsed.RawQuery = q.Encode()
 	}
-	if strings.EqualFold(parsed.Hostname(), "submit.backtrace.io") {
-		segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-		// The token is always the second path segment
-		// ({universe}/{token}[/{format}]).
-		if len(segments) >= 2 {
-			segments[1] = "REDACTED"
-			parsed.Path = "/" + strings.Join(segments, "/")
-		}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if pathEmbedsToken(parsed.Hostname(), segments) {
+		segments[1] = "REDACTED"
+		parsed.Path = "/" + strings.Join(segments, "/")
 	}
 	return parsed.String()
 }
 
+// submissionFormats are the final path segments of submit-style URLs
+// ({universe}/{token}/{format}).
+var submissionFormats = map[string]bool{"json": true, "minidump": true, "plcrash": true, "dmp": true}
+
+var hexTokenPattern = regexp.MustCompile(`^[0-9a-fA-F]{32,}$`)
+
+// pathEmbedsToken reports whether segments[1] is a submission token: always
+// for submit.backtrace.io, and for self-hosted/aliased gateways when the
+// path has the {universe}/{token}[/{format}] shape (known format suffix or
+// a hex token). Plain API paths like /api/post never match.
+func pathEmbedsToken(host string, segments []string) bool {
+	if len(segments) < 2 || len(segments) > 3 {
+		return false
+	}
+	if strings.EqualFold(host, "submit.backtrace.io") {
+		return true
+	}
+	return submissionFormats[strings.ToLower(segments[len(segments)-1])] ||
+		hexTokenPattern.MatchString(segments[1])
+}
+
 // retryAfter parses a Retry-After header given either as delay seconds or as
-// an HTTP date, falling back to rateLimitFallback.
+// an HTTP date, falling back to rateLimitFallback and capped at
+// rateLimitMaxPause.
 func retryAfter(resp *http.Response) time.Duration {
 	header := resp.Header.Get("Retry-After")
 	if header == "" {
 		return rateLimitFallback
 	}
 	if seconds, err := strconv.Atoi(header); err == nil && seconds >= 0 {
+		if seconds > int(rateLimitMaxPause/time.Second) {
+			return rateLimitMaxPause
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if at, err := http.ParseTime(header); err == nil {
-		if d := time.Until(at); d > 0 {
+		d := time.Until(at)
+		switch {
+		case d <= 0:
+			return 0
+		case d > rateLimitMaxPause:
+			return rateLimitMaxPause
+		default:
 			return d
 		}
-		return 0
 	}
 	return rateLimitFallback
 }

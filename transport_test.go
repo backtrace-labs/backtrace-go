@@ -33,6 +33,14 @@ func TestRetryAfterParsing(t *testing.T) {
 	if d := retryAfter(mk(past)); d != 0 {
 		t.Errorf("past http-date = %v, want 0", d)
 	}
+	// A hostile/malformed Retry-After must not disable reporting forever.
+	if d := retryAfter(mk("2147483647")); d != rateLimitMaxPause {
+		t.Errorf("huge seconds = %v, want cap %v", d, rateLimitMaxPause)
+	}
+	farFuture := time.Now().Add(24 * time.Hour * 365).UTC().Format(http.TimeFormat)
+	if d := retryAfter(mk(farFuture)); d != rateLimitMaxPause {
+		t.Errorf("far-future date = %v, want cap %v", d, rateLimitMaxPause)
+	}
 }
 
 func TestTransportPause(t *testing.T) {
@@ -66,7 +74,16 @@ func TestRedactURL(t *testing.T) {
 	if got := redactURL("https://submit.backtrace.io/universe/secret-token"); got != "https://submit.backtrace.io/universe/REDACTED" {
 		t.Errorf("2-segment submit path token not redacted: %q", got)
 	}
-	// Other tokenless URLs pass through unchanged.
+	// Self-hosted/aliased gateways with the submit path shape: format suffix.
+	if got := redactURL("https://errors.mycorp.com/universe/sometoken/json"); got != "https://errors.mycorp.com/universe/REDACTED/json" {
+		t.Errorf("aliased submit path (format suffix) not redacted: %q", got)
+	}
+	// ... or a hex-shaped token.
+	hexTok := "51cc8e69c5b62fa8c72dc963e730f1e8"
+	if got := redactURL("https://errors.mycorp.com/universe/" + hexTok); got != "https://errors.mycorp.com/universe/REDACTED" {
+		t.Errorf("aliased submit path (hex token) not redacted: %q", got)
+	}
+	// Plain API paths never match the token shape.
 	if got := redactURL("https://uni.sp.backtrace.io/api/post"); got != "https://uni.sp.backtrace.io/api/post" {
 		t.Errorf("tokenless URL modified: %q", got)
 	}

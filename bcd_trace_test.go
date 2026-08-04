@@ -92,6 +92,27 @@ func TestTraceStartFailureIsReportedNotPanicked(t *testing.T) {
 	}
 }
 
+// TestTraceNilFinalizeFailsGracefully pins the darwin-stub path: a Tracer
+// whose Finalize returns nil (no command to run) must produce an error, not
+// a nil-pointer crash in the exec goroutine.
+func TestTraceNilFinalizeFailsGracefully(t *testing.T) {
+	defer traceTestConfig()()
+
+	tr := &fakeTracer{
+		makeCmd: func() *exec.Cmd { return nil },
+		dto:     TraceOptions{Timeout: 5 * time.Second},
+	}
+
+	err := Trace(tr, nil, &TraceOptions{Timeout: 5 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("err = %v, want 'tracer unavailable' error", err)
+	}
+	// The trace lock must have been released: a second call still works.
+	if err := Trace(tr, nil, &TraceOptions{Timeout: 5 * time.Second}); err == nil {
+		t.Fatal("second Trace unexpectedly succeeded with nil Finalize")
+	}
+}
+
 func TestTraceSuccess(t *testing.T) {
 	defer traceTestConfig()()
 

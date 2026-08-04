@@ -41,8 +41,8 @@ type OptionsStruct struct {
 	// Token is the project token for legacy endpoints; see Config.Token.
 	Token string
 
-	// SendEnvVars attaches the process environment (secret-looking values
-	// redacted) to every report. Default false.
+	// SendEnvVars attaches the process environment to every report.
+	// Default false. See Config.SendEnvVars for the redaction rules.
 	SendEnvVars bool
 
 	// CaptureAllGoroutines includes every goroutine's stack in reports.

@@ -28,6 +28,37 @@ func TestGetEnvVarsSplitAndScrub(t *testing.T) {
 	}
 }
 
+// TestGetEnvVarsScrubsCommonSecretShapes covers the broadened name patterns
+// and the value-shape detection of URL-embedded credentials.
+func TestGetEnvVarsScrubsCommonSecretShapes(t *testing.T) {
+	redactedNames := []string{
+		"BT_SHAPE_ENCRYPTION_KEY", "BT_SHAPE_SIGNING_KEY", "BT_SHAPE_DB_PASS",
+		"BT_SHAPE_PASSPHRASE", "BT_SHAPE_SENTRY_DSN", "BT_SHAPE_SESSION_COOKIE",
+		"BT_SHAPE_CONNECTION_STRING", "BT_SHAPE_BEARER_HEADER",
+	}
+	for _, name := range redactedNames {
+		t.Setenv(name, "sensitive")
+	}
+	// Connection strings with embedded credentials are caught by value
+	// shape, regardless of the variable name.
+	t.Setenv("BT_SHAPE_DATABASE_URL", "postgres://user:hunter2@db/prod?sslmode=require")
+	// Plain URLs without credentials survive.
+	t.Setenv("BT_SHAPE_HOMEPAGE", "https://example.com/path")
+
+	env := getEnvVars(nil)
+	for _, name := range redactedNames {
+		if env[name] != redactedValue {
+			t.Errorf("%s not redacted: %q", name, env[name])
+		}
+	}
+	if env["BT_SHAPE_DATABASE_URL"] != redactedValue {
+		t.Errorf("URL-embedded credentials not redacted: %q", env["BT_SHAPE_DATABASE_URL"])
+	}
+	if env["BT_SHAPE_HOMEPAGE"] != "https://example.com/path" {
+		t.Errorf("credential-free URL over-redacted: %q", env["BT_SHAPE_HOMEPAGE"])
+	}
+}
+
 func TestStaticAttributes(t *testing.T) {
 	attrs := staticAttributes()
 	for _, key := range []string{

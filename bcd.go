@@ -475,6 +475,13 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 	done := make(chan tracerResult, 1)
 	started := make(chan struct{})
 	tracer := t.Finalize(options)
+	if tracer == nil {
+		// Stub tracers (e.g. on macOS) have no command to run; fail
+		// gracefully instead of dereferencing nil in the goroutine.
+		err = errors.New("tracer unavailable on this platform")
+		t.Logf(LogWarning, "%v\n", err)
+		return
+	}
 
 	if traceOptions.SpawnedGs != nil {
 		traceOptions.SpawnedGs.Add(1)
