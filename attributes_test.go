@@ -100,6 +100,22 @@ func TestUnwrapErrorChainTypes(t *testing.T) {
 	}
 }
 
+func TestParseWindowsRegValue(t *testing.T) {
+	guidOut := "\r\nHKEY_LOCAL_MACHINE\\Software\\Microsoft\\Cryptography\r\n" +
+		"    MachineGuid    REG_SZ    12345678-abcd-ef00-1122-334455667788\r\n\r\n"
+	if got := parseWindowsRegValue(guidOut); got != "12345678-abcd-ef00-1122-334455667788" {
+		t.Errorf("guid parse = %q", got)
+	}
+	cpuOut := "\r\nHKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\r\n" +
+		"    ProcessorNameString    REG_SZ    Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz\r\n\r\n"
+	if got := parseWindowsRegValue(cpuOut); got != "Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz" {
+		t.Errorf("cpu parse = %q (spaces must survive)", got)
+	}
+	if got := parseWindowsRegValue("no reg marker"); got != "no reg marker" {
+		t.Errorf("fallback = %q", got)
+	}
+}
+
 func TestBreadcrumbRingDisabled(t *testing.T) {
 	var r *breadcrumbRing // negative MaxBreadcrumbs => nil ring
 	r.add(Breadcrumb{Message: "ignored"})

@@ -21,7 +21,9 @@ var (
 	freebsdGUIDCommand = []string{"sh", "-c", "kenv -q smbios.system.uuid || sysctl -n kern.hostuuid"}
 	darwinGUIDCommand  = []string{"sh", "-c", "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | awk -F'= \"' '{print $2}' | tr -d '\"' | tr -d '\n'"}
 
-	windowsCPUCommand = []string{"wmic", "CPU", "get", "NAME"}
+	// reg query instead of wmic: wmic is removed from Windows 11 24H2 /
+	// Server 2025.
+	windowsCPUCommand = []string{"reg", "query", `HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0`, "/v", "ProcessorNameString"}
 	linuxCPUCommand   = []string{"sh", "-c", "lscpu | grep \"Model name\" | awk -F':' '{print $2}' | sed 's/^[[:space:]]*//'"}
 	darwinCPUCommand  = []string{"sh", "-c", "sysctl -n machdep.cpu.brand_string | tr -d '\n'"}
 	freebsdCPUCommand = []string{"sh", "-c", "sysctl -n hw.model"}
@@ -115,22 +117,14 @@ func machineAttributes(d diag) map[string]interface{} {
 
 		if output := execCommand(guidCommand, d); output != "" {
 			if runtime.GOOS == "windows" {
-				// reg query output:
-				// HKEY_LOCAL_MACHINE\Software\Microsoft\Cryptography
-				//     MachineGuid    REG_SZ    xxxxxxxx-xxxx-...
-				if fields := strings.Fields(output); len(fields) > 0 {
-					output = strings.Trim(fields[len(fields)-1], "{}")
-				}
+				output = strings.Trim(parseWindowsRegValue(output), "{}")
 			}
 			attrs["guid"] = strings.TrimSpace(output)
 		}
 
 		if output := execCommand(cpuCommand, d); output != "" {
 			if runtime.GOOS == "windows" {
-				// wmic output: header line "NAME" then the value.
-				if lines := strings.Split(output, "\n"); len(lines) > 1 {
-					output = lines[1]
-				}
+				output = parseWindowsRegValue(output)
 			}
 			attrs["cpu.brand"] = strings.TrimSpace(output)
 		}
@@ -142,6 +136,21 @@ func machineAttributes(d diag) map[string]interface{} {
 		machineAttrs = attrs
 	})
 	return machineAttrs
+}
+
+// parseWindowsRegValue extracts the value from `reg query` output:
+//
+//	HKEY_LOCAL_MACHINE\...
+//	    ValueName    REG_SZ    the value, possibly with spaces
+func parseWindowsRegValue(output string) string {
+	if idx := strings.Index(output, "REG_SZ"); idx >= 0 {
+		value := output[idx+len("REG_SZ"):]
+		// Keep only the first line after the type column.
+		value, _, _ = strings.Cut(strings.TrimLeft(value, " \t"), "\r")
+		value, _, _ = strings.Cut(value, "\n")
+		return strings.TrimSpace(value)
+	}
+	return strings.TrimSpace(output)
 }
 
 // execCommand runs command[0] with the remaining arguments and returns its
