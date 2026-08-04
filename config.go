@@ -108,8 +108,9 @@ type Config struct {
 
 	// AttachmentPaths lists files attached to every report (multipart
 	// submission, one "attachment_<basename>" part per file). Unreadable
-	// files are skipped with a debug log. Per-report changes can be made
-	// in BeforeSend via ReportData.Attachments.
+	// or non-regular files and files larger than 10 MiB are skipped with
+	// a debug log. Per-report changes can be made in BeforeSend via
+	// ReportData.Attachments.
 	AttachmentPaths []string
 
 	// SampleRate is the fraction of reports actually sent, in [0.0, 1.0].
@@ -119,8 +120,10 @@ type Config struct {
 
 	// BeforeSend, when set, runs just before a report is serialized.
 	// Return the (optionally modified) report to send it, or nil to drop
-	// it. Runs on the SDK's worker goroutine; a panic inside the hook is
-	// recovered and logged, and the report is sent unmodified.
+	// it. Runs on the SDK's worker goroutine — do not call Flush or Close
+	// from inside the hook. A panic inside the hook is recovered and the
+	// report is DROPPED (never sent half-scrubbed) and counted in
+	// DroppedReports.
 	BeforeSend func(report *ReportData) *ReportData
 
 	// MaxErrorDepth caps error-chain unwrapping. Default: 100. Negative
@@ -207,6 +210,9 @@ func (c Config) validate() error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("bt: Config.Endpoint must be an http(s) URL, got %q", c.Endpoint)
 	}
+	if c.Token != "" && u.RawQuery != "" {
+		return fmt.Errorf("bt: Config.Endpoint must not carry a query string when Token is set, got %q", c.Endpoint)
+	}
 	return nil
 }
 
@@ -229,5 +235,7 @@ func (c Config) submissionURL() string {
 	v := url.Values{}
 	v.Set("format", "json")
 	v.Set("token", c.Token)
-	return fmt.Sprintf("%s/post?%s", c.Endpoint, v.Encode())
+	// Trim trailing slashes (the form users paste from a browser) so the
+	// appended path never produces "//post".
+	return fmt.Sprintf("%s/post?%s", strings.TrimRight(c.Endpoint, "/"), v.Encode())
 }

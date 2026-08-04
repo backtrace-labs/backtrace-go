@@ -98,6 +98,24 @@ func TestSubmissionURLForms(t *testing.T) {
 	if strings.Contains(got, "a&b") || !strings.Contains(got, "format=json") {
 		t.Errorf("token not escaped or format missing: %q", got)
 	}
+
+	// Trailing slash (the form users paste from a browser) must not
+	// produce "//post".
+	cfg = Config{Endpoint: "https://uni.sp.backtrace.io/", Token: "tok"}.normalize()
+	if got := cfg.submissionURL(); strings.Contains(got, "//post") {
+		t.Errorf("trailing slash produced double slash: %q", got)
+	}
+}
+
+func TestConfigValidateRejectsQueryWithToken(t *testing.T) {
+	err := (Config{Endpoint: "https://host:6098?x=1", Token: "tok"}).validate()
+	if err == nil {
+		t.Error("endpoint with query + token accepted; submissionURL would be malformed")
+	}
+	// Without a token the endpoint is used verbatim, so a query is fine.
+	if err := (Config{Endpoint: "https://host/post?format=json&token=t"}).validate(); err != nil {
+		t.Errorf("verbatim endpoint with query rejected: %v", err)
+	}
 }
 
 func TestConfigValidate(t *testing.T) {
