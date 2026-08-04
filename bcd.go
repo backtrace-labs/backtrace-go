@@ -36,6 +36,9 @@ type globalState struct {
 	m sync.RWMutex
 }
 
+// GlobalConfig holds configuration applicable to all tracer invocations.
+// UpdateConfig replaces the ENTIRE struct: populate every field (or start
+// from the documented defaults) rather than passing a partial literal.
 type GlobalConfig struct {
 	// If the tracer's timeout expires and the tracer cannot be killed,
 	// generate a run-time panic.
@@ -217,6 +220,8 @@ type TraceOptions struct {
 	SpawnedGs *sync.WaitGroup
 }
 
+// Log is the logging interface used by Tracers for execution status
+// messages.
 type Log interface {
 	// Logs the specified message if the specified log level is enabled.
 	Logf(level LogPriority, format string, v ...interface{})
@@ -226,10 +231,12 @@ type Log interface {
 	SetLogLevel(level LogPriority)
 }
 
+// LogPriority is a bitmask of tracer log levels.
 type LogPriority int
 
+// Tracer log levels; combine with bitwise OR, or use LogMax for everything.
 const (
-	LogDebug = 1 << iota
+	LogDebug LogPriority = 1 << iota
 	LogWarning
 	LogError
 	LogMax = (1 << iota) - 1
