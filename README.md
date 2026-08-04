@@ -42,8 +42,8 @@ func main() {
 
 Two endpoint forms are supported:
 
-- `https://submit.backtrace.io/{universe}/{token}/json` | `Endpoint` only |
-- `https://{universe}.sp.backtrace.io` | `Endpoint` + `Token` |
+- `https://submit.backtrace.io/{universe}/{token}/json` — set `Endpoint` only
+- `https://{universe}.sp.backtrace.io` — set `Endpoint` + `Token`
 
 `BACKTRACE_ENDPOINT` and `BACKTRACE_TOKEN` environment variables are used as fallbacks when the corresponding fields are empty.
 
@@ -79,7 +79,7 @@ client, err := bt.NewClient(bt.Config{
 	Attributes: map[string]interface{}{         // stamped on every report
 		"application.environment": "production",
 	},
-	AttachmentPaths: []string{"/var/log/app.log"}, // uploaded with every report
+	AttachmentPaths: []string{"/var/log/app.log"}, // uploaded with every report (10 MiB/file cap)
 	SendEnvVars:     true,  // env vars as annotation, secrets redacted
 	SampleRate:      1.0,   // fraction of reports sent (0 == 1.0)
 	BeforeSend: func(r *bt.ReportData) *bt.ReportData {
@@ -102,7 +102,7 @@ client.AddBreadcrumb(bt.Breadcrumb{
 })
 ```
 
-Every report automatically includes: hostname, process ID and age, Go version, goroutine count, heap statistics, GC count, CPU architecture and model, OS version, machine GUID, `application.version` / `vcs.revision` (from Go build info), the Go module dependency list, and — on Linux —`/proc` memory and scheduler attributes.
+Every report automatically includes: hostname, process ID and age, Go version, goroutine count, heap statistics, GC count, CPU architecture and model, OS version, machine GUID, `application.version` / `vcs.revision` (from Go build info), the Go module dependency list, and — on Linux — `/proc` memory and scheduler attributes.
 
 ### net/http middleware
 
@@ -143,7 +143,7 @@ Notes:
 - Configure `bt.Options` before the first report. For attribute changes at runtime use `bt.SetAttribute` / `bt.SetAttributes`, which are safe for concurrent use.
 - `bt.FinishSendingReports()` now waits for queued reports **without** stopping the reporter (historically it killed the sender permanently): prefer `bt.Flush(timeout)`.
 - Source capture now defaults to context lines around each frame instead of whole files: opt back in with `Options.SourceCode = bt.SourceCodeFile`.
-- The SDK never panics. `DebugBacktrace` only controls diagnostic logging.
+- The reporting API (`Client` methods, `bt.Report`, `bt.ReportPanic`, ...) never panics; `DebugBacktrace` only controls diagnostic logging. (The bcd tracing integration may panic on tracer kill failure unless `GlobalConfig.PanicOnKillFailure` is disabled via `bt.UpdateConfig`.)
 
 ## Thread-safety contract
 
@@ -152,7 +152,7 @@ Notes:
 `Options` struct and `Config` maps are read when reports are captured;
 mutate them only before reporting starts (or via `SetAttribute`).
 
-# bcd (out-of-process tracing)
+## bcd (out-of-process tracing)
 
 The `bt` package also provides integration with out-of-process tracers.
 Using the provided `Tracer` interface, applications may invoke tracer execution on demand: panic and signal handling integrations are provided.

@@ -15,8 +15,9 @@ type Logger interface {
 var defaultDiagLogger Logger = log.New(os.Stderr, "[backtrace] ", log.LstdFlags)
 
 // diag is an internal logging helper. Diagnostics are emitted only when
-// debug mode is enabled; the SDK never panics and never writes to
-// stdout/stderr unless debugging was requested.
+// debug mode is enabled; the reporting API never panics and never writes to
+// stdout/stderr unless debugging was requested. (The bcd tracing
+// integration has its own logging and panic semantics; see GlobalConfig.)
 type diag struct {
 	logger Logger
 	debug  bool

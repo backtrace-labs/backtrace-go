@@ -19,8 +19,10 @@ type ReportData struct {
 	// Timestamp is the report time in Unix seconds.
 	Timestamp int64
 
-	// Classifiers group the report in the Backtrace UI ("error", "panic",
-	// "message", plus error-chain type names).
+	// Classifiers group the report in the Backtrace UI; the SDK sets
+	// exactly one of "error", "panic", or "message". Error-chain type
+	// names are reported via the "error.type" attribute and the
+	// "Error Chain" annotation, not as classifiers.
 	Classifiers []string
 
 	// Attributes are indexed key/value pairs used for search and
@@ -87,8 +89,9 @@ type errorChainLink struct {
 }
 
 // unwrapErrorChain walks err's Unwrap chain (up to maxDepth links) and
-// returns the chain description plus the Go type names encountered, for use
-// as classifiers. A maxDepth < 0 disables chain capture.
+// returns the chain description (Go type name plus message per link), used
+// for the "error.type" attribute and the "Error Chain" annotation.
+// A maxDepth < 0 disables chain capture.
 func unwrapErrorChain(err error, maxDepth int) []errorChainLink {
 	if err == nil || maxDepth < 0 {
 		return nil
