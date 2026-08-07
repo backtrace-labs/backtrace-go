@@ -1,7 +1,9 @@
 package bt
 
 import (
+	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -43,6 +45,12 @@ type sourceOptions struct {
 	mode         SourceCodeMode
 	contextLines int
 	tabWidth     int
+	// roots, when non-empty, restricts which files may be read.
+	roots []string
+	// maxFileBytes caps a single file read; maxTotal caps the aggregate
+	// source text embedded in one report.
+	maxFileBytes int64
+	maxTotal     int64
 }
 
 // ParseThreadsFromStack parses runtime.Stack output into the Backtrace
@@ -54,6 +62,9 @@ func ParseThreadsFromStack(stackTrace []byte) (map[string]Thread, map[string]Sou
 		mode:         cfg.SourceCode,
 		contextLines: cfg.ContextLineCount,
 		tabWidth:     cfg.TabWidth,
+		roots:        cfg.SourceRoots,
+		maxFileBytes: cfg.MaxSourceFileBytes,
+		maxTotal:     cfg.MaxSourceBytes,
 	})
 	return threads, sourceCodes
 }
@@ -126,7 +137,7 @@ func buildThreads(stackTrace []byte, opts sourceOptions) (map[string]Thread, map
 				continue
 			}
 			qualified := trimCreatedBy(line)
-			if strings.HasPrefix(qualified, sdkFramePrefix) {
+			if isSDKFrame(qualified) {
 				if len(current.Stacks) == 0 {
 					sdkOnly = true
 				}
@@ -215,6 +226,15 @@ func splitQualifiedFunction(line string) (library, function string) {
 	return line[:lastDot], line[lastDot+1:]
 }
 
+// isSDKFrame reports whether a qualified function name belongs to this SDK,
+// requiring an import-path boundary so sibling module paths (e.g.
+// ".../backtrace-go-fork") are never filtered.
+func isSDKFrame(name string) bool {
+	return name == sdkFramePrefix ||
+		strings.HasPrefix(name, sdkFramePrefix+"/") ||
+		strings.HasPrefix(name, sdkFramePrefix+".")
+}
+
 // trimCreatedBy reduces "created by pkg.fn in goroutine 7" to "pkg.fn".
 func trimCreatedBy(line string) string {
 	if strings.HasPrefix(line, "created by") {
@@ -224,17 +244,30 @@ func trimCreatedBy(line string) string {
 	return line
 }
 
-// sourceBuilder deduplicates and extracts source snippets for stack frames.
+// sourceBuilder deduplicates and extracts source snippets for stack frames,
+// under per-file and per-report byte budgets and an optional root allowlist.
 type sourceBuilder struct {
-	opts    sourceOptions
-	ids     map[string]string // dedup key -> snippet ID
-	entries map[string]SourceCode
-	files   map[string][]string // per-report file line cache
-	failed  map[string]bool
-	nextID  int
+	opts      sourceOptions
+	ids       map[string]string // dedup key -> snippet ID
+	entries   map[string]SourceCode
+	files     map[string][]string // per-report file line cache
+	failed    map[string]bool
+	nextID    int
+	usedBytes int64 // embedded source text so far (budget accounting)
 }
 
 func newSourceBuilder(opts sourceOptions) *sourceBuilder {
+	// Normalize roots to absolute paths once: stack traces carry absolute
+	// file paths, so a relative root would silently never match.
+	if len(opts.roots) > 0 {
+		normalized := make([]string, 0, len(opts.roots))
+		for _, root := range opts.roots {
+			if abs, err := filepath.Abs(root); err == nil {
+				normalized = append(normalized, abs)
+			}
+		}
+		opts.roots = normalized
+	}
 	return &sourceBuilder{
 		opts:    opts,
 		ids:     map[string]string{},
@@ -262,7 +295,12 @@ func (b *sourceBuilder) reference(path, lineNo string) string {
 	id := strconv.Itoa(b.nextID)
 	b.nextID++
 	b.ids[key] = id
-	b.entries[id] = b.extract(path, lineNo)
+	if b.opts.mode == SourceCodeMetadata {
+		// Path/line metadata only; no source text leaves the host.
+		b.entries[id] = SourceCode{Path: path}
+	} else {
+		b.entries[id] = b.extract(path, lineNo)
+	}
 	return id
 }
 
@@ -271,19 +309,26 @@ func (b *sourceBuilder) result() map[string]SourceCode {
 }
 
 // extract builds the snippet for path around lineNo according to the mode.
-// Unreadable files degrade to a path-only entry.
+// Unreadable, disallowed, or over-budget files degrade to path-only entries.
 func (b *sourceBuilder) extract(path, lineNo string) SourceCode {
 	sc := SourceCode{Path: path}
+
+	// Short-circuit before reading: once the per-report budget is
+	// exhausted no further file I/O is useful.
+	if b.opts.maxTotal > 0 && b.usedBytes >= b.opts.maxTotal {
+		return sc
+	}
 
 	lines := b.readLines(path)
 	if lines == nil {
 		return sc
 	}
 
+	var text string
+	startLine := 1
 	switch b.opts.mode {
 	case SourceCodeFile:
-		sc.Text = strings.Join(lines, "\n")
-		sc.StartLine = 1
+		text = strings.Join(lines, "\n")
 	default: // SourceCodeContext
 		center, err := strconv.Atoi(lineNo)
 		if err != nil || center < 1 {
@@ -300,17 +345,52 @@ func (b *sourceBuilder) extract(path, lineNo string) SourceCode {
 		if start > len(lines) {
 			return sc
 		}
-		sc.Text = strings.Join(lines[start-1:end], "\n")
-		sc.StartLine = start
+		text = strings.Join(lines[start-1:end], "\n")
+		startLine = start
 	}
 
+	// Enforce the per-report source budget.
+	if b.opts.maxTotal > 0 && b.usedBytes+int64(len(text)) > b.opts.maxTotal {
+		return sc
+	}
+	b.usedBytes += int64(len(text))
+
+	sc.Text = text
+	sc.StartLine = startLine
 	sc.StartColumn = 1
 	sc.StartPos = 0
 	sc.TabWidth = b.opts.tabWidth
 	return sc
 }
 
-// readLines reads and caches a source file for the duration of one report.
+// pathAllowed applies the SourceRoots allowlist: when roots are configured,
+// only files under one of them may be read. Both the candidate and the
+// roots are symlink-resolved so a link placed under an allowed root cannot
+// smuggle in content from outside it; an unresolvable candidate is denied.
+func (b *sourceBuilder) pathAllowed(path string) bool {
+	if len(b.opts.roots) == 0 {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	for _, root := range b.opts.roots {
+		resolvedRoot, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			continue
+		}
+		if resolved == resolvedRoot ||
+			strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// readLines reads and caches a source file for the duration of one report,
+// bounded by the per-file byte budget and restricted to a regular file
+// inside the configured roots.
 func (b *sourceBuilder) readLines(path string) []string {
 	if lines, ok := b.files[path]; ok {
 		return lines
@@ -318,11 +398,35 @@ func (b *sourceBuilder) readLines(path string) []string {
 	if b.failed[path] {
 		return nil
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
+	fail := func() []string {
 		b.failed[path] = true
 		return nil
 	}
+	if !b.pathAllowed(path) {
+		return fail()
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return fail()
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return fail()
+	}
+	maxBytes := b.opts.maxFileBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxSourceFileBytes
+	}
+	if info.Size() > maxBytes {
+		return fail()
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil || int64(len(data)) > maxBytes {
+		return fail()
+	}
+
 	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
 	b.files[path] = lines
 	return lines

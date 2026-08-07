@@ -2,6 +2,7 @@ package bt
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -31,11 +32,14 @@ const rateLimitFallback = time.Minute
 const rateLimitMaxPause = 5 * time.Minute
 
 // httpTransport delivers serialized reports over HTTP. It is safe for
-// concurrent use, applies the configured timeout, verifies response status,
-// honors 429 Retry-After, and drains response bodies so connections are
-// reused.
+// concurrent use, applies the configured deadline through an SDK-owned
+// request context (independent of any custom http.Client), verifies
+// response status, honors 429 Retry-After, drains response bodies so
+// connections are reused, and never lets a credential-bearing URL escape
+// into an error or log line.
 type httpTransport struct {
-	client *http.Client
+	client  *http.Client
+	timeout time.Duration
 
 	mu         sync.Mutex
 	pauseUntil time.Time
@@ -43,9 +47,15 @@ type httpTransport struct {
 
 func newHTTPTransport(client *http.Client, timeout time.Duration) *httpTransport {
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = &http.Client{}
 	}
-	return &httpTransport{client: client}
+	return &httpTransport{client: client, timeout: timeout}
+}
+
+func (t *httpTransport) closeIdleConnections() {
+	if t != nil && t.client != nil {
+		t.client.CloseIdleConnections()
+	}
 }
 
 // rateLimited reports whether submissions are currently paused.
@@ -61,80 +71,134 @@ func (t *httpTransport) pause(d time.Duration) {
 	t.pauseUntil = time.Now().Add(d)
 }
 
-// maxAttachmentSize caps individual attachment uploads; larger files are
-// skipped with a diagnostic.
-const maxAttachmentSize = 10 << 20 // 10 MiB
-
 // inlinePart is an in-memory attachment (e.g. the bt-breadcrumbs-0 file).
 type inlinePart struct {
 	name string
 	data []byte
 }
 
-// send POSTs body to url. Attachments, when present, switch the request to
-// the documented multipart form ("upload_file" part for the report JSON,
-// "attachment_<name>" parts for files). A non-2xx response is an error; a
-// 429 additionally pauses future sends until the server's Retry-After
-// deadline.
-func (t *httpTransport) send(url string, body []byte, attachments []string, inline []inlinePart, d diag) error {
+// send POSTs body to url under an SDK-owned deadline derived from parent.
+// Attachments, when present, switch the request to the documented multipart
+// form ("upload_file" part for the report JSON, "attachment_<name>" parts
+// for files). It returns the drop reason alongside any error.
+func (t *httpTransport) send(
+	parent context.Context,
+	url string,
+	body []byte,
+	attachments []string,
+	inline []inlinePart,
+	limits multipartLimits,
+	d diag,
+) (dropReason, error) {
 	if t.rateLimited() {
-		return errRateLimited
+		return dropRateLimit, errRateLimited
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, t.timeout)
+	defer cancel()
 
 	var (
 		reqBody     io.Reader = bytes.NewReader(body)
 		contentType           = "application/json"
 	)
 	if len(attachments) > 0 || len(inline) > 0 {
-		multipartBody, multipartType, err := buildMultipart(body, attachments, inline, d)
+		multipartBody, multipartType, err := buildMultipart(body, attachments, inline, limits, d)
 		if err != nil {
-			return fmt.Errorf("bt: building multipart request: %w", err)
+			return dropSerialization, fmt.Errorf("bt: building multipart request: %w", err)
 		}
 		reqBody, contentType = multipartBody, multipartType
 	}
 
-	req, err := http.NewRequest(http.MethodPost, url, reqBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reqBody)
 	if err != nil {
-		return fmt.Errorf("bt: building request: %w", err)
+		return dropSerialization, fmt.Errorf("bt: building request for %s: %s",
+			redactURL(url), sanitizeHTTPError(err, url))
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "backtrace-go/"+Version)
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		// *url.Error embeds the full URL (token included); scrub it
-		// before the error reaches any log.
-		var ue *neturl.Error
-		if errors.As(err, &ue) {
-			ue.URL = redactURL(ue.URL)
-		}
-		return fmt.Errorf("bt: sending report: %w", err)
+		// Never return an error that retains a credential-bearing URL.
+		return dropNetwork, fmt.Errorf("bt: sending report to %s: %s",
+			redactURL(url), sanitizeHTTPError(err, url))
 	}
 	defer func() {
-		// Drain so the keep-alive connection can be reused.
+		// Drain (bounded) so the keep-alive connection can be reused.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 	}()
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return nil
+		return 0, nil
 	case resp.StatusCode == http.StatusTooManyRequests:
-		d := retryAfter(resp)
-		t.pause(d)
-		return fmt.Errorf("bt: server rate limit (429), pausing submissions for %s", d)
+		pause := retryAfter(resp)
+		t.pause(pause)
+		return dropRateLimit, fmt.Errorf("bt: server rate limit (429), pausing submissions for %s", pause)
 	default:
-		return fmt.Errorf("bt: server rejected report: %s", resp.Status)
+		return dropServerReject, fmt.Errorf("bt: server rejected report: %s", resp.Status)
 	}
+}
+
+// sanitizeHTTPError renders err with every occurrence of the raw URL or its
+// embedded credentials replaced. Returns a string (not an error) so callers
+// cannot accidentally re-wrap the original.
+func sanitizeHTTPError(err error, rawURL string) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if rawURL != "" {
+		text = strings.ReplaceAll(text, rawURL, redactURL(rawURL))
+	}
+	if u, parseErr := neturl.Parse(rawURL); parseErr == nil {
+		if token := u.Query().Get("token"); token != "" {
+			text = strings.ReplaceAll(text, token, "REDACTED")
+		}
+		segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if pathEmbedsToken(u.Hostname(), segments) {
+			text = strings.ReplaceAll(text, segments[1], "REDACTED")
+		}
+	}
+	return text
+}
+
+// maxMultipartNameLength bounds sanitized attachment part names.
+const maxMultipartNameLength = 255
+
+// safeMultipartName reduces an attachment path to a conservative printable
+// basename for use in multipart part names and filenames.
+func safeMultipartName(path string) string {
+	name := filepath.Base(path)
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\r' || r == '\n' || r == 0 || r == '"' || r == '\\':
+			return '_'
+		case r < 0x20 || r == 0x7f:
+			return '_'
+		default:
+			return r
+		}
+	}, name)
+	if name == "" || name == "." || name == ".." || name == "/" || name == `\` {
+		return "attachment"
+	}
+	if len(name) > maxMultipartNameLength {
+		name = name[len(name)-maxMultipartNameLength:]
+	}
+	return name
 }
 
 // buildMultipart assembles the multipart body documented for Backtrace
 // submissions: the report JSON in an "upload_file" part plus one
-// "attachment_<basename>" part per readable attachment. Unreadable,
-// non-regular, or oversized files are skipped, never failing the report
-// itself. The size cap is enforced at read time (a file may grow between
-// stat and copy).
-func buildMultipart(body []byte, attachments []string, inline []inlinePart, d diag) (io.Reader, string, error) {
+// "attachment_<basename>" part per admitted attachment. Unreadable,
+// non-regular, oversized, or over-budget files — and files that fail while
+// being read — are skipped, never failing the report itself. Size caps are
+// enforced at read time (a file may grow between stat and copy).
+func buildMultipart(body []byte, attachments []string, inline []inlinePart, limits multipartLimits, d diag) (io.Reader, string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 
@@ -158,30 +222,54 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, d di
 		}
 	}
 
+	var (
+		count      int
+		totalBytes int64
+	)
 	for _, path := range attachments {
-		info, err := os.Stat(path)
-		if err != nil {
-			d.logf("attachment %q skipped: %v", path, err)
+		if limits.maxAttachments < 0 {
+			d.logf("attachment %q skipped: attachments disabled (MaxAttachments < 0)", path)
 			continue
 		}
-		// FIFOs and devices would block or read unbounded data.
-		if !info.Mode().IsRegular() {
-			d.logf("attachment %q skipped: not a regular file", path)
+		if count >= limits.maxAttachments {
+			d.logf("attachment %q skipped: attachment count limit (%d) reached",
+				path, limits.maxAttachments)
 			continue
 		}
-		if info.Size() > maxAttachmentSize {
-			d.logf("attachment %q skipped: %d bytes exceeds the %d byte limit",
-				path, info.Size(), maxAttachmentSize)
+		remaining := limits.maxTotalBytes - totalBytes
+		if remaining <= 0 {
+			d.logf("attachment %q skipped: aggregate attachment budget (%d bytes) exhausted",
+				path, limits.maxTotalBytes)
 			continue
 		}
+		perFile := limits.maxAttachmentBytes
+		if perFile > remaining {
+			perFile = remaining
+		}
+
 		file, err := os.Open(path)
 		if err != nil {
 			d.logf("attachment %q skipped: %v", path, err)
 			continue
 		}
-		// Attachments from different directories may share a
-		// basename; uniquify so no part overwrites another.
-		name := filepath.Base(path)
+		// Stat the opened handle (not the path) so a file swapped
+		// between stat and open cannot bypass the checks.
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			file.Close()
+			d.logf("attachment %q skipped: not a readable regular file", path)
+			continue
+		}
+		if info.Size() > perFile {
+			file.Close()
+			d.logf("attachment %q skipped: %d bytes exceeds the %d-byte budget",
+				path, info.Size(), perFile)
+			continue
+		}
+
+		// Attachments from different directories may share a basename;
+		// uniquify so no part overwrites another.
+		name := safeMultipartName(path)
 		if used[name] {
 			ext := filepath.Ext(name)
 			stem := strings.TrimSuffix(name, ext)
@@ -195,26 +283,31 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, d di
 		}
 		used[name] = true
 
-		// Remember the buffer position so an over-limit file can be
-		// rolled back cleanly (part boundaries are only written by
-		// CreateFormFile/Close, so truncating to the mark removes the
-		// whole part).
+		// Remember the buffer position so a failed or over-limit read
+		// can be rolled back cleanly (part boundaries are only written
+		// by CreateFormFile/Close, so truncating removes the part).
 		mark := buf.Len()
 		part, err := w.CreateFormFile("attachment_"+name, name)
 		var copied int64
 		if err == nil {
-			copied, err = io.Copy(part, io.LimitReader(file, maxAttachmentSize+1))
+			copied, err = io.Copy(part, io.LimitReader(file, perFile+1))
 		}
 		file.Close()
 		if err != nil {
-			return nil, "", err
-		}
-		if copied > maxAttachmentSize {
 			buf.Truncate(mark)
 			delete(used, name)
-			d.logf("attachment %q skipped: grew beyond the %d byte limit while reading",
-				path, maxAttachmentSize)
+			d.logf("attachment %q skipped: read failed: %v", path, err)
+			continue
 		}
+		if copied > perFile {
+			buf.Truncate(mark)
+			delete(used, name)
+			d.logf("attachment %q skipped: grew beyond the %d-byte budget while reading",
+				path, perFile)
+			continue
+		}
+		count++
+		totalBytes += copied
 	}
 
 	if err := w.Close(); err != nil {
@@ -223,13 +316,16 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, d di
 	return &buf, w.FormDataContentType(), nil
 }
 
-// redactURL hides the submission token in diagnostics output, both in the
-// ?token= query form and in the submit.backtrace.io/{universe}/{token}/{fmt}
+// redactURL hides credentials in diagnostics output: URL userinfo, the
+// ?token= query form, and the submit-style {universe}/{token}/{format}
 // path form.
 func redactURL(u string) string {
 	parsed, err := neturl.Parse(u)
 	if err != nil {
-		return u
+		return "[REDACTED URL]"
+	}
+	if parsed.User != nil {
+		parsed.User = neturl.User("REDACTED")
 	}
 	q := parsed.Query()
 	if q.Get("token") != "" {
@@ -255,7 +351,7 @@ var hexTokenPattern = regexp.MustCompile(`^[0-9a-fA-F]{32,}$`)
 // path has the {universe}/{token}[/{format}] shape (known format suffix or
 // a hex token). Plain API paths like /api/post never match.
 func pathEmbedsToken(host string, segments []string) bool {
-	if len(segments) < 2 || len(segments) > 3 {
+	if len(segments) < 2 || len(segments) > 3 || segments[1] == "" {
 		return false
 	}
 	if strings.EqualFold(host, "submit.backtrace.io") {

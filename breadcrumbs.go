@@ -53,10 +53,17 @@ func newBreadcrumbRing(capacity int) *breadcrumbRing {
 	return &breadcrumbRing{buf: make([]Breadcrumb, capacity)}
 }
 
+// cloneBreadcrumb detaches the attribute map from caller ownership.
+func cloneBreadcrumb(b Breadcrumb) Breadcrumb {
+	b.Attributes = cloneAnyMap(b.Attributes)
+	return b
+}
+
 func (r *breadcrumbRing) add(b Breadcrumb) {
 	if r == nil {
 		return
 	}
+	b = cloneBreadcrumb(b)
 	if b.Timestamp == 0 {
 		b.Timestamp = time.Now().UnixMilli()
 	}
@@ -93,7 +100,7 @@ func (r *breadcrumbRing) snapshot() []Breadcrumb {
 	}
 	out := make([]Breadcrumb, r.size)
 	for i := 0; i < r.size; i++ {
-		out[i] = r.buf[(r.head+i)%len(r.buf)]
+		out[i] = cloneBreadcrumb(r.buf[(r.head+i)%len(r.buf)])
 	}
 	return out
 }

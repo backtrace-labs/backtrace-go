@@ -2,9 +2,13 @@ package bt
 
 import (
 	"crypto/rand"
-	"errors"
+	"crypto/sha256"
 	"fmt"
+	"os"
+	"reflect"
 	"runtime"
+	"sync/atomic"
+	"time"
 )
 
 // ReportData is a fully assembled crash/error report, exposed to the
@@ -20,7 +24,7 @@ type ReportData struct {
 	Timestamp int64
 
 	// Classifiers group the report in the Backtrace UI; the SDK sets
-	// exactly one of "error", "panic", or "message". Error-chain type
+	// exactly one of "error", "panic", or "message". Error-graph type
 	// names are reported via the "error.type" attribute and the
 	// "Error Chain" annotation, not as classifiers.
 	Classifiers []string
@@ -66,42 +70,101 @@ func (r *ReportData) toWire() map[string]interface{} {
 	}
 }
 
-// uuid4 returns an RFC 4122 version 4 UUID from crypto/rand.
+var uuidFallbackCounter atomic.Uint64
+
+// uuid4 returns an RFC 4122 version 4 UUID from crypto/rand. If crypto/rand
+// somehow fails (documented never to happen on supported platforms), the
+// fallback derives distinct bytes from time, PID, and a counter rather than
+// producing a process-wide constant.
 func uuid4() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand is documented never to fail on supported
-		// platforms; if it somehow does, a constant-free fallback is
-		// still preferable to panicking inside a crash reporter.
-		for i := range b {
-			b[i] = byte(i * 17)
-		}
+		n := uuidFallbackCounter.Add(1)
+		seed := fmt.Sprintf("%d:%d:%d", time.Now().UnixNano(), os.Getpid(), n)
+		sum := sha256.Sum256([]byte(seed))
+		copy(b[:], sum[:16])
 	}
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// errorChainLink describes one error in an unwrapped chain.
+// errorChainLink describes one node in an unwrapped error graph.
 type errorChainLink struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
+	ID       int    `json:"id"`
+	ParentID *int   `json:"parentId,omitempty"`
+	Source   string `json:"source,omitempty"`
+	Type     string `json:"type"`
+	Message  string `json:"message"`
 }
 
-// unwrapErrorChain walks err's Unwrap chain (up to maxDepth links) and
-// returns the chain description (Go type name plus message per link), used
-// for the "error.type" attribute and the "Error Chain" annotation.
-// A maxDepth < 0 disables chain capture.
-func unwrapErrorChain(err error, maxDepth int) []errorChainLink {
-	if err == nil || maxDepth < 0 {
+// unwrapErrorChain walks err's unwrap graph — both Unwrap() error and
+// Unwrap() []error (errors.Join) forms — bounded by depth and total node
+// count, with cycle detection. All application-defined methods are invoked
+// behind panic containment. A maxDepth < 0 disables capture.
+func unwrapErrorChain(err error, maxDepth, maxNodes int) []errorChainLink {
+	if err == nil || maxDepth < 0 || maxNodes < 1 {
 		return nil
 	}
-	var chain []errorChainLink
-	for e := err; e != nil && len(chain) < maxDepth; e = errors.Unwrap(e) {
-		chain = append(chain, errorChainLink{
-			Type:    fmt.Sprintf("%T", e),
-			Message: e.Error(),
+	links := make([]errorChainLink, 0, 8)
+	seen := make(map[string]struct{})
+
+	var visit func(current error, depth int, parent *int, source string)
+	visit = func(current error, depth int, parent *int, source string) {
+		if current == nil || depth > maxDepth || len(links) >= maxNodes {
+			return
+		}
+		key := errorVisitKey(current)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+
+		id := len(links)
+		links = append(links, errorChainLink{
+			ID:       id,
+			ParentID: parent,
+			Source:   source,
+			Type:     fmt.Sprintf("%T", current),
+			Message:  safeErrorString(current),
 		})
+		parentID := id
+
+		if many := safeUnwrapMany(current); many != nil {
+			for i, child := range many {
+				visit(child, depth+1, &parentID, fmt.Sprintf("errors[%d]", i))
+			}
+			return
+		}
+		visit(safeUnwrapOne(current), depth+1, &parentID, "unwrap")
 	}
-	return chain
+
+	visit(err, 0, nil, "")
+	return links
+}
+
+// errorVisitKey identifies an error for cycle detection: pointer identity
+// where available, type+message otherwise.
+func errorVisitKey(err error) string {
+	rv := reflect.ValueOf(err)
+	if rv.IsValid() && rv.Kind() == reflect.Pointer && !rv.IsNil() {
+		return fmt.Sprintf("%T@%x", err, rv.Pointer())
+	}
+	return fmt.Sprintf("%T:%s", err, safeErrorString(err))
+}
+
+func safeUnwrapOne(err error) (out error) {
+	defer func() { _ = recover() }()
+	if u, ok := err.(interface{ Unwrap() error }); ok {
+		return u.Unwrap()
+	}
+	return nil
+}
+
+func safeUnwrapMany(err error) (out []error) {
+	defer func() { _ = recover() }()
+	if u, ok := err.(interface{ Unwrap() []error }); ok {
+		return append([]error(nil), u.Unwrap()...)
+	}
+	return nil
 }

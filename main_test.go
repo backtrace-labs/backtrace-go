@@ -312,6 +312,55 @@ func TestSetAttributeIsConcurrencySafe(t *testing.T) {
 	}
 }
 
+// resetDefaultClientForTest detaches the process-global default client so a
+// test can exercise the unconfigured path, restoring everything afterwards.
+func resetDefaultClientForTest(t *testing.T) {
+	t.Helper()
+	defaultClientMu.Lock()
+	oldClient := defaultClientV
+	defaultClientV = nil
+	defaultClientMu.Unlock()
+	oldOptions := Options
+	t.Cleanup(func() {
+		defaultClientMu.Lock()
+		defaultClientV = oldClient
+		defaultClientMu.Unlock()
+		Options = oldOptions
+	})
+}
+
+// TestUnconfiguredPanicHelpersDoNotRecover pins the legacy semantic: while
+// reporting is unconfigured, the deferred panic helpers must not touch the
+// panic at all — the application's panic proceeds exactly as if the handler
+// were absent.
+func TestUnconfiguredPanicHelpersDoNotRecover(t *testing.T) {
+	resetDefaultClientForTest(t)
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envToken, "")
+	Options.Endpoint = ""
+	Options.Token = ""
+
+	recoverValue := func(f func()) (v interface{}) {
+		defer func() { v = recover() }()
+		f()
+		return nil
+	}
+
+	if got := recoverValue(func() {
+		defer ReportAndRecoverPanic(nil)
+		panic("original")
+	}); got != "original" {
+		t.Fatalf("ReportAndRecoverPanic swallowed an unconfigured panic: recovered %#v, want it to propagate", got)
+	}
+
+	if got := recoverValue(func() {
+		defer ReportPanic(nil)
+		panic("original2")
+	}); got != "original2" {
+		t.Fatalf("ReportPanic altered an unconfigured panic: recovered %#v", got)
+	}
+}
+
 func TestLegacyEnvVarAnnotations(t *testing.T) {
 	legacyServer.reset()
 	t.Setenv("BT_TEST_SECRET_TOKEN", "hunter2")

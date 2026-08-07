@@ -1,6 +1,8 @@
 package bt
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -52,8 +54,10 @@ func TestTransportPause(t *testing.T) {
 	if !tr.rateLimited() {
 		t.Error("pause not applied")
 	}
-	if err := tr.send("http://127.0.0.1:1/unused", []byte("{}"), nil, nil, diag{}); err != errRateLimited {
-		t.Errorf("send while paused = %v, want errRateLimited", err)
+	reason, err := tr.send(context.Background(), "http://127.0.0.1:1/unused",
+		[]byte("{}"), nil, nil, multipartLimits{}, diag{})
+	if err != errRateLimited || reason != dropRateLimit {
+		t.Errorf("send while paused = (%v, %v), want (dropRateLimit, errRateLimited)", reason, err)
 	}
 }
 
@@ -86,5 +90,46 @@ func TestRedactURL(t *testing.T) {
 	// Plain API paths never match the token shape.
 	if got := redactURL("https://uni.sp.backtrace.io/api/post"); got != "https://uni.sp.backtrace.io/api/post" {
 		t.Errorf("tokenless URL modified: %q", got)
+	}
+	// URL userinfo is redacted.
+	if got := redactURL("https://user:secretpw@host/x"); strings.Contains(got, "secretpw") {
+		t.Errorf("userinfo not redacted: %q", got)
+	}
+	// Unparsable input degrades to a fixed placeholder, never the raw string.
+	if got := redactURL("http://%zz\x7f"); got != "[REDACTED URL]" {
+		t.Errorf("unparsable URL leaked: %q", got)
+	}
+}
+
+func TestSanitizeHTTPError(t *testing.T) {
+	raw := "https://uni.sp.backtrace.io/post?format=json&token=supersecret"
+	err := errors.New(`Post "` + raw + `": context deadline exceeded`)
+	out := sanitizeHTTPError(err, raw)
+	if strings.Contains(out, "supersecret") {
+		t.Errorf("token leaked through sanitized error: %q", out)
+	}
+	if !strings.Contains(out, "context deadline exceeded") {
+		t.Errorf("error cause lost: %q", out)
+	}
+
+	pathRaw := "https://submit.backtrace.io/universe/secrettoken123/json"
+	pathErr := errors.New(`Post "` + pathRaw + `": connection refused`)
+	if out := sanitizeHTTPError(pathErr, pathRaw); strings.Contains(out, "secrettoken123") {
+		t.Errorf("path token leaked through sanitized error: %q", out)
+	}
+}
+
+func TestSafeMultipartName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/var/log/app.log", "app.log"},
+		{"/tmp/evil\r\nname", "evil__name"},
+		{"/tmp/quote\"back\\slash", "quote_back_slash"},
+		{"/", "attachment"},
+		{".", "attachment"},
+	}
+	for _, c := range cases {
+		if got := safeMultipartName(c.in); got != c.want {
+			t.Errorf("safeMultipartName(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
