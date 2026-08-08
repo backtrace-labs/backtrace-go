@@ -173,6 +173,11 @@ const maxMultipartNameLength = 255
 // basename for use in multipart part names and filenames.
 func safeMultipartName(path string) string {
 	name := filepath.Base(path)
+	// Degenerate basenames first: on Windows, Base("/") is `\`, which the
+	// character mapping below would otherwise turn into "_".
+	if name == "" || name == "." || name == ".." || name == "/" || name == `\` {
+		return "attachment"
+	}
 	name = strings.Map(func(r rune) rune {
 		switch {
 		case r == '\r' || r == '\n' || r == 0 || r == '"' || r == '\\':
@@ -183,7 +188,7 @@ func safeMultipartName(path string) string {
 			return r
 		}
 	}, name)
-	if name == "" || name == "." || name == ".." || name == "/" || name == `\` {
+	if name == "" {
 		return "attachment"
 	}
 	if len(name) > maxMultipartNameLength {

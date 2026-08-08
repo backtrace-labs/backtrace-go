@@ -120,12 +120,16 @@ func TestSanitizeHTTPError(t *testing.T) {
 }
 
 func TestSafeMultipartName(t *testing.T) {
+	// Only separator-free basenames and portable paths: filepath.Base
+	// treats `\` as a separator on Windows, so embedded-backslash
+	// expectations would be platform-dependent.
 	cases := []struct{ in, want string }{
 		{"/var/log/app.log", "app.log"},
-		{"/tmp/evil\r\nname", "evil__name"},
-		{"/tmp/quote\"back\\slash", "quote_back_slash"},
+		{"evil\r\nname", "evil__name"},
+		{"quote\"file", "quote_file"},
 		{"/", "attachment"},
 		{".", "attachment"},
+		{"..", "attachment"},
 	}
 	for _, c := range cases {
 		if got := safeMultipartName(c.in); got != c.want {

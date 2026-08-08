@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -126,16 +125,8 @@ func TestPutSnapshotFileHardening(t *testing.T) {
 	})
 
 	t.Run("non-regular file rejected", func(t *testing.T) {
-		fifo := filepath.Join(dir, "snap.fifo")
-		if err := syscall.Mkfifo(fifo, 0o644); err != nil {
-			t.Skipf("mkfifo unavailable: %v", err)
-		}
-		// Keep the FIFO openable without blocking: open the write end.
-		w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-		if err == nil {
-			defer w.Close()
-		}
-
+		// A device file opens instantly (unlike a FIFO, whose blocking
+		// read-end open would hang the test) and is not regular.
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			t.Error("non-regular file reached the server")
 		}))
@@ -144,7 +135,7 @@ func TestPutSnapshotFileHardening(t *testing.T) {
 		if err := tr.ConfigurePut(srv.URL, "tok", PutOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		if err := tr.putSnapshotFile(fifo); err == nil ||
+		if err := tr.putSnapshotFile(os.DevNull); err == nil ||
 			!strings.Contains(err.Error(), "regular file") {
 			t.Errorf("err = %v, want regular-file rejection", err)
 		}

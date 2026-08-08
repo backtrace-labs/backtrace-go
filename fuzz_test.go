@@ -2,6 +2,7 @@ package bt
 
 import (
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"testing"
 )
@@ -35,19 +36,30 @@ func FuzzBuildThreads(f *testing.F) {
 	})
 }
 
-// FuzzRedactURL: whatever the input, no query token value or userinfo
-// password may survive into the output.
+// FuzzRedactURL: when the input PARSES as a URL whose token query value or
+// userinfo password contains the canary, the canary must not survive into
+// the output. (Raw substring matching would misfire on inputs like a bare
+// "token=X" that have no URL credential semantics.)
 func FuzzRedactURL(f *testing.F) {
 	f.Add("https://uni.sp.backtrace.io/post?format=json&token=SECRETCANARY")
 	f.Add("https://submit.backtrace.io/universe/SECRETCANARY/json")
 	f.Add("https://user:SECRETCANARY@host/path")
 	f.Add("http://%zz")
 	f.Fuzz(func(t *testing.T, raw string) {
-		out := redactURL(raw)
-		if strings.Contains(raw, "SECRETCANARY") &&
-			strings.Contains(out, "SECRETCANARY") &&
-			(strings.Contains(raw, "token=SECRETCANARY") ||
-				strings.Contains(raw, ":SECRETCANARY@")) {
+		out := redactURL(raw) // must never panic
+		u, err := neturl.Parse(raw)
+		if err != nil {
+			// Unparsable input degrades to a fixed placeholder.
+			if out != "[REDACTED URL]" {
+				t.Fatalf("unparsable URL leaked: %q -> %q", raw, out)
+			}
+			return
+		}
+		credential := strings.Contains(u.Query().Get("token"), "SECRETCANARY")
+		if pw, set := u.User.Password(); set && strings.Contains(pw, "SECRETCANARY") {
+			credential = true
+		}
+		if credential && strings.Contains(out, "SECRETCANARY") {
 			t.Fatalf("credential survived redaction: %q -> %q", raw, out)
 		}
 	})
