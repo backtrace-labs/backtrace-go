@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 //nolint:all
@@ -85,27 +85,23 @@ type NewOptions struct {
 }
 
 // Returns a new object implementing the bt.Tracer and bt.TracerSig interfaces
-// using the Backtrace debugging platform.
+// using the Backtrace debugging platform. On macOS the tracer is a stub:
+// methods are no-ops and Trace requests fail gracefully.
 func New(options NewOptions) *BTTracer {
-	return &BTTracer{}
+	return &BTTracer{
+		defaultTraceOptions: TraceOptions{
+			Faulted:           true,
+			CallerOnly:        false,
+			ErrClassification: true,
+			Timeout:           time.Second * 120,
+		},
+	}
 }
 
-type PutOptions struct {
-	// If set to true, tracer results (i.e. generated snapshot files)
-	// will be unlinked from the filesystem after successful puts.
-	Unlink bool
-
-	// The http.Client to use for uploading. The default will be used
-	// if left unspecified.
-	Client http.Client
-
-	// If set to true, tracer results will be uploaded after each
-	// successful Trace request.
-	OnTrace bool
-}
-
+// ConfigurePut is unsupported on macOS; the error wraps
+// ErrUnsupportedPlatform so callers never mistake the no-op for success.
 func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) error {
-	return nil
+	return fmt.Errorf("%w: snapshot upload", ErrUnsupportedPlatform)
 }
 
 // See bt.Tracer.PutOnTrace().
@@ -113,14 +109,14 @@ func (t *BTTracer) PutOnTrace() bool {
 	return t.put.options.OnTrace
 }
 
-// See bt.Tracer.Put().
+// Put is unsupported on macOS.
 func (t *BTTracer) Put(snapshot []byte) error {
-	return nil
+	return fmt.Errorf("%w: snapshot upload", ErrUnsupportedPlatform)
 }
 
-// Synchronously uploads snapshots contained in the specified directory.
+// PutDir is unsupported on macOS.
 func (t *BTTracer) PutDir(path string) error {
-	return nil
+	return fmt.Errorf("%w: snapshot directory upload", ErrUnsupportedPlatform)
 }
 
 //nolint:all
@@ -137,9 +133,9 @@ func (t *BTTracer) putSnapshotFile(path string) error {
 func (t *BTTracer) SetTracerPath(path string) {
 }
 
-// Sets the output path for generated snapshots.
+// SetOutputPath is unsupported on macOS.
 func (t *BTTracer) SetOutputPath(path string, perm os.FileMode) error {
-	return nil
+	return fmt.Errorf("%w: tracer output", ErrUnsupportedPlatform)
 }
 
 // Sets the input and output pipes for the tracer.
@@ -152,8 +148,12 @@ func (t *BTTracer) SetPipes(stdin io.Reader, stderr io.Writer) {
 func (t *BTTracer) SetLogger(logger Log) {
 }
 
-// See bt.Tracer.AddOptions().
+// See bt.Tracer.AddOptions(). Honors the interface contract: a non-nil
+// options slice is extended and returned.
 func (t *BTTracer) AddOptions(options []string, v ...string) []string {
+	if options != nil {
+		return append(options, v...)
+	}
 	return nil
 }
 
@@ -191,9 +191,27 @@ func (t *BTTracer) Options() []string {
 func (t *BTTracer) ClearOptions() {
 }
 
-// See bt.Tracer.DefaultTraceOptions().
+// See bt.Tracer.DefaultTraceOptions(). Returns a pointer to a COPY; use
+// SetDefaultTraceOptions to change the defaults.
 func (t *BTTracer) DefaultTraceOptions() *TraceOptions {
-	return &t.defaultTraceOptions
+	t.m.RLock()
+	defer t.m.RUnlock()
+
+	opts := t.defaultTraceOptions
+	return &opts
+}
+
+// SetDefaultTraceOptions replaces the defaults used by bt.Trace when no
+// per-call options are supplied. A zero Timeout keeps the built-in default.
+func (t *BTTracer) SetDefaultTraceOptions(opts TraceOptions) {
+	if opts.Timeout == 0 {
+		opts.Timeout = 120 * time.Second
+	}
+
+	t.m.Lock()
+	defer t.m.Unlock()
+
+	t.defaultTraceOptions = opts
 }
 
 // See bt.Tracer.Finalize().

@@ -1,13 +1,15 @@
-// +build linux freebsd
+//go:build linux || freebsd
 
 package bt
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +27,14 @@ type pipes struct {
 	stderr io.Writer
 }
 
+const (
+	defaultPutTimeout             = 30 * time.Second
+	defaultMaxSnapshotBytes int64 = 1 << 30
+	defaultTraceTimeout           = 120 * time.Second
+)
+
+// uploader is the connection information and options used during Put
+// operations.
 type uploader struct {
 	endpoint string
 	options  PutOptions
@@ -58,23 +68,37 @@ type BTTracer struct {
 	// Protects tracer state modification.
 	m sync.RWMutex
 
+	// Protects the logger reference independently of m: Logf is called
+	// from paths that hold m (recursively read-locking a sync.RWMutex
+	// deadlocks once a writer is queued).
+	logMu sync.RWMutex
+
 	// Logs tracer execution status messages.
 	logger Log
 
 	// Default trace options to use if none are specified to bt.Trace().
 	defaultTraceOptions TraceOptions
 
+	// Protects the uploader configuration: traces are documented
+	// goroutine-safe and may upload concurrently with ConfigurePut.
+	putMu sync.RWMutex
+
 	// The connection information and options used during Put operations.
 	put uploader
 }
 
 type defaultLogger struct {
+	mu     sync.Mutex
 	logger *log.Logger
 	level  LogPriority
 }
 
 func (d *defaultLogger) Logf(level LogPriority, format string, v ...interface{}) {
-	if (d.level & level) == 0 {
+	d.mu.Lock()
+	enabled := (d.level & level) != 0
+	d.mu.Unlock()
+
+	if !enabled {
 		return
 	}
 
@@ -82,6 +106,9 @@ func (d *defaultLogger) Logf(level LogPriority, format string, v ...interface{})
 }
 
 func (d *defaultLogger) SetLogLevel(level LogPriority) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.level = level
 }
 
@@ -145,7 +172,7 @@ func New(options NewOptions) *BTTracer {
 			Faulted:           true,
 			CallerOnly:        false,
 			ErrClassification: true,
-			Timeout:           time.Second * 120}}
+			Timeout:           defaultTraceTimeout}}
 }
 
 const (
@@ -153,86 +180,132 @@ const (
 	defaultCoronerPort   = "6098"
 )
 
-type PutOptions struct {
-	// If set to true, tracer results (i.e. generated snapshot files)
-	// will be unlinked from the filesystem after successful puts.
-	Unlink bool
-
-	// The http.Client to use for uploading. The default will be used
-	// if left unspecified.
-	Client http.Client
-
-	// If set to true, tracer results will be uploaded after each
-	// successful Trace request.
-	OnTrace bool
-}
-
-// Configures the uploading of a generated snapshot file to a remote Backtrace
-// coronerd object store.
-//
-// Uploads use simple one-shot semantics and won't retry on failures. For
-// more robust snapshot uploading and directory monitoring, consider using
-// coroner daemon, as described at
-// https://documentation.backtrace.io/snapshot/#daemon.
-//
-// endpoint: The URL of the server. It must be a valid HTTP endpoint as
-// according to url.Parse() (which is based on RFC 3986). The default scheme
-// and port are https and 6098, respectively, and are used if left unspecified.
-//
-// token: The hash associated with the coronerd project to which this
-// application belongs; see
-// https://documentation.backtrace.io/coronerd_setup/#authentication-tokens
-// for more details.
-//
-// options: Modifies behavior of the Put action; see PutOptions documentation
-// for more details.
-func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) error {
-	if endpoint == "" || token == "" {
-		return errors.New("Endpoint must be non-empty")
+// buildPutURL validates the upload endpoint strictly and assembles the
+// final URL. Only absolute http(s) URLs without userinfo, fragment, or
+// opaque form are accepted; a missing scheme or port receives the coronerd
+// defaults (IPv6-safe).
+func buildPutURL(endpoint, token string) (string, error) {
+	if endpoint == "" {
+		return "", errors.New("endpoint must be non-empty")
+	}
+	if token == "" {
+		return "", errors.New("token must be non-empty")
 	}
 
-	url, err := url.Parse(endpoint)
+	u, err := url.Parse(endpoint)
 	if err != nil {
-		return err
+		// Do not wrap err: *url.Error quotes the raw URL, and net/url
+		// inner errors can embed quoted input fragments too. The
+		// endpoint should not carry credentials (the token is a
+		// separate argument), but redact defensively anyway.
+		msg := "unparsable URL"
+		var ue *url.Error
+		if errors.As(err, &ue) && ue.Err != nil {
+			if inner := ue.Err.Error(); !strings.Contains(inner, `"`) {
+				msg = inner
+			}
+		}
+		return "", fmt.Errorf("invalid endpoint (%s): %s", msg, redactURL(endpoint))
 	}
 
 	// Endpoints without the scheme prefix (or at the very least a '//`
 	// prefix) are interpreted as remote server paths. Handle the
-	// (unlikely) case of an unspecified scheme. We won't allow other
-	// cases, like a port specified without a scheme, though, as per
-	// RFC 3986.
-	if url.Host == "" {
-		if url.Path == "" {
-			return errors.New("invalid URL specification: host " +
-				"or path must be non-empty")
+	// (unlikely) case of an unspecified scheme — but only for bare
+	// hosts: a path component in the shifted host would silently move
+	// the upload target.
+	if u.Host == "" && u.Scheme == "" && u.Opaque == "" && u.Path != "" {
+		host := strings.TrimSuffix(u.Path, "/")
+		if strings.Contains(host, "/") {
+			return "", errors.New("endpoint must be an absolute HTTP(S) URL " +
+				"or a bare host, got a scheme-less path")
 		}
-
-		url.Host = url.Path
+		u.Host = host
+		u.Path = ""
+	}
+	if u.Scheme == "" {
+		u.Scheme = defaultCoronerScheme
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported endpoint scheme %q", u.Scheme)
+	}
+	if u.Host == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
+		return "", errors.New("endpoint must be an absolute HTTP(S) URL " +
+			"without userinfo or fragment")
 	}
 
-	if url.Scheme == "" {
-		url.Scheme = defaultCoronerScheme
+	// Apply the default port IPv6-safely: Hostname() strips any brackets
+	// and JoinHostPort restores them as needed. Detect the missing-port
+	// case structurally and range-check explicit ports.
+	if host, port, portErr := net.SplitHostPort(u.Host); portErr != nil {
+		var addrErr *net.AddrError
+		if !errors.As(portErr, &addrErr) || !strings.Contains(addrErr.Err, "missing port") {
+			return "", fmt.Errorf("invalid endpoint host/port: %w", portErr)
+		}
+		u.Host = net.JoinHostPort(u.Hostname(), defaultCoronerPort)
+	} else {
+		if n, convErr := strconv.Atoi(port); convErr != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("invalid endpoint port %q", port)
+		}
+		_ = host
 	}
 
-	if !strings.ContainsAny(url.Host, ":") {
-		url.Host += ":" + defaultCoronerPort
+	u.Path = "post"
+	u.RawPath = ""
+	u.RawQuery = url.Values{"token": {token}}.Encode()
+	return u.String(), nil
+}
+
+// ConfigurePut configures the uploading of a generated snapshot file to a
+// remote Backtrace coronerd object store.
+//
+// Uploads use simple one-shot semantics and won't retry on failures. For
+// more robust snapshot uploading and directory monitoring, consider using
+// the coroner daemon.
+//
+// endpoint: the URL of the server; a valid HTTP(S) endpoint per url.Parse.
+// The default scheme and port are https and 6098, used if left unspecified.
+//
+// token: the hash associated with the coronerd project to which this
+// application belongs.
+//
+// options: modifies behavior of the Put action; see PutOptions.
+func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) error {
+	putURL, err := buildPutURL(endpoint, token)
+	if err != nil {
+		return err
+	}
+	if options.Timeout < 0 {
+		return errors.New("upload timeout must be positive")
+	}
+	if options.Timeout == 0 {
+		options.Timeout = defaultPutTimeout
+	}
+	if options.MaxSnapshotBytes < 0 {
+		return errors.New("snapshot size limit must be positive")
+	}
+	if options.MaxSnapshotBytes == 0 {
+		options.MaxSnapshotBytes = defaultMaxSnapshotBytes
+	}
+	if options.HTTPClient == nil {
+		options.HTTPClient = &options.Client
 	}
 
-	url.Path = "post"
-	url.RawQuery = fmt.Sprintf("token=%s", token)
+	t.putMu.Lock()
+	t.put = uploader{endpoint: putURL, options: options}
+	t.putMu.Unlock()
 
-	t.put.endpoint = url.String()
-	t.put.options = options
-
+	// Diagnostics carry the redacted URL only: the query embeds the token.
 	t.Logf(LogDebug, "Put enabled (endpoint: %s, unlink: %v)\n",
-		t.put.endpoint,
-		t.put.options.Unlink)
+		redactURL(putURL), options.Unlink)
 
 	return nil
 }
 
 // See bt.Tracer.PutOnTrace().
 func (t *BTTracer) PutOnTrace() bool {
+	t.putMu.RLock()
+	defer t.putMu.RUnlock()
+
 	return t.put.options.OnTrace
 }
 
@@ -287,29 +360,63 @@ func putDirWalk(t *BTTracer) filepath.WalkFunc {
 func (t *BTTracer) putSnapshotFile(path string) error {
 	t.Logf(LogDebug, "Attempting to upload snapshot %s...\n", path)
 
+	t.putMu.RLock()
+	u := t.put
+	t.putMu.RUnlock()
+	if u.endpoint == "" || u.options.HTTPClient == nil {
+		return errors.New("snapshot upload is not configured")
+	}
+
 	body, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer body.Close()
 
-	// The file is automatically closed by the Post request after
-	// completion.
-
-	resp, err := t.put.options.Client.Post(
-		t.put.endpoint,
-		"application/octet-stream",
-		body)
+	// Snapshot files must be bounded regular files: FIFOs or devices
+	// would block or stream unbounded data.
+	info, err := body.Stat()
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("failed to upload: %s", resp.Status)
+	if !info.Mode().IsRegular() {
+		return errors.New("snapshot is not a regular file")
+	}
+	if info.Size() > u.options.MaxSnapshotBytes {
+		return fmt.Errorf("snapshot exceeds %d-byte limit", u.options.MaxSnapshotBytes)
 	}
 
-	if t.put.options.Unlink {
+	ctx, cancel := context.WithTimeout(context.Background(), u.options.Timeout)
+	defer cancel()
+	// Bound the body at read time too (the file may grow after stat) and
+	// declare the length so the request is not chunked-unbounded.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.endpoint,
+		io.LimitReader(body, info.Size()))
+	if err != nil {
+		return fmt.Errorf("building upload request for %s: %s",
+			redactURL(u.endpoint), sanitizeHTTPError(err, u.endpoint))
+	}
+	req.ContentLength = info.Size()
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := u.options.HTTPClient.Do(req)
+	if err != nil {
+		// Never surface an error retaining the credential-bearing URL.
+		return fmt.Errorf("upload to %s failed: %s",
+			redactURL(u.endpoint), sanitizeHTTPError(err, u.endpoint))
+	}
+	defer func() {
+		// Drain (bounded) so the keep-alive connection can be reused
+		// across PutDir loops.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+	}()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("upload to %s failed: %s", redactURL(u.endpoint), resp.Status)
+	}
+
+	if u.options.Unlink {
 		t.Logf(LogDebug, "Unlinking snapshot...\n")
 
 		if err := os.Remove(path); err != nil {
@@ -373,6 +480,9 @@ func (t *BTTracer) SetPipes(stdin io.Reader, stderr io.Writer) {
 
 // Sets the logger for the tracer.
 func (t *BTTracer) SetLogger(logger Log) {
+	t.logMu.Lock()
+	defer t.logMu.Unlock()
+
 	t.logger = logger
 }
 
@@ -455,20 +565,46 @@ func (t *BTTracer) ClearOptions() {
 	t.options = nil
 }
 
-// See bt.Tracer.DefaultTraceOptions().
+// See bt.Tracer.DefaultTraceOptions(). Returns a pointer to a COPY: mutate
+// defaults through SetDefaultTraceOptions, not through the returned value.
 func (t *BTTracer) DefaultTraceOptions() *TraceOptions {
-	return &t.defaultTraceOptions
+	t.m.RLock()
+	defer t.m.RUnlock()
+
+	opts := t.defaultTraceOptions
+	return &opts
+}
+
+// SetDefaultTraceOptions replaces the defaults used by bt.Trace when no
+// per-call options are supplied. A zero Timeout keeps the built-in default
+// (a zero default would make every Trace time out instantly); use a
+// negative Timeout to disable the deadline.
+func (t *BTTracer) SetDefaultTraceOptions(opts TraceOptions) {
+	if opts.Timeout == 0 {
+		opts.Timeout = defaultTraceTimeout
+	}
+
+	t.m.Lock()
+	defer t.m.Unlock()
+
+	t.defaultTraceOptions = opts
 }
 
 // See bt.Tracer.Finalize().
 func (t *BTTracer) Finalize(options []string) *exec.Cmd {
+	// Snapshot under the lock, then build and log without holding it:
+	// Logf must never run while m is held (recursive RLock).
 	t.m.RLock()
-	defer t.m.RUnlock()
+	cmd := t.cmd
+	dir := t.outputDir
+	stdin := t.p.stdin
+	stderr := t.p.stderr
+	t.m.RUnlock()
 
-	tracer := exec.Command(t.cmd, options...)
-	tracer.Dir = t.outputDir
-	tracer.Stdin = t.p.stdin
-	tracer.Stderr = t.p.stderr
+	tracer := exec.Command(cmd, options...)
+	tracer.Dir = dir
+	tracer.Stdin = stdin
+	tracer.Stderr = stderr
 
 	t.Logf(LogDebug, "Command: %v\n", tracer)
 
@@ -476,17 +612,27 @@ func (t *BTTracer) Finalize(options []string) *exec.Cmd {
 }
 
 func (t *BTTracer) Logf(level LogPriority, format string, v ...interface{}) {
-	t.m.RLock()
-	defer t.m.RUnlock()
+	t.logMu.RLock()
+	logger := t.logger
+	t.logMu.RUnlock()
 
-	t.logger.Logf(level, format, v...)
+	if logger != nil {
+		// Called outside any BTTracer lock: format arguments may
+		// re-enter the tracer (e.g. %s on the tracer itself). A
+		// panicking logger is contained.
+		defer func() { _ = recover() }()
+		logger.Logf(level, format, v...)
+	}
 }
 
 func (t *BTTracer) SetLogLevel(level LogPriority) {
-	t.m.RLock()
-	defer t.m.RUnlock()
+	t.logMu.RLock()
+	logger := t.logger
+	t.logMu.RUnlock()
 
-	t.logger.SetLogLevel(level)
+	if logger != nil {
+		logger.SetLogLevel(level)
+	}
 }
 
 func (t *BTTracer) String() string {

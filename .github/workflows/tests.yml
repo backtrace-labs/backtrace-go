@@ -6,24 +6,157 @@ on:
       - master
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  run-tests:
-    name: lint-and-test
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: Check gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required for:"; echo "$unformatted"; exit 1
+          fi
+      - name: Verify go.mod/go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
+  test:
+    name: test (go ${{ matrix.go-version }}, ${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        go-version: [1.18, 1.22]
+        # Support policy: the two most recent Go releases (go.mod
+        # declares the minimum).
+        go-version: ['1.25.x', '1.26.x']
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+          check-latest: true
+      - name: Vet
+        run: go vet ./...
+      - name: Run unit tests (race detector)
+        run: go test -race -count=1 ./...
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          version: v1.60
-      - name: Run Unit Tests
+          go-version: '1.26.x'
+          check-latest: true
+      - name: Scan for known vulnerabilities
         run: |
-          go test
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+          # Full human-readable report always appears in the log.
+          govulncheck ./... || true
+
+          # Gate policy: vulnerabilities reachable in this module's own
+          # dependencies FAIL the build — those ship to users through
+          # go.mod. Standard-library findings are advisory here: consumers
+          # compile this library with their own Go toolchain, so the CI
+          # toolchain's stdlib is not shipped, and a strict gate would turn
+          # red on an unrelated schedule every time a Go patch release lands
+          # before the runner image's cached toolchain catches up.
+          # `check-latest: true` above keeps the toolchain current, so
+          # stdlib findings should normally be empty anyway.
+          govulncheck -format json ./... > govulncheck.json || true
+
+          dependency_vulns="$(jq -s -r '
+            [ .[]
+              | select(.finding)
+              | .finding
+              | select(.trace[0].function)                 # reachable symbol
+              | select(.trace[0].module != "stdlib")       # not the toolchain
+              | .osv ] | unique | .[]' govulncheck.json)"
+
+          stdlib_vulns="$(jq -s -r '
+            [ .[]
+              | select(.finding)
+              | .finding
+              | select(.trace[0].function)
+              | select(.trace[0].module == "stdlib")
+              | .osv ] | unique | .[]' govulncheck.json)"
+
+          if [ -n "$stdlib_vulns" ]; then
+            echo "::warning title=Go stdlib vulnerabilities::Advisory only (fixed by a newer Go toolchain): $(echo "$stdlib_vulns" | tr '\n' ' ')"
+          fi
+
+          if [ -n "$dependency_vulns" ]; then
+            echo "::error title=Dependency vulnerabilities::$(echo "$dependency_vulns" | tr '\n' ' ')"
+            exit 1
+          fi
+
+          echo "No reachable dependency vulnerabilities."
+
+  fuzz-smoke:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: Fuzz parsers and redaction briefly
+        run: |
+          for target in FuzzBuildThreads FuzzRedactURL FuzzRetryAfter FuzzSplitQualifiedFunction FuzzSafeMultipartName; do
+            go test -run "^$target$" -fuzz "^$target$" -fuzztime 20s .
+          done
+
+  cross-compile:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - linux/amd64
+          - linux/arm
+          - linux/arm64
+          - windows/amd64
+          - darwin/arm64
+          - freebsd/amd64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: Build
+        run: |
+          export GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}"
+          go build ./...
+          go vet ./...
+        env:
+          TARGET: ${{ matrix.target }}
