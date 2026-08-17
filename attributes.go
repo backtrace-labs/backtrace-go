@@ -1,9 +1,8 @@
 package bt
 
 import (
-	"context"
+	neturl "net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -11,27 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-)
-
-// execCommandTimeout bounds every machine-metadata subprocess.
-const execCommandTimeout = 2 * time.Second
-
-var (
-	windowsGUIDCommand = []string{"reg", "query", `HKEY_LOCAL_MACHINE\Software\Microsoft\Cryptography`, "/v", "MachineGuid"}
-	linuxGUIDCommand   = []string{"sh", "-c", "( cat /var/lib/dbus/machine-id /etc/machine-id 2> /dev/null || hostname ) | head -n 1 || :"}
-	freebsdGUIDCommand = []string{"sh", "-c", "kenv -q smbios.system.uuid || sysctl -n kern.hostuuid"}
-	darwinGUIDCommand  = []string{"sh", "-c", "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | awk -F'= \"' '{print $2}' | tr -d '\"' | tr -d '\n'"}
-
-	// reg query instead of wmic: wmic is removed from Windows 11 24H2 /
-	// Server 2025.
-	windowsCPUCommand = []string{"reg", "query", `HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0`, "/v", "ProcessorNameString"}
-	linuxCPUCommand   = []string{"sh", "-c", "lscpu | grep \"Model name\" | awk -F':' '{print $2}' | sed 's/^[[:space:]]*//'"}
-	darwinCPUCommand  = []string{"sh", "-c", "sysctl -n machdep.cpu.brand_string | tr -d '\n'"}
-	freebsdCPUCommand = []string{"sh", "-c", "sysctl -n hw.model"}
-
-	linuxOSVersionCommand   = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
-	darwinOSVersionCommand  = []string{"sh", "-c", "sw_vers | grep ProductVersion | awk -F':' '{print $2}' | tr -d '\t' | tr -d '\n'"}
-	freebsdOSVersionCommand = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
 )
 
 // processSessionID identifies this process instance across its reports.
@@ -87,87 +65,32 @@ func runtimeAttributes(attrs map[string]interface{}) {
 var (
 	machineOnce  sync.Once
 	machineAttrs map[string]interface{}
+
+	machineGUIDOnce sync.Once
+	machineGUIDVal  string
 )
 
-// machineAttributes gathers machine metadata (GUID, CPU model, OS version)
-// by shelling out to platform tools. It runs at most once per process, on
-// first use — never at import time — and each command is bounded by
-// execCommandTimeout. Failures degrade to missing attributes.
+// machineAttributes gathers machine metadata (CPU model, OS version) using
+// native file and syscall reads — never shell pipelines. It runs at most
+// once per process, on first use (never at import time). Failures degrade
+// to missing attributes.
 func machineAttributes(d diag) map[string]interface{} {
 	machineOnce.Do(func() {
 		attrs := map[string]interface{}{}
-
-		var guidCommand, cpuCommand, osCommand []string
-		switch runtime.GOOS {
-		case "windows":
-			guidCommand = windowsGUIDCommand
-			cpuCommand = windowsCPUCommand
-		case "linux":
-			guidCommand = linuxGUIDCommand
-			cpuCommand = linuxCPUCommand
-			osCommand = linuxOSVersionCommand
-		case "darwin":
-			guidCommand = darwinGUIDCommand
-			cpuCommand = darwinCPUCommand
-			osCommand = darwinOSVersionCommand
-		case "freebsd":
-			guidCommand = freebsdGUIDCommand
-			cpuCommand = freebsdCPUCommand
-			osCommand = freebsdOSVersionCommand
-		}
-
-		if output := execCommand(guidCommand, d); output != "" {
-			if runtime.GOOS == "windows" {
-				output = strings.Trim(parseWindowsRegValue(output), "{}")
-			}
-			attrs["guid"] = strings.TrimSpace(output)
-		}
-
-		if output := execCommand(cpuCommand, d); output != "" {
-			if runtime.GOOS == "windows" {
-				output = parseWindowsRegValue(output)
-			}
-			attrs["cpu.brand"] = strings.TrimSpace(output)
-		}
-
-		if output := execCommand(osCommand, d); output != "" {
-			attrs["uname.version"] = strings.TrimSpace(output)
-		}
-
+		collectMachineInfo(attrs, d)
 		machineAttrs = attrs
 	})
 	return machineAttrs
 }
 
-// parseWindowsRegValue extracts the value from `reg query` output:
-//
-//	HKEY_LOCAL_MACHINE\...
-//	    ValueName    REG_SZ    the value, possibly with spaces
-func parseWindowsRegValue(output string) string {
-	if idx := strings.Index(output, "REG_SZ"); idx >= 0 {
-		value := output[idx+len("REG_SZ"):]
-		// Keep only the first line after the type column.
-		value, _, _ = strings.Cut(strings.TrimLeft(value, " \t"), "\r")
-		value, _, _ = strings.Cut(value, "\n")
-		return strings.TrimSpace(value)
-	}
-	return strings.TrimSpace(output)
-}
-
-// execCommand runs command[0] with the remaining arguments and returns its
-// stdout, or "" on any failure. A nil/empty command returns "".
-func execCommand(command []string, d diag) string {
-	if len(command) == 0 {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), execCommandTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, command[0], command[1:]...).Output()
-	if err != nil {
-		d.logf("machine attribute command %q failed: %v", command[0], err)
-		return ""
-	}
-	return string(out)
+// machineGUID resolves the stable machine identifier lazily and only when a
+// client actually opted in via SendMachineID — on macOS this is the one
+// probe that spawns a (bounded, non-shell) subprocess.
+func machineGUID(d diag) string {
+	machineGUIDOnce.Do(func() {
+		machineGUIDVal = collectMachineGUID(d)
+	})
+	return machineGUIDVal
 }
 
 var (
@@ -176,9 +99,12 @@ var (
 	buildInfoModules []string
 )
 
+// maxDependencyModules caps the dependency annotation size.
+const maxDependencyModules = 512
+
 // buildInfoAttributes extracts release metadata embedded by the Go toolchain:
 // main module version, VCS revision/time/dirty flag, and the dependency list
-// (attached to reports as the "Dependencies" annotation).
+// (attached to reports as the "Dependencies" annotation, capped).
 func buildInfoAttributes() (map[string]interface{}, []string) {
 	buildInfoOnce.Do(func() {
 		attrs := map[string]interface{}{}
@@ -200,8 +126,12 @@ func buildInfoAttributes() (map[string]interface{}, []string) {
 				attrs["vcs.modified"] = s.Value
 			}
 		}
-		modules := make([]string, 0, len(info.Deps))
-		for _, dep := range info.Deps {
+		deps := info.Deps
+		if len(deps) > maxDependencyModules {
+			deps = deps[:maxDependencyModules]
+		}
+		modules := make([]string, 0, len(deps))
+		for _, dep := range deps {
 			m := dep
 			if m.Replace != nil {
 				m = m.Replace
@@ -256,7 +186,30 @@ func getEnvVars(extraPatterns []string) map[string]string {
 		if value != redactedValue && urlUserinfoPattern.MatchString(value) {
 			value = redactedValue
 		}
+		// Submission-URL shapes (the SDK's own BACKTRACE_ENDPOINT, or any
+		// variable holding a tokenized submit URL) get their token
+		// redacted while keeping the rest of the URL readable.
+		if value != redactedValue {
+			value = redactSubmissionValue(value)
+		}
 		result[key] = value
 	}
 	return result
+}
+
+// redactSubmissionValue redacts embedded Backtrace submission tokens
+// (?token= query or submit-style path) in URL-shaped env values.
+func redactSubmissionValue(value string) string {
+	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+		return value
+	}
+	u, err := neturl.Parse(value)
+	if err != nil {
+		return value
+	}
+	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if u.Query().Get("token") != "" || pathEmbedsToken(u.Hostname(), segments) {
+		return redactURL(value)
+	}
+	return value
 }

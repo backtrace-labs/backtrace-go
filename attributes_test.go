@@ -59,6 +59,25 @@ func TestGetEnvVarsScrubsCommonSecretShapes(t *testing.T) {
 	}
 }
 
+// TestGetEnvVarsRedactsSubmissionURLs pins the fix for the SDK's own
+// credential: BACKTRACE_ENDPOINT (or any variable holding a tokenized
+// submission URL) must not ship its token in the env annotation.
+func TestGetEnvVarsRedactsSubmissionURLs(t *testing.T) {
+	t.Setenv("BACKTRACE_ENDPOINT", "https://submit.backtrace.io/universe/SECRETSUBMITTOKEN/json")
+	t.Setenv("BT_SHAPE_LEGACY_ENDPOINT_URL", "https://uni.sp.backtrace.io/post?format=json&token=SECRETQUERYTOKEN")
+
+	env := getEnvVars(nil)
+	if strings.Contains(env["BACKTRACE_ENDPOINT"], "SECRETSUBMITTOKEN") {
+		t.Errorf("submit-path token leaked: %q", env["BACKTRACE_ENDPOINT"])
+	}
+	if !strings.Contains(env["BACKTRACE_ENDPOINT"], "submit.backtrace.io") {
+		t.Errorf("redaction should keep the URL readable: %q", env["BACKTRACE_ENDPOINT"])
+	}
+	if strings.Contains(env["BT_SHAPE_LEGACY_ENDPOINT_URL"], "SECRETQUERYTOKEN") {
+		t.Errorf("query token leaked: %q", env["BT_SHAPE_LEGACY_ENDPOINT_URL"])
+	}
+}
+
 func TestStaticAttributes(t *testing.T) {
 	attrs := staticAttributes()
 	for _, key := range []string{
@@ -122,28 +141,15 @@ func TestBuildInfoAttributesDoesNotPanic(t *testing.T) {
 
 func TestUnwrapErrorChainTypes(t *testing.T) {
 	err := &testWrapErr{msg: "outer", inner: &testWrapErr{msg: "inner"}}
-	chain := unwrapErrorChain(err, DefaultMaxErrorDepth)
+	chain := unwrapErrorChain(err, DefaultMaxErrorDepth, DefaultMaxErrorNodes)
 	if len(chain) != 2 {
 		t.Fatalf("chain length = %d", len(chain))
 	}
 	if chain[0].Type != "*bt.testWrapErr" || chain[0].Message != "outer" {
 		t.Errorf("chain head = %+v", chain[0])
 	}
-}
-
-func TestParseWindowsRegValue(t *testing.T) {
-	guidOut := "\r\nHKEY_LOCAL_MACHINE\\Software\\Microsoft\\Cryptography\r\n" +
-		"    MachineGuid    REG_SZ    12345678-abcd-ef00-1122-334455667788\r\n\r\n"
-	if got := parseWindowsRegValue(guidOut); got != "12345678-abcd-ef00-1122-334455667788" {
-		t.Errorf("guid parse = %q", got)
-	}
-	cpuOut := "\r\nHKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\r\n" +
-		"    ProcessorNameString    REG_SZ    Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz\r\n\r\n"
-	if got := parseWindowsRegValue(cpuOut); got != "Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz" {
-		t.Errorf("cpu parse = %q (spaces must survive)", got)
-	}
-	if got := parseWindowsRegValue("no reg marker"); got != "no reg marker" {
-		t.Errorf("fallback = %q", got)
+	if chain[1].ParentID == nil || *chain[1].ParentID != 0 || chain[1].Source != "unwrap" {
+		t.Errorf("chain link parent metadata = %+v", chain[1])
 	}
 }
 

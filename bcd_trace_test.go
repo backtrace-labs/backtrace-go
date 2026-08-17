@@ -107,9 +107,53 @@ func TestTraceNilFinalizeFailsGracefully(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Fatalf("err = %v, want 'tracer unavailable' error", err)
 	}
-	// The trace lock must have been released: a second call still works.
-	if err := Trace(tr, nil, &TraceOptions{Timeout: 5 * time.Second}); err == nil {
-		t.Fatal("second Trace unexpectedly succeeded with nil Finalize")
+	// The trace lock must have been released: a second call must fail the
+	// SAME way (a lock-acquisition timeout would prove a leaked lock).
+	if err := Trace(tr, nil, &TraceOptions{Timeout: 5 * time.Second}); err == nil ||
+		!strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("second Trace = %v, want 'tracer unavailable' (trace lock leaked?)", err)
+	}
+}
+
+// TestTraceStartTimeoutHandoff pins the handoff path deterministically: the
+// timeout fires while Cmd.Start is still blocked, Trace returns a start-
+// timeout error, and the cleanup goroutine eventually releases the trace
+// lock so later traces still run.
+func TestTraceStartTimeoutHandoff(t *testing.T) {
+	defer traceTestConfig()()
+
+	release := make(chan struct{})
+	testHookBeforeTracerStart = func() { <-release }
+	defer func() { testHookBeforeTracerStart = nil }()
+
+	tr := &fakeTracer{
+		makeCmd: func() *exec.Cmd { return exec.Command("true") },
+		dto:     TraceOptions{Timeout: 5 * time.Second},
+	}
+
+	err := Trace(tr, nil, &TraceOptions{Timeout: 50 * time.Millisecond})
+	if err == nil || !strings.Contains(err.Error(), "start timed out") {
+		t.Fatalf("err = %v, want start-timeout error", err)
+	}
+
+	// Unblock the late Start; the cleanup goroutine must release the lock.
+	// The hook stays set (clearing it here would race with the blocked
+	// goroutine's earlier read); the closed channel makes it a no-op for
+	// subsequent traces, and the deferred clear is ordered by the lock
+	// handover.
+	close(release)
+
+	lockFree := make(chan error, 1)
+	go func() {
+		lockFree <- Trace(tr, nil, &TraceOptions{Timeout: 5 * time.Second})
+	}()
+	select {
+	case err := <-lockFree:
+		if err != nil {
+			t.Fatalf("post-handoff Trace = %v, want nil (lock released, tracer runs)", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("trace lock leaked by the start-timeout handoff")
 	}
 }
 

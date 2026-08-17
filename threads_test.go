@@ -378,6 +378,113 @@ func TestParseThreadsFromStackLegacyWrapper(t *testing.T) {
 	}
 }
 
+func TestSourceMetadataMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "meta.go")
+	if err := os.WriteFile(path, []byte("secret line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stack := "goroutine 1 [running]:\n" +
+		"main.main()\n" +
+		"\t" + path + ":1 +0x1f\n"
+
+	threads, sources, _ := buildThreads([]byte(stack), sourceOptions{
+		mode: SourceCodeMetadata, contextLines: 8, tabWidth: 8,
+	})
+	sc := sources[threads["0"].Stacks[0].SourceCodeID]
+	if sc.Path != path {
+		t.Errorf("metadata path = %q", sc.Path)
+	}
+	if sc.Text != "" {
+		t.Errorf("metadata mode leaked source text: %q", sc.Text)
+	}
+}
+
+func TestSourceRootsAllowlist(t *testing.T) {
+	allowedDir := t.TempDir()
+	deniedDir := t.TempDir()
+	allowed := filepath.Join(allowedDir, "in.go")
+	denied := filepath.Join(deniedDir, "out.go")
+	for _, p := range []string{allowed, denied} {
+		if err := os.WriteFile(p, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stack := "goroutine 1 [running]:\n" +
+		"main.a()\n" +
+		"\t" + allowed + ":2 +0x1\n" +
+		"main.b()\n" +
+		"\t" + denied + ":2 +0x2\n"
+
+	threads, sources, _ := buildThreads([]byte(stack), sourceOptions{
+		mode: SourceCodeContext, contextLines: 2, tabWidth: 8,
+		roots: []string{allowedDir},
+	})
+	frames := threads["0"].Stacks
+	if sources[frames[0].SourceCodeID].Text == "" {
+		t.Error("allowed root produced no source text")
+	}
+	if got := sources[frames[1].SourceCodeID].Text; got != "" {
+		t.Errorf("file outside SourceRoots was read: %q", got)
+	}
+}
+
+func TestSourceBudgets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.go")
+	content := strings.Repeat("padding line\n", 100)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stack := "goroutine 1 [running]:\n" +
+		"main.a()\n" +
+		"\t" + path + ":50 +0x1\n"
+
+	// Per-file budget smaller than the file: degrade to path-only.
+	_, sources, _ := buildThreads([]byte(stack), sourceOptions{
+		mode: SourceCodeContext, contextLines: 3, tabWidth: 8,
+		maxFileBytes: 64,
+	})
+	for _, sc := range sources {
+		if sc.Text != "" {
+			t.Errorf("per-file budget ignored: %d bytes embedded", len(sc.Text))
+		}
+	}
+
+	// Total budget of 1 byte: snippet cannot be embedded.
+	_, sources, _ = buildThreads([]byte(stack), sourceOptions{
+		mode: SourceCodeContext, contextLines: 3, tabWidth: 8,
+		maxTotal: 1,
+	})
+	for _, sc := range sources {
+		if sc.Text != "" {
+			t.Errorf("total source budget ignored: %d bytes embedded", len(sc.Text))
+		}
+	}
+}
+
+func TestIsSDKFrameBoundary(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"github.com/backtrace-labs/backtrace-go.Report", true},
+		{"github.com/backtrace-labs/backtrace-go", true},
+		{"github.com/backtrace-labs/backtrace-go/bthttp.(*Handler).Handle", true},
+		{"github.com/backtrace-labs/backtrace-go-fork.Report", false},
+		{"github.com/backtrace-labs/backtrace-gopher.Report", false},
+		{"main.main", false},
+	}
+	for _, c := range cases {
+		if got := isSDKFrame(c.name); got != c.want {
+			t.Errorf("isSDKFrame(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestSplitQualifiedFunction(t *testing.T) {
 	cases := []struct{ in, lib, fn string }{
 		{"main.main()", "main", "main"},

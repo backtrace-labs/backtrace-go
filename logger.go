@@ -3,6 +3,7 @@ package bt
 import (
 	"log"
 	"os"
+	"sync/atomic"
 )
 
 // Logger is the minimal logging interface used for SDK diagnostics.
@@ -21,6 +22,14 @@ var defaultDiagLogger Logger = log.New(os.Stderr, "[backtrace] ", log.LstdFlags)
 type diag struct {
 	logger Logger
 	debug  bool
+
+	// busy, when set, is a per-client re-entrancy guard: a Logger that
+	// calls back into the SDK (a logging-adapter pattern) would otherwise
+	// recurse Printf -> Report -> drop -> logf -> Printf without bound,
+	// ending in an uncatchable stack overflow. While a diagnostic line is
+	// being written, nested (and concurrent) diagnostics for the same
+	// client are suppressed.
+	busy *atomic.Int32
 }
 
 func (d diag) logf(format string, v ...interface{}) {
@@ -31,5 +40,17 @@ func (d diag) logf(format string, v ...interface{}) {
 	if l == nil {
 		l = defaultDiagLogger
 	}
+
+	if d.busy != nil {
+		if !d.busy.CompareAndSwap(0, 1) {
+			return
+		}
+		defer d.busy.Store(0)
+	}
+
+	// A diagnostic callback must never be able to terminate the
+	// application or the SDK worker. Do not recursively attempt to log
+	// this panic.
+	defer func() { _ = recover() }()
 	l.Printf(format, v...)
 }

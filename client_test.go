@@ -1,6 +1,7 @@
 package bt
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -53,7 +55,10 @@ func TestNewClientValidation(t *testing.T) {
 }
 
 func TestClientReportDelivery(t *testing.T) {
-	c, rs := newTestClient(t, nil)
+	c, rs := newTestClient(t, func(cfg *Config) {
+		// Source text is opt-in; this test asserts context snippets.
+		cfg.SourceCode = SourceCodeContext
+	})
 
 	c.Report(errors.New("client error"), map[string]interface{}{"who": "client"})
 	if !c.Flush(5 * time.Second) {
@@ -335,9 +340,11 @@ func TestBreadcrumbsRingAndAnnotation(t *testing.T) {
 	}
 }
 
-// TestPanicReportRetriesFullQueue pins the bounded blocking enqueue for
-// panic reports: with the queue full they retry instead of dropping.
-func TestPanicReportRetriesFullQueue(t *testing.T) {
+// TestPanicAndFlushRetriesFullQueue pins ReportPanicValueAndFlush: with the
+// queue full it retries admission under its single deadline instead of
+// dropping, then waits for delivery. Plain ReportPanicValue stays
+// non-blocking.
+func TestPanicAndFlushRetriesFullQueue(t *testing.T) {
 	block := make(chan struct{})
 	c, rs := newTestClient(t, func(cfg *Config) {
 		cfg.QueueSize = 1
@@ -358,24 +365,33 @@ func TestPanicReportRetriesFullQueue(t *testing.T) {
 	}
 	c.ReportMessage("fills the queue", nil)
 
-	done := make(chan struct{})
+	// Plain ReportPanicValue must return immediately (drop + count).
+	before := c.Stats().QueueFull
+	c.ReportPanicValue("non-blocking panic", nil)
+	if got := c.Stats().QueueFull; got != before+1 {
+		t.Errorf("non-blocking panic with full queue: QueueFull = %d, want %d", got, before+1)
+	}
+
+	done := make(chan bool, 1)
 	go func() {
-		c.ReportPanicValue("panic while queue full", nil)
-		close(done)
+		done <- c.ReportPanicValueAndFlush("panic while queue full", nil, 10*time.Second)
 	}()
 
 	select {
 	case <-done:
-		t.Fatal("panic report returned immediately: dropped instead of retrying")
+		t.Fatal("ReportPanicValueAndFlush returned immediately: dropped instead of retrying")
 	case <-time.After(100 * time.Millisecond):
-		// Still retrying, as intended.
+		// Still retrying under its deadline, as intended.
 	}
 
 	unblock()
 	select {
-	case <-done:
+	case delivered := <-done:
+		if !delivered {
+			t.Error("ReportPanicValueAndFlush = false after queue freed within deadline")
+		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("panic report never enqueued after queue freed")
+		t.Fatal("ReportPanicValueAndFlush never returned after queue freed")
 	}
 	if !c.Flush(5 * time.Second) {
 		t.Fatal("Flush timed out")
@@ -578,6 +594,278 @@ func TestAttachmentsMultipartSubmission(t *testing.T) {
 	}
 }
 
+type testPanicMethodError struct{}
+
+func (*testPanicMethodError) Error() string { panic("Error panic") }
+
+type testPanicStringer struct{}
+
+func (testPanicStringer) String() string { panic("String panic") }
+
+type testPanicLogger struct{}
+
+func (testPanicLogger) Printf(string, ...interface{}) { panic("logger panic") }
+
+func mustNotPanic(t *testing.T, name string, f func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%s let an application panic escape: %v", name, r)
+		}
+	}()
+	f()
+}
+
+// TestPublicReportingContainsApplicationPanics pins the "never panic"
+// contract at every boundary that executes caller-controlled code: error
+// and stringer implementations, unwrap methods, and the diagnostic logger.
+func TestPublicReportingContainsApplicationPanics(t *testing.T) {
+	c, _ := newTestClient(t, func(cfg *Config) {
+		cfg.Debug = true
+		cfg.Logger = testPanicLogger{}
+	})
+
+	var typedNil *testPanicMethodError
+	var err error = typedNil // non-nil interface, panicking Error()
+
+	mustNotPanic(t, "ReportError", func() { c.ReportError(err, nil) })
+	mustNotPanic(t, "Report", func() { c.Report(testPanicStringer{}, nil) })
+	mustNotPanic(t, "ReportPanicValue", func() { c.ReportPanicValue(testPanicStringer{}, nil) })
+	mustNotPanic(t, "ReportPanicValueAndFlush", func() {
+		c.ReportPanicValueAndFlush(testPanicStringer{}, nil, 100*time.Millisecond)
+	})
+	mustNotPanic(t, "Flush", func() { _ = c.Flush(time.Second) })
+}
+
+// reentrantLogger forwards every diagnostic line back into the SDK — the
+// logging-adapter pattern that historically recursed to a fatal stack
+// overflow. depth tracks the maximum observed nesting.
+type reentrantLogger struct {
+	c     *Client
+	depth atomic.Int32
+	max   atomic.Int32
+}
+
+func (l *reentrantLogger) Printf(format string, v ...interface{}) {
+	d := l.depth.Add(1)
+	defer l.depth.Add(-1)
+	if d > l.max.Load() {
+		l.max.Store(d)
+	}
+	if d > 25 {
+		// A guard failure would blow the stack long before this, but
+		// bail out rather than crash the whole test binary.
+		return
+	}
+	l.c.ReportMessage("from logger", nil)
+}
+
+// TestReentrantLoggerIsContained pins the diag re-entrancy guard: a Logger
+// that reports back into the SDK must not recurse unboundedly on the
+// closed-client or full-queue drop paths.
+func TestReentrantLoggerIsContained(t *testing.T) {
+	logger := &reentrantLogger{}
+	c, _ := newTestClient(t, func(cfg *Config) {
+		cfg.Debug = true
+		cfg.Logger = logger
+		cfg.QueueSize = 1
+	})
+	logger.c = c
+
+	// Closed-client drop path: deterministic infinite recursion before
+	// the guard existed.
+	c.Close()
+	c.ReportMessage("after close", nil)
+
+	if got := logger.max.Load(); got > 2 {
+		t.Errorf("re-entrant logger nested to depth %d; guard not effective", got)
+	}
+}
+
+// TestSourceMetadataDefault pins the production-safe default: frames carry
+// path/line metadata but no source text leaves the host.
+func TestSourceMetadataDefault(t *testing.T) {
+	c, rs := newTestClient(t, nil) // no SourceCode override
+
+	c.ReportMessage("metadata only", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	sources, _ := rs.last()["sourceCode"].(map[string]interface{})
+	if len(sources) == 0 {
+		t.Fatal("metadata mode should still reference paths")
+	}
+	for id, v := range sources {
+		sc, _ := v.(map[string]interface{})
+		if sc == nil {
+			continue
+		}
+		if text, _ := sc["text"].(string); text != "" {
+			t.Errorf("source entry %s carries text in metadata mode", id)
+		}
+		if path, _ := sc["path"].(string); path == "" {
+			t.Errorf("source entry %s missing path", id)
+		}
+	}
+}
+
+// TestFlushIsCaptureTimeBarrier pins the sequence-based flush: reports
+// enqueued after Flush is called must not extend its wait.
+func TestFlushIsCaptureTimeBarrier(t *testing.T) {
+	block := make(chan struct{})
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.QueueSize = 64
+	})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+
+	rs.mu.Lock()
+	rs.block = block
+	rs.mu.Unlock()
+
+	c.ReportMessage("pre-flush", nil)
+	select {
+	case <-rs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never reached the transport")
+	}
+
+	flushed := make(chan bool, 1)
+	go func() { flushed <- c.Flush(10 * time.Second) }()
+
+	// Concurrent producers keep pouring reports in AFTER the flush call.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					c.ReportMessage("post-flush noise", nil)
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond) // flush is now waiting on the barrier
+	unblock()
+
+	select {
+	case ok := <-flushed:
+		if !ok {
+			t.Error("Flush = false although its pre-call backlog drained")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Flush starved by post-call producers (not a capture-time barrier)")
+	}
+	close(stop)
+	wg.Wait()
+	c.Flush(10 * time.Second)
+}
+
+// TestStatsBreakdown pins the reasoned discard counters.
+func TestStatsBreakdown(t *testing.T) {
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			if r.Attributes["drop.me"] == true {
+				return nil
+			}
+			return r
+		}
+	})
+
+	c.ReportMessage("delivered", nil)
+	c.ReportMessage("hook-dropped", map[string]interface{}{"drop.me": true})
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	stats := c.Stats()
+	if stats.Accepted != 2 {
+		t.Errorf("Accepted = %d, want 2", stats.Accepted)
+	}
+	if stats.Delivered != 1 {
+		t.Errorf("Delivered = %d, want 1", stats.Delivered)
+	}
+	if stats.BeforeSend != 1 {
+		t.Errorf("BeforeSend drops = %d, want 1", stats.BeforeSend)
+	}
+	if rs.count() != 1 {
+		t.Errorf("server received %d reports, want 1", rs.count())
+	}
+
+	// Server rejection is classified separately.
+	rs.mu.Lock()
+	rs.status = http.StatusInternalServerError
+	rs.mu.Unlock()
+	c.ReportMessage("rejected", nil)
+	c.Flush(5 * time.Second)
+	if got := c.Stats().ServerReject; got != 1 {
+		t.Errorf("ServerReject = %d, want 1", got)
+	}
+	if c.DroppedReports() != c.Stats().BeforeSend+c.Stats().ServerReject {
+		t.Errorf("DroppedReports = %d, want sum of reasons", c.DroppedReports())
+	}
+}
+
+// TestCloseContextCancelsBlockedTransport pins bounded shutdown: a stuck
+// transport cannot hold CloseContext past its deadline, and the SDK root
+// context aborts the in-flight request.
+func TestCloseContextCancelsBlockedTransport(t *testing.T) {
+	block := make(chan struct{})
+	c, rs := newTestClient(t, nil)
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+
+	rs.mu.Lock()
+	rs.block = block
+	rs.mu.Unlock()
+
+	c.ReportMessage("stuck in flight", nil)
+	select {
+	case <-rs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never reached the transport")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	completed := c.CloseContext(ctx)
+	if completed {
+		t.Error("CloseContext reported clean completion despite a blocked transport")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("CloseContext took %v; deadline not honored", elapsed)
+	}
+	unblock()
+	// The worker exits on its own after cancellation aborts the request.
+	select {
+	case <-c.workerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker leaked after CloseContext")
+	}
+}
+
+// TestCaptureStackCap pins the stack budget.
+func TestCaptureStackCap(t *testing.T) {
+	out := captureStack(true, 2048)
+	if len(out) > 2048 {
+		t.Errorf("stack = %d bytes, cap 2048", len(out))
+	}
+	if len(out) == 0 {
+		t.Error("empty stack")
+	}
+}
+
 // TestNilClientIsSafe pins the documented contract: every method on a nil
 // *Client (ignored NewClient error) is a safe no-op.
 func TestNilClientIsSafe(t *testing.T) {
@@ -592,10 +880,80 @@ func TestNilClientIsSafe(t *testing.T) {
 	if got := c.DroppedReports(); got != 0 {
 		t.Errorf("DroppedReports on nil = %d", got)
 	}
+	if got := c.Stats(); got != (ClientStats{}) {
+		t.Errorf("Stats on nil = %+v", got)
+	}
 	if !c.Flush(time.Millisecond) {
 		t.Error("Flush on nil client should trivially succeed")
 	}
+	if !c.FlushContext(context.Background()) {
+		t.Error("FlushContext on nil client should trivially succeed")
+	}
+	if !c.ReportPanicValueAndFlush("v", nil, time.Millisecond) {
+		t.Error("ReportPanicValueAndFlush on nil client should trivially succeed")
+	}
+	if !c.CloseContext(context.Background()) {
+		t.Error("CloseContext on nil client should trivially succeed")
+	}
 	c.Close()
+}
+
+// TestNegativeMaxAttachmentsDisables pins the documented contract: a
+// negative MaxAttachments sends NO attachments (privacy opt-out), rather
+// than removing the count cap.
+func TestNegativeMaxAttachmentsDisables(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.log")
+	if err := os.WriteFile(path, []byte("must not upload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.AttachmentPaths = []string{path}
+		cfg.MaxAttachments = -1
+	})
+	c.ReportMessage("no attachments", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	if rs.count() != 1 {
+		t.Fatalf("reports = %d, want 1", rs.count())
+	}
+	for name := range rs.lastAttachments() {
+		if strings.HasPrefix(name, "attachment_secret") {
+			t.Errorf("attachment sent despite MaxAttachments=-1: %s", name)
+		}
+	}
+}
+
+// TestSourceRootsSymlinkDenied pins the symlink-resolution fix: a link
+// under an allowed root pointing outside it must not smuggle content in.
+func TestSourceRootsSymlinkDenied(t *testing.T) {
+	allowedDir := t.TempDir()
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "secret.go")
+	if err := os.WriteFile(secret, []byte("classified\nlines\nhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(allowedDir, "linked.go")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	stack := "goroutine 1 [running]:\n" +
+		"main.a()\n" +
+		"\t" + link + ":2 +0x1\n"
+
+	_, sources, _ := buildThreads([]byte(stack), sourceOptions{
+		mode: SourceCodeContext, contextLines: 2, tabWidth: 8,
+		roots: []string{allowedDir},
+	})
+	for _, sc := range sources {
+		if sc.Text != "" {
+			t.Errorf("symlink escaped SourceRoots: %q", sc.Text)
+		}
+	}
 }
 
 func TestUUID4Format(t *testing.T) {
