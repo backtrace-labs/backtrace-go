@@ -20,6 +20,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
+          check-latest: true
       - name: Check gofmt
         run: |
           unformatted="$(gofmt -l .)"
@@ -52,6 +53,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
+          check-latest: true
       - name: Vet
         run: go vet ./...
       - name: Run unit tests (race detector)
@@ -67,10 +69,51 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
+          check-latest: true
       - name: Scan for known vulnerabilities
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          govulncheck ./...
+
+          # Full human-readable report always appears in the log.
+          govulncheck ./... || true
+
+          # Gate policy: vulnerabilities reachable in this module's own
+          # dependencies FAIL the build — those ship to users through
+          # go.mod. Standard-library findings are advisory here: consumers
+          # compile this library with their own Go toolchain, so the CI
+          # toolchain's stdlib is not shipped, and a strict gate would turn
+          # red on an unrelated schedule every time a Go patch release lands
+          # before the runner image's cached toolchain catches up.
+          # `check-latest: true` above keeps the toolchain current, so
+          # stdlib findings should normally be empty anyway.
+          govulncheck -format json ./... > govulncheck.json || true
+
+          dependency_vulns="$(jq -s -r '
+            [ .[]
+              | select(.finding)
+              | .finding
+              | select(.trace[0].function)                 # reachable symbol
+              | select(.trace[0].module != "stdlib")       # not the toolchain
+              | .osv ] | unique | .[]' govulncheck.json)"
+
+          stdlib_vulns="$(jq -s -r '
+            [ .[]
+              | select(.finding)
+              | .finding
+              | select(.trace[0].function)
+              | select(.trace[0].module == "stdlib")
+              | .osv ] | unique | .[]' govulncheck.json)"
+
+          if [ -n "$stdlib_vulns" ]; then
+            echo "::warning title=Go stdlib vulnerabilities::Advisory only (fixed by a newer Go toolchain): $(echo "$stdlib_vulns" | tr '\n' ' ')"
+          fi
+
+          if [ -n "$dependency_vulns" ]; then
+            echo "::error title=Dependency vulnerabilities::$(echo "$dependency_vulns" | tr '\n' ' ')"
+            exit 1
+          fi
+
+          echo "No reachable dependency vulnerabilities."
 
   fuzz-smoke:
     name: fuzz (smoke)
@@ -82,6 +125,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
+          check-latest: true
       - name: Fuzz parsers and redaction briefly
         run: |
           for target in FuzzBuildThreads FuzzRedactURL FuzzRetryAfter FuzzSplitQualifiedFunction FuzzSafeMultipartName; do
@@ -108,6 +152,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
+          check-latest: true
       - name: Build
         run: |
           export GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}"
