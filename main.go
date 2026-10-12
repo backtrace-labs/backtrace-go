@@ -1,413 +1,341 @@
+// Package bt is the Backtrace error reporting SDK for Go, plus an
+// integration with out-of-process tracers (see bcd.go).
+//
+// # Modern API
+//
+// Create a Client with NewClient and report errors, messages, and recovered
+// panics through it:
+//
+//	client, err := bt.NewClient(bt.Config{
+//		Endpoint: "https://submit.backtrace.io/{universe}/{token}/json",
+//	})
+//	if err != nil { ... }
+//	defer client.Close()
+//	client.Report(err, nil)
+//
+// # Legacy global API
+//
+// The package-level functions (Report, ReportPanic, ReportAndRecoverPanic,
+// FinishSendingReports) operate on a default client configured through the
+// global Options variable and remain fully supported:
+//
+//	bt.Options.Endpoint = "https://submit.backtrace.io/{universe}/{token}/json"
+//	bt.Report(err, nil)
+//
+// Configure Options before the first report. For runtime attribute changes
+// use SetAttribute (safe for concurrent use) instead of mutating
+// Options.Attributes.
+//
+// # Scope
+//
+// This SDK reports errors, messages, and recovered panics from within the
+// process. It cannot capture crashes that bypass Go panics (native/cgo
+// faults, runtime aborts); for those, use the bcd out-of-process tracer
+// integration in this package or the Backtrace Coresnap workflow.
 package bt
 
 import (
-	"bytes"
-	cryptorand "crypto/rand"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	mathrand "math/rand"
 	"net/http"
-	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
-	"strings"
+	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-const (
-	VersionMajor = 1
-	VersionMinor = 0
-	VersionPatch = 0
-)
-
-var (
-	Version = fmt.Sprintf("%d.%d.%d", VersionMajor, VersionMinor, VersionPatch)
-
-	windowsGUIDCommand = []string{"reg", "query", "\"HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Cryptography\"", "/v", "MachineGuid"}
-	linuxGUIDCommand   = []string{"sh", "-c", "( cat /var/lib/dbus/machine-id /etc/machine-id 2> /dev/null || hostname ) | head -n 1 || :"}
-	freebsdGUIDCommand = []string{"sh", "-c", "kenv -q smbios.system.uuid || sysctl -n kern.hostuuid"}
-	darwinGUIDCommand  = []string{"sh", "-c", "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | awk -F'= \"' '{print $2}' | tr -d '\"' | tr -d '\n'"}
-
-	windowsCPUCommand = []string{"wmic", "CPU", "get", "NAME"}
-	linuxCPUCommand   = []string{"sh", "-c", "lscpu | grep \"Model name\" | awk -F':' '{print $2}' | sed 's/^[[:space:]]*//'"}
-	darwinCPUCommand  = []string{"sh", "-c", "sysctl -n machdep.cpu.brand_string | tr -d '\n'"}
-	freebsdCPUCommand = []string{"sh", "-c", "sysctl -n hw.model"}
-
-	linuxOSVersionCommand   = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
-	darwinOSVersionCommand  = []string{"sh", "-c", "sw_vers | grep ProductVersion | awk -F':' '{print $2}' | tr -d '\t' | tr -d '\n'"}
-	freebsdOSVersionCommand = []string{"sh", "-c", "cat /etc/os-release | grep VERSION= | awk -F'=\"' '{print $2}' | tr -d '\"'"}
-)
-
+// OptionsStruct configures the legacy global reporter. New code should
+// prefer NewClient with a Config.
 type OptionsStruct struct {
+	// Endpoint is the Backtrace submission URL; see Config.Endpoint.
 	Endpoint string
-	Token    string
-	// SendEnvVars gathers and sends all environment variables with every report if true. Default false.
+	// Token is the project token for legacy endpoints; see Config.Token.
+	Token string
+
+	// SendEnvVars attaches the process environment to every report.
+	// Default false. See Config.SendEnvVars for the redaction rules.
 	SendEnvVars bool
 
+	// CaptureAllGoroutines includes every goroutine's stack in reports.
 	CaptureAllGoroutines bool
-	TabWidth             int
-	ContextLineCount     int
-	Attributes           map[string]interface{}
-	DebugBacktrace       bool
+	// TabWidth is reported to the Backtrace UI for source rendering.
+	TabWidth int
+	// ContextLineCount limits the source lines captured around each frame.
+	ContextLineCount int
+	// Attributes are added to every report. Prefer SetAttribute for
+	// changes made while the application is running.
+	Attributes map[string]interface{}
+	// DebugBacktrace enables SDK diagnostic logging (payload-free
+	// summaries). Unlike historical versions, the SDK never panics:
+	// failures are logged instead.
+	DebugBacktrace bool
+
+	// SourceCode controls source embedding; see Config.SourceCode.
+	// Default: SourceCodeMetadata (path/line only). Historical behavior
+	// (whole files) is available with SourceCodeFile.
+	SourceCode SourceCodeMode
+	// SourceRoots restricts source text reads; see Config.SourceRoots.
+	SourceRoots []string
+	// SampleRate is the fraction of reports sent; zero means 1.0.
+	SampleRate float64
+	// BeforeSend runs before each report is serialized; see Config.BeforeSend.
+	BeforeSend func(report *ReportData) *ReportData
+	// ScrubEnvVars extends the built-in redaction patterns; see Config.ScrubEnvVars.
+	ScrubEnvVars []string
+	// SendMachineID includes a stable machine identifier; see
+	// Config.SendMachineID. Default false.
+	SendMachineID bool
+	// Logger receives diagnostics when DebugBacktrace is on.
+	Logger Logger
+	// HTTPClient overrides the submission HTTP client.
+	HTTPClient *http.Client
+	// Timeout is the per-request submission deadline (default 30s).
+	// Applied when the default client is created (first report).
+	Timeout time.Duration
+	// ShutdownTimeout bounds client shutdown; see Config.ShutdownTimeout.
+	ShutdownTimeout time.Duration
+	// QueueSize is the report queue capacity (default 128). Applied when
+	// the default client is created (first report).
+	QueueSize int
+	// MaxErrorDepth caps error-graph unwrapping; see Config.MaxErrorDepth.
+	MaxErrorDepth int
+	// MaxBreadcrumbs caps the breadcrumb buffer; applied at first report.
+	MaxBreadcrumbs int
+	// AttachmentPaths lists files attached to every report.
+	AttachmentPaths []string
+	// DisableMachineAttributes skips machine metadata collection.
+	DisableMachineAttributes bool
 }
 
+// Options configures the legacy global reporter. Set fields before the
+// first report; concurrent mutation while reporting is not synchronized
+// (use SetAttribute / SetAttributes for runtime attribute updates). The
+// delivery configuration is snapshotted when each report is captured, so
+// later changes cannot reroute already-queued reports.
 var Options OptionsStruct
 
-var rng *mathrand.Rand
-
-type reportPayload struct {
-	stack       []byte
-	attributes  map[string]interface{}
-	annotations map[string]interface{}
-	timestamp   int64
-	classifier  string
-}
-
-var queue = make(chan interface{}, 50)
-var doneChan = make(chan struct{})
-var blockChan = make(chan struct{})
-
 func init() {
-	var err error
-
-	var seedBytes [8]byte
-	_, err = cryptorand.Read(seedBytes[:])
-	if err != nil {
-		panic(err)
-	}
-
-	seed :=
-		(int64(seedBytes[0]) << 0) |
-			(int64(seedBytes[1]) << 1) |
-			(int64(seedBytes[2]) << 2) |
-			(int64(seedBytes[3]) << 3) |
-			(int64(seedBytes[4]) << 4) |
-			(int64(seedBytes[5]) << 5) |
-			(int64(seedBytes[6]) << 6) |
-			(int64(seedBytes[7]) << 7)
-
-	randSource := mathrand.NewSource(seed)
-	rng = mathrand.New(randSource)
-
-	setDefaultAttributes()
-
-	go sendWorkerMain()
+	// Historical behavior: Options.Attributes is usable at import time,
+	// so existing `bt.Options.Attributes[k] = v` call sites keep working.
+	Options.Attributes = map[string]interface{}{}
 }
 
-func setDefaultAttributes() {
-	if Options.Attributes == nil {
-		Options.Attributes = make(map[string]interface{})
-	}
+// legacyAttrMu guards Options.Attributes for callers using SetAttribute
+// alongside the legacy global API.
+var legacyAttrMu sync.Mutex
 
-	hostName, _ := os.Hostname()
-	Options.Attributes["backtrace.version"] = Version
-	Options.Attributes["backtrace.agent"] = "backtrace-go"
-	Options.Attributes["hostname"] = hostName
-	Options.Attributes["uname.sysname"] = runtime.GOOS
-	Options.Attributes["cpu.arch"] = runtime.GOARCH
-	Options.Attributes["process.id"] = os.Getpid()
-	Options.Attributes["application.session"] = uuid.New()
-	Options.Attributes["application"] = filepath.Base(os.Args[0])
+// optionsToConfig snapshots the global Options into a Config, cloning every
+// collection so queued reports cannot observe later mutations.
+func optionsToConfig() Config {
+	legacyAttrMu.Lock()
+	attrs := cloneAnyMap(Options.Attributes)
+	legacyAttrMu.Unlock()
 
-	guiCommand := []string{}
-	cpuCommand := []string{}
-	osCommand := []string{}
-	switch runtime.GOOS {
-	case "windows":
-		guiCommand = windowsGUIDCommand
-		cpuCommand = windowsCPUCommand
-	case "linux":
-		guiCommand = linuxGUIDCommand
-		cpuCommand = linuxCPUCommand
-		osCommand = linuxOSVersionCommand
-	case "darwin":
-		guiCommand = darwinGUIDCommand
-		cpuCommand = darwinCPUCommand
-		osCommand = darwinOSVersionCommand
-	case "freebsd":
-		guiCommand = freebsdGUIDCommand
-		cpuCommand = freebsdCPUCommand
-		osCommand = freebsdOSVersionCommand
-	}
-
-	if len(guiCommand) > 0 {
-		if output := execCommand(guiCommand); output != "" {
-			if runtime.GOOS == "windows" {
-				// windows gives:
-				// HKEY_LOCAL_MACHINE\Software\Microsoft\Cryptography
-				//    MachineGuid    REG_SZ    {XXXX-XXXX-XXXX-XXXX-XXXX}
-				if splitOutput := strings.Split(output, "{"); len(splitOutput) > 1 {
-					output = strings.TrimSuffix(splitOutput[1], "}")
-				}
-			}
-
-			Options.Attributes["guid"] = output
-		}
-	}
-
-	if len(cpuCommand) > 0 {
-		if output := execCommand(cpuCommand); output != "" {
-			if runtime.GOOS == "windows" {
-				// windows gives:
-				//NAME
-				//Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz
-				if splitOutput := strings.Split(output, "\n"); len(splitOutput) > 1 {
-					output = splitOutput[1]
-				}
-			}
-
-			Options.Attributes["cpu.brand"] = output
-		}
-	}
-
-	if len(osCommand) > 0 {
-		if output := execCommand(osCommand); output != "" {
-			Options.Attributes["uname.version"] = output
-		}
-	}
+	return Config{
+		Endpoint:                 Options.Endpoint,
+		Token:                    Options.Token,
+		SendEnvVars:              Options.SendEnvVars,
+		CaptureAllGoroutines:     Options.CaptureAllGoroutines,
+		TabWidth:                 Options.TabWidth,
+		ContextLineCount:         Options.ContextLineCount,
+		Attributes:               attrs,
+		Debug:                    Options.DebugBacktrace,
+		SourceCode:               Options.SourceCode,
+		SourceRoots:              cloneStringSlice(Options.SourceRoots),
+		SampleRate:               Options.SampleRate,
+		BeforeSend:               Options.BeforeSend,
+		ScrubEnvVars:             cloneStringSlice(Options.ScrubEnvVars),
+		SendMachineID:            Options.SendMachineID,
+		Logger:                   Options.Logger,
+		HTTPClient:               Options.HTTPClient,
+		Timeout:                  Options.Timeout,
+		ShutdownTimeout:          Options.ShutdownTimeout,
+		QueueSize:                Options.QueueSize,
+		MaxErrorDepth:            Options.MaxErrorDepth,
+		MaxBreadcrumbs:           Options.MaxBreadcrumbs,
+		AttachmentPaths:          cloneStringSlice(Options.AttachmentPaths),
+		DisableMachineAttributes: Options.DisableMachineAttributes,
+	}.normalize()
 }
 
-// first value in array is command to exec, rest are arguments.
-// e.g. []string{"sh", "-c", "sysctl -n foo_bar | grep foo_bar | tr -d "foo_var" "}
-func execCommand(commands []string) string {
-	out, err := exec.Command(commands[0], commands[1:]...).Output()
-	if err != nil {
-		if Options.DebugBacktrace {
-			log.Println(err)
-		}
-	}
+var (
+	defaultClientMu sync.Mutex
+	defaultClientV  *Client
 
-	return string(out)
+	// disabledWarnOnce rate-limits the unconditional misconfiguration
+	// warning to a single line per process.
+	disabledWarnOnce sync.Once
+)
+
+// defaultClient lazily creates the client backing the legacy global API.
+// Returns nil while Options.Endpoint (and BACKTRACE_ENDPOINT) are unset or
+// invalid: the global API is then a safe no-op.
+func defaultClient() *Client {
+	defaultClientMu.Lock()
+	if defaultClientV != nil {
+		c := defaultClientV
+		defaultClientMu.Unlock()
+		return c
+	}
+	cfg := optionsToConfig()
+	if err := cfg.validate(); err != nil {
+		defaultClientMu.Unlock()
+		// Log outside the lock: the logger is application code.
+		diag{logger: cfg.Logger, debug: cfg.Debug}.logf("reporting disabled: %v", err)
+		// An endpoint was configured but rejected: the application
+		// clearly intended reporting, so surface the misconfiguration
+		// once even without debug mode (an empty endpoint stays
+		// silent — that is the documented no-op mode).
+		if cfg.Endpoint != "" {
+			disabledWarnOnce.Do(func() {
+				defaultDiagLogger.Printf("reporting disabled: %v", err)
+			})
+		}
+		return nil
+	}
+	// The legacy client re-reads Options on every report so historical
+	// patterns (mutating bt.Options at runtime) keep working; queue size,
+	// timeout, and HTTP client are fixed at creation, and each report
+	// snapshots the delivery configuration at capture time.
+	c := startClient(optionsToConfig)
+	defaultClientV = c
+	defaultClientMu.Unlock()
+	return c
 }
 
+// Report sends an error report through the legacy global reporter. object
+// may be an error or any value convertible to a string; nil is ignored.
+// extraAttributes are added to this report only. Safe no-op while the SDK
+// is unconfigured. Never blocks on network I/O.
 func Report(object interface{}, extraAttributes map[string]interface{}) {
-	if extraAttributes == nil {
-		extraAttributes = map[string]interface{}{}
-	}
-	if extraAttributes["report_type"] == nil {
-		extraAttributes["report_type"] = "error"
-	}
-	switch value := object.(type) {
-	case nil:
-		return
-	case error:
-		sendReportString(value.Error(), "error", extraAttributes)
-	default:
-		sendReportString(fmt.Sprint(value), "message", extraAttributes)
+	if c := defaultClient(); c != nil {
+		c.Report(object, extraAttributes)
 	}
 }
 
-func sendReportString(msg string, classifier string, extraAttributes map[string]interface{}) {
-	if !checkOptions() {
-		return
+// reportingConfigured decides whether the deferred panic helpers should act
+// WITHOUT instantiating the default client — the helpers run on every
+// deferred return, and client startup belongs on the (rare) panic path.
+func reportingConfigured() bool {
+	if currentDefaultClient() != nil {
+		return true
 	}
-
-	timestamp := time.Now().Unix()
-
-	attributes := map[string]interface{}{}
-
-	updateAttrsWithProcMemInfo(attributes)
-
-	for k, v := range Options.Attributes {
-		attributes[k] = v
-	}
-
-	attributes["error.message"] = msg
-
-	for k, v := range extraAttributes {
-		attributes[k] = v
-	}
-
-	annotations := map[string]interface{}{}
-	if Options.SendEnvVars {
-		annotations["Environment Variables"] = getEnvVars()
-	}
-
-	payload := &reportPayload{
-		stack:       stack(Options.CaptureAllGoroutines),
-		attributes:  attributes,
-		annotations: annotations,
-		timestamp:   timestamp,
-		classifier:  classifier,
-	}
-	queue <- payload
+	return optionsToConfig().validate() == nil
 }
 
+// ReportPanic reports a panic and re-panics with the original value, after
+// waiting up to DefaultFlushTimeout (one deadline covering capture and
+// delivery). Use with defer:
+//
+//	defer bt.ReportPanic(nil)
+//
+// While the SDK is unconfigured this function does NOT recover: the
+// original panic proceeds exactly as if the handler were absent.
 func ReportPanic(extraAttributes map[string]interface{}) {
-	if !checkOptions() {
+	if !reportingConfigured() {
+		// Crucial: do not call recover. The original panic continues
+		// exactly as it did before SDK configuration.
 		return
 	}
-
-	err := recover()
-	if err == nil {
+	v := recover()
+	if v == nil {
 		return
 	}
-
-	if extraAttributes == nil {
-		extraAttributes = map[string]interface{}{}
+	if c := defaultClient(); c != nil {
+		_ = c.ReportPanicValueAndFlush(v, extraAttributes, DefaultFlushTimeout)
 	}
-	extraAttributes["report_type"] = "panic"
-
-	Report(err, extraAttributes)
-	finishSendingReports(false)
-	panic(err)
+	panic(v)
 }
 
+// ReportAndRecoverPanic reports a panic and swallows it; the goroutine
+// lives on. Use with defer. While the SDK is unconfigured this function
+// does NOT recover: the original panic proceeds unchanged.
 func ReportAndRecoverPanic(extraAttributes map[string]interface{}) {
-	if !checkOptions() {
+	if !reportingConfigured() {
+		return // no recover; preserve the application's panic
+	}
+	v := recover()
+	if v == nil {
 		return
 	}
-
-	if extraAttributes == nil {
-		extraAttributes = map[string]interface{}{}
+	if c := defaultClient(); c != nil {
+		c.ReportPanicValue(v, extraAttributes)
+		return
 	}
-	extraAttributes["report_type"] = "panic"
-
-	Report(recover(), extraAttributes)
+	// Configuration became invalid between the check and client creation
+	// (rare race): keep the panic alive rather than silently swallow it.
+	panic(v)
 }
 
-func stack(all bool) []byte {
-	buf := make([]byte, 1024)
-	for {
-		n := runtime.Stack(buf, all)
-		if n < len(buf) {
-			return buf[:n]
-		}
-		buf = make([]byte, 2*len(buf))
+// ReportPanicValue reports an already-recovered panic value through the
+// legacy global reporter without re-panicking or blocking. Intended for
+// middleware and custom recover() handlers.
+func ReportPanicValue(value interface{}, extraAttributes map[string]interface{}) {
+	if c := defaultClient(); c != nil {
+		c.ReportPanicValue(value, extraAttributes)
 	}
 }
 
-func getEnvVars() map[string]string {
-	lines := os.Environ()
-	result := map[string]string{}
-	for _, line := range lines {
-		kv := strings.Split(line, "=")
-		result[kv[0]] = kv[1]
+// ReportPanicValueAndFlush reports an already-recovered panic value and
+// waits for its delivery under one deadline. Returns false when the SDK is
+// unconfigured or delivery did not complete in time.
+func ReportPanicValueAndFlush(value interface{}, extraAttributes map[string]interface{}, timeout time.Duration) bool {
+	if c := defaultClient(); c != nil {
+		return c.ReportPanicValueAndFlush(value, extraAttributes, timeout)
 	}
-	return result
+	return false
 }
 
-func checkOptions() bool {
-	if len(Options.Endpoint) == 0 {
-		if !Options.DebugBacktrace {
-			return false
-		}
-		panic("must set bt.Options.Endpoint")
+// SetAttribute sets a global attribute included in every subsequent report.
+// Safe for concurrent use; prefer this over mutating Options.Attributes.
+func SetAttribute(key string, value interface{}) {
+	legacyAttrMu.Lock()
+	if Options.Attributes == nil {
+		Options.Attributes = map[string]interface{}{}
 	}
-
-	if !strings.HasPrefix(Options.Endpoint, "https://submit.backtrace.io") {
-		if len(Options.Token) == 0 {
-			if !Options.DebugBacktrace {
-				return false
-			}
-			panic("must set bt.Options.Token")
-		}
-	}
-	return true
+	Options.Attributes[key] = value
+	legacyAttrMu.Unlock()
 }
 
-func createUuid() string {
-	var uuidBytes [16]byte
-	_, _ = rng.Read(uuidBytes[:]) // This function is documented to never fail.
-	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-		uuidBytes[0], uuidBytes[1], uuidBytes[2], uuidBytes[3],
-		uuidBytes[4], uuidBytes[5],
-		uuidBytes[6], uuidBytes[7],
-		uuidBytes[8], uuidBytes[9],
-		uuidBytes[10], uuidBytes[11], uuidBytes[12], uuidBytes[13], uuidBytes[14], uuidBytes[15])
+// SetAttributes sets multiple global attributes atomically.
+func SetAttributes(attrs map[string]interface{}) {
+	legacyAttrMu.Lock()
+	if Options.Attributes == nil {
+		Options.Attributes = map[string]interface{}{}
+	}
+	for k, v := range attrs {
+		Options.Attributes[k] = v
+	}
+	legacyAttrMu.Unlock()
 }
 
-func sendWorkerMain() {
-	for {
-		select {
-		case queueItem := <-queue:
-			switch value := queueItem.(type) {
-			case nil:
-				doneChan <- struct{}{}
-				return
-			case *reportPayload:
-				processAndSend(value)
-			default:
-				panic("invalid queue item")
-			}
-		case <-blockChan:
-			doneChan <- struct{}{}
-		}
-
+// AddBreadcrumb records a breadcrumb on the legacy global reporter.
+func AddBreadcrumb(b Breadcrumb) {
+	if c := defaultClient(); c != nil {
+		c.AddBreadcrumb(b)
 	}
 }
 
+// Flush blocks until reports queued at the time of the call are processed
+// or timeout elapses, reporting whether the drain completed. The reporter
+// stays fully usable afterwards. Flushing proves local processing and send
+// completion, not backend acceptance.
+func Flush(timeout time.Duration) bool {
+	c := currentDefaultClient()
+	if c == nil {
+		return true
+	}
+	return c.Flush(timeout)
+}
+
+// FinishSendingReports blocks until queued reports are sent (bounded by the
+// configured submission deadline per report, 30s overall). Unlike
+// historical versions it does NOT stop the reporter: reporting continues to
+// work afterwards. Kept for backward compatibility — new code should use
+// Flush.
 func FinishSendingReports() {
-	finishSendingReports(true)
-}
-func finishSendingReports(kill bool) {
-	if kill {
-		queue <- nil
-	} else {
-		blockChan <- struct{}{}
-	}
-	<-doneChan
+	Flush(DefaultTimeout)
 }
 
-func processAndSend(payload *reportPayload) {
-	threads, sourceCode := ParseThreadsFromStack(payload.stack)
-
-	report := map[string]interface{}{}
-	report["uuid"] = createUuid()
-	report["timestamp"] = payload.timestamp
-	report["lang"] = "go"
-	report["langVersion"] = runtime.Version()
-	report["agent"] = "backtrace-go"
-	report["agentVersion"] = Version
-	report["attributes"] = payload.attributes
-	report["annotations"] = payload.annotations
-	report["threads"] = threads
-	report["mainThread"] = "0"
-	report["sourceCode"] = sourceCode
-	report["classifiers"] = []string{payload.classifier}
-
-	fullUrl := Options.Endpoint
-
-	if len(Options.Token) != 0 { // if token is set that means its old URL.
-		fullUrl = fmt.Sprintf("%s/post?format=json&token=%s", Options.Endpoint, url.QueryEscape(Options.Token))
-	}
-
-	if Options.DebugBacktrace {
-		fmt.Fprintf(os.Stderr, "POST %s\n", fullUrl)
-		var err error
-		jsonBytes, err := json.MarshalIndent(report, "", "  ")
-		if err != nil {
-			panic(err)
-		}
-		fmt.Fprintf(os.Stderr, "%s\n", string(jsonBytes))
-	}
-
-	jsonBytes, err := json.Marshal(report)
-	if err != nil {
-		if Options.DebugBacktrace {
-			panic(err)
-		}
-		return
-	}
-	resp, err := http.Post(fullUrl, "application/json", bytes.NewReader(jsonBytes))
-	if err != nil {
-		if Options.DebugBacktrace {
-			panic(err)
-		}
-		return
-	}
-	defer resp.Body.Close()
-
-	if _, err = io.ReadAll(resp.Body); err != nil {
-		if Options.DebugBacktrace {
-			panic(err)
-		}
-		return
-	}
+// currentDefaultClient returns the default client without creating one.
+func currentDefaultClient() *Client {
+	defaultClientMu.Lock()
+	defer defaultClientMu.Unlock()
+	return defaultClientV
 }

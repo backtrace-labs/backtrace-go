@@ -1,0 +1,24 @@
+# golangci-lint v2 configuration.
+version: "2"
+
+linters:
+  # standard: errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  settings:
+    errcheck:
+      # Response/file Close in defers is intentionally best-effort.
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net.Listener).Close
+  exclusions:
+    rules:
+      # Test helpers may ignore errors for brevity.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
