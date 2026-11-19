@@ -9,14 +9,32 @@
 // (method, protocol, registered route pattern) is attached; raw URL, host,
 // remote address, and user agent are gated behind Options.SendDefaultPII.
 //
-// The middleware wraps the http.ResponseWriter (to detect uncommitted
-// responses). The wrapper implements Flush, Hijack, Push, ReadFrom, and
-// Unwrap; handlers that type-assert the writer to a concrete type should
-// use http.NewResponseController or Unwrap instead.
+// # The response writer
+//
+// The wrapped handler receives the middleware's own http.ResponseWriter, so
+// that a swallowed panic becomes a 500 only when no response was started,
+// and nothing is written to a connection the handler hijacked. That writer
+// offers:
+//
+//   - http.Flusher and http.Hijacker when the writer it wraps supports
+//     them, or any writer reachable through that writer's Unwrap method
+//     does: the lookup http.ResponseController performs. Flushing or
+//     hijacking through an http.ResponseController is tracked as well.
+//   - http.Pusher and io.ReaderFrom only when the writer it wraps
+//     implements them itself. Reaching past an intermediate writer for
+//     these would skip that writer's own Write.
+//   - io.StringWriter, and Unwrap for the deadline and full-duplex calls of
+//     http.ResponseController.
+//
+// The deprecated http.CloseNotifier is never offered; use
+// Request.Context().Done(). A handler that type-asserts the writer to a
+// concrete type should use http.NewResponseController instead. Writing to
+// the result of Unwrap goes around the tracking described above.
 package bthttp
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -85,8 +103,9 @@ func New(opts Options) *Handler {
 func (h *Handler) Handle(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tw := &trackingWriter{ResponseWriter: w}
+		wrapped := wrapWriter(tw)
 		defer h.recoverAndReport(tw, r)
-		next.ServeHTTP(tw, r)
+		next.ServeHTTP(wrapped, r)
 	})
 }
 
@@ -94,8 +113,9 @@ func (h *Handler) Handle(next http.Handler) http.Handler {
 func (h *Handler) HandleFunc(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tw := &trackingWriter{ResponseWriter: w}
+		wrapped := wrapWriter(tw)
 		defer h.recoverAndReport(tw, r)
-		next(tw, r)
+		next(wrapped, r)
 	}
 }
 
@@ -139,7 +159,8 @@ func (h *Handler) recoverAndReport(w *trackingWriter, r *http.Request) {
 	}
 	// Swallowing the panic means net/http's default handling never runs;
 	// an uncommitted response would otherwise become an empty 200 OK.
-	if !w.wroteHeader {
+	// Never write after a hijack — the connection no longer belongs to us.
+	if !w.wroteHeader && !w.hijacked {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
 }
@@ -168,17 +189,24 @@ func boundedString(s string, max int) string {
 	return s
 }
 
-// trackingWriter records whether a response was committed so a swallowed
-// panic can be converted into a 500 when nothing was written. It preserves
-// the optional ResponseWriter interfaces via http.NewResponseController
-// (Flush/Hijack) and direct assertions (Push/ReadFrom), and exposes Unwrap
-// for the controller.
+// trackingWriter records whether a response was started (so a swallowed
+// panic becomes a 500 only when nothing was sent) and whether the
+// connection was hijacked. The optional http.ResponseWriter interfaces are
+// added by wrapWriter only where they are really supported, so a handler's
+// `w.(http.Flusher)` assertion tells the truth.
+//
+// The deprecated http.CloseNotifier is intentionally not propagated (it is
+// superseded by Request.Context().Done()); returning a nil channel from a
+// falsely-advertised CloseNotify would block a handler forever.
 type trackingWriter struct {
 	http.ResponseWriter
 	wroteHeader bool
 	status      int
+	hijacked    bool
 }
 
+// Unwrap lets http.ResponseController reach the wrapped writer for the
+// operations the wrapper does not track (deadlines, full duplex).
 func (w *trackingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *trackingWriter) WriteHeader(code int) {
@@ -197,41 +225,206 @@ func (w *trackingWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
-func (w *trackingWriter) Flush() {
+// WriteString keeps io.WriteString on the wrapped writer's own fast path
+// when it has one; otherwise it is the Write above.
+func (w *trackingWriter) WriteString(s string) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	_ = http.NewResponseController(w.ResponseWriter).Flush()
+	return io.WriteString(w.ResponseWriter, s)
 }
 
-func (w *trackingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return http.NewResponseController(w.ResponseWriter).Hijack()
-}
+// The optional-method implementations below live on trackingWriter but are
+// surfaced only through the combination types selected in wrapWriter, so
+// they never widen the advertised interface set on their own.
 
-func (w *trackingWriter) Push(target string, opts *http.PushOptions) error {
-	if p, ok := w.ResponseWriter.(http.Pusher); ok {
-		return p.Push(target, opts)
+// flushError flushes through http.ResponseController, which finds the
+// flusher wherever it sits behind Unwrap. An attempted flush starts the
+// response (an implicit 200) whether or not the write succeeds, so only
+// "not supported" leaves it unstarted.
+func (w *trackingWriter) flushError() error {
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if !w.wroteHeader && !errors.Is(err, http.ErrNotSupported) {
+		w.wroteHeader = true
+		w.status = http.StatusOK
 	}
-	return http.ErrNotSupported
+	return err
 }
 
-func (w *trackingWriter) ReadFrom(r io.Reader) (int64, error) {
+// hijack takes the connection over through http.ResponseController, for
+// the same reason.
+func (w *trackingWriter) hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(w.ResponseWriter).Hijack()
+	if err == nil {
+		w.hijacked = true
+	}
+	return conn, rw, err
+}
+
+func (w *trackingWriter) push(target string, opts *http.PushOptions) error {
+	return w.ResponseWriter.(http.Pusher).Push(target, opts)
+}
+
+func (w *trackingWriter) readFrom(r io.Reader) (int64, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
-		return rf.ReadFrom(r)
-	}
-	return io.Copy(w.ResponseWriter, r)
+	return w.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
 }
 
-// CloseNotify delegates to the underlying writer for handlers still using
-// the deprecated http.CloseNotifier interface.
-//
-//nolint:staticcheck // deliberate passthrough of the deprecated interface
-func (w *trackingWriter) CloseNotify() <-chan bool {
-	if cn, ok := w.ResponseWriter.(http.CloseNotifier); ok {
-		return cn.CloseNotify()
+// The 2^4 combination types below give the returned wrapper exactly the
+// optional-interface method set of the underlying writer. This is verbose
+// but is the standard, dependency-free way to preserve interface parity
+// (the same shape httpsnoop/gorilla generate).
+type (
+	twF    struct{ *trackingWriter }
+	twH    struct{ *trackingWriter }
+	twP    struct{ *trackingWriter }
+	twR    struct{ *trackingWriter }
+	twFH   struct{ *trackingWriter }
+	twFP   struct{ *trackingWriter }
+	twFR   struct{ *trackingWriter }
+	twHP   struct{ *trackingWriter }
+	twHR   struct{ *trackingWriter }
+	twPR   struct{ *trackingWriter }
+	twFHP  struct{ *trackingWriter }
+	twFHR  struct{ *trackingWriter }
+	twFPR  struct{ *trackingWriter }
+	twHPR  struct{ *trackingWriter }
+	twFHPR struct{ *trackingWriter }
+)
+
+func (w twF) Flush()    { _ = w.flushError() }
+func (w twFH) Flush()   { _ = w.flushError() }
+func (w twFP) Flush()   { _ = w.flushError() }
+func (w twFR) Flush()   { _ = w.flushError() }
+func (w twFHP) Flush()  { _ = w.flushError() }
+func (w twFHR) Flush()  { _ = w.flushError() }
+func (w twFPR) Flush()  { _ = w.flushError() }
+func (w twFHPR) Flush() { _ = w.flushError() }
+
+// FlushError is the method http.ResponseController looks for first. With
+// it a flush made through a controller is tracked, and its error returned.
+func (w twF) FlushError() error    { return w.flushError() }
+func (w twFH) FlushError() error   { return w.flushError() }
+func (w twFP) FlushError() error   { return w.flushError() }
+func (w twFR) FlushError() error   { return w.flushError() }
+func (w twFHP) FlushError() error  { return w.flushError() }
+func (w twFHR) FlushError() error  { return w.flushError() }
+func (w twFPR) FlushError() error  { return w.flushError() }
+func (w twFHPR) FlushError() error { return w.flushError() }
+
+func (w twH) Hijack() (net.Conn, *bufio.ReadWriter, error)    { return w.hijack() }
+func (w twFH) Hijack() (net.Conn, *bufio.ReadWriter, error)   { return w.hijack() }
+func (w twHP) Hijack() (net.Conn, *bufio.ReadWriter, error)   { return w.hijack() }
+func (w twHR) Hijack() (net.Conn, *bufio.ReadWriter, error)   { return w.hijack() }
+func (w twFHP) Hijack() (net.Conn, *bufio.ReadWriter, error)  { return w.hijack() }
+func (w twFHR) Hijack() (net.Conn, *bufio.ReadWriter, error)  { return w.hijack() }
+func (w twHPR) Hijack() (net.Conn, *bufio.ReadWriter, error)  { return w.hijack() }
+func (w twFHPR) Hijack() (net.Conn, *bufio.ReadWriter, error) { return w.hijack() }
+
+func (w twP) Push(t string, o *http.PushOptions) error    { return w.push(t, o) }
+func (w twFP) Push(t string, o *http.PushOptions) error   { return w.push(t, o) }
+func (w twHP) Push(t string, o *http.PushOptions) error   { return w.push(t, o) }
+func (w twPR) Push(t string, o *http.PushOptions) error   { return w.push(t, o) }
+func (w twFHP) Push(t string, o *http.PushOptions) error  { return w.push(t, o) }
+func (w twFPR) Push(t string, o *http.PushOptions) error  { return w.push(t, o) }
+func (w twHPR) Push(t string, o *http.PushOptions) error  { return w.push(t, o) }
+func (w twFHPR) Push(t string, o *http.PushOptions) error { return w.push(t, o) }
+
+func (w twR) ReadFrom(r io.Reader) (int64, error)    { return w.readFrom(r) }
+func (w twFR) ReadFrom(r io.Reader) (int64, error)   { return w.readFrom(r) }
+func (w twHR) ReadFrom(r io.Reader) (int64, error)   { return w.readFrom(r) }
+func (w twPR) ReadFrom(r io.Reader) (int64, error)   { return w.readFrom(r) }
+func (w twFHR) ReadFrom(r io.Reader) (int64, error)  { return w.readFrom(r) }
+func (w twFPR) ReadFrom(r io.Reader) (int64, error)  { return w.readFrom(r) }
+func (w twHPR) ReadFrom(r io.Reader) (int64, error)  { return w.readFrom(r) }
+func (w twFHPR) ReadFrom(r io.Reader) (int64, error) { return w.readFrom(r) }
+
+// maxUnwrapDepth bounds the capability lookup, so that a writer whose
+// Unwrap returns itself cannot stall every request.
+const maxUnwrapDepth = 32
+
+// supportsFlush and supportsHijack follow Unwrap exactly as
+// http.ResponseController does, so the wrapper offers what a controller
+// could reach on the wrapped writer.
+func supportsFlush(rw http.ResponseWriter) bool {
+	for i := 0; i < maxUnwrapDepth; i++ {
+		switch t := rw.(type) {
+		case interface{ FlushError() error }, http.Flusher:
+			return true
+		case interface{ Unwrap() http.ResponseWriter }:
+			rw = t.Unwrap()
+		default:
+			return false
+		}
 	}
-	return nil
+	return false
+}
+
+func supportsHijack(rw http.ResponseWriter) bool {
+	for i := 0; i < maxUnwrapDepth; i++ {
+		switch t := rw.(type) {
+		case http.Hijacker:
+			return true
+		case interface{ Unwrap() http.ResponseWriter }:
+			rw = t.Unwrap()
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// wrapWriter returns an http.ResponseWriter with exactly the optional
+// methods that work on the wrapped writer: Flusher and Hijacker anywhere
+// behind Unwrap, Pusher and ReaderFrom on the writer itself.
+func wrapWriter(tw *trackingWriter) http.ResponseWriter {
+	var mask int
+	if supportsFlush(tw.ResponseWriter) {
+		mask |= 1
+	}
+	if supportsHijack(tw.ResponseWriter) {
+		mask |= 2
+	}
+	if _, ok := tw.ResponseWriter.(http.Pusher); ok {
+		mask |= 4
+	}
+	if _, ok := tw.ResponseWriter.(io.ReaderFrom); ok {
+		mask |= 8
+	}
+	switch mask {
+	case 0:
+		return tw
+	case 1:
+		return twF{tw}
+	case 2:
+		return twH{tw}
+	case 4:
+		return twP{tw}
+	case 8:
+		return twR{tw}
+	case 1 | 2:
+		return twFH{tw}
+	case 1 | 4:
+		return twFP{tw}
+	case 1 | 8:
+		return twFR{tw}
+	case 2 | 4:
+		return twHP{tw}
+	case 2 | 8:
+		return twHR{tw}
+	case 4 | 8:
+		return twPR{tw}
+	case 1 | 2 | 4:
+		return twFHP{tw}
+	case 1 | 2 | 8:
+		return twFHR{tw}
+	case 1 | 4 | 8:
+		return twFPR{tw}
+	case 2 | 4 | 8:
+		return twHPR{tw}
+	default: // 1|2|4|8
+		return twFHPR{tw}
+	}
 }
