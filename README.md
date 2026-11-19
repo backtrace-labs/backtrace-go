@@ -59,7 +59,9 @@ defer bt.ReportPanic(nil)           // reports, waits (one 5s deadline), re-pani
 defer bt.ReportAndRecoverPanic(nil) // reports without waiting; swallows the panic
 ```
 
-Regular `Report*` calls never block on network I/O or queue admission: reports are queued to a background worker, and a full queue drops the newest report and counts it (`client.Stats()`, `client.DroppedReports()`) instead of stalling the application. The only synchronous waits are the explicitly bounded ones: `Flush`, `Close`, `ReportPanicValueAndFlush`, and `bt.ReportPanic` (one 5s deadline); `ReportAndRecoverPanic` reports without waiting.
+Regular `Report*` calls never block on SDK-controlled network I/O or queue admission: reports are queued to a background worker, and a full queue drops the newest report and counts it (`client.Stats()`, `client.DroppedReports()`) instead of stalling the application. The SDK-controlled waits are explicitly bounded: `Flush`, `Close`, `ReportPanicValueAndFlush`, and `bt.ReportPanic` (one 5s deadline); `ReportAndRecoverPanic` reports without waiting. The `…Context` variants obey the caller's context — passing `context.Background()` means no deadline.
+
+See [Extension points and guarantees](#extension-points-and-guarantees) for the one caveat: user-supplied callbacks are trusted to return promptly.
 
 Delivery lifecycle:
 
@@ -85,7 +87,8 @@ client, err := bt.NewClient(bt.Config{
 		"application.environment": "production",
 	},
 	AttachmentPaths: []string{"/var/log/app.log"}, // uploaded with every report (10 MiB/file cap)
-	SendEnvVars:     true,  // env vars as annotation, secrets redacted
+	EnvVars:         []string{"APP_ENV", "REGION"}, // exact allowlist (preferred)
+	SendEnvVars:     false, // or capture ALL env vars, best-effort redaction
 	SampleRate:      1.0,   // fraction of reports sent (0 == 1.0)
 	BeforeSend: func(r *bt.ReportData) *bt.ReportData {
 		delete(r.Attributes, "secret") // scrub, enrich, or return nil to drop
@@ -107,6 +110,26 @@ client.AddBreadcrumb(bt.Breadcrumb{
 })
 ```
 
+Values are normalised when you hand them over: the SDK keeps its own detached copy, made of plain JSON-native types, so you can reuse or change your maps and slices as soon as the call returns. Types with their own JSON or text form keep it (`time.Time`, a UUID, `net.IP`), an `error` becomes its message and a struct becomes a map of its exported fields. See [MIGRATION.md](MIGRATION.md#values-are-normalised-when-you-report) for the full table and the size limits.
+
+### BeforeSend
+
+`BeforeSend` runs on the SDK worker just before a report is sent. Return the report (changed or not) to send it, or `nil` to drop it.
+
+```go
+BeforeSend: func(r *bt.ReportData) *bt.ReportData {
+	// Attribute values have one of these types, whatever you passed in:
+	// nil, bool, string, int64, uint64, float64, []interface{}, map[string]interface{}
+	if headers, ok := r.Attributes["headers"].(map[string]interface{}); ok {
+		delete(headers, "Authorization")
+	}
+	r.SourceCode = nil // removals stick: no source text is sent
+	return r
+},
+```
+
+The hook works on its own copy of the report, so an edit never shows up in a later one. Everything can be changed except the report id; the SDK then repairs only what the submission format requires (a positive timestamp, at least one thread, a main thread among them).
+
 Every report automatically includes: hostname, process ID and age, Go version, goroutine count, heap statistics, GC count, CPU architecture and model, OS version, `application.version` / `vcs.revision` (from Go build info), the Go module dependency list, and — on Linux — `/proc` memory and scheduler attributes. A stable machine identifier (`guid`) is opt-in via `SendMachineID`. Machine metadata is gathered once per process with native file, syscall, and registry reads — no shell pipelines (macOS additionally runs a single time-bounded `ioreg` probe for the opt-in machine identifier).
 
 ### net/http middleware
@@ -123,12 +146,9 @@ handler := bthttp.New(bthttp.Options{
 http.ListenAndServe(":8080", handler.Handle(mux))
 ```
 
-By default panic reports carry `request.method`, `request.proto`, and the
-registered route pattern (`request.route`). Raw URL path, host, remote
-address, and user agent require `SendDefaultPII: true`; use
-`RequestAttributes` to contribute application-approved metadata. When a
-swallowed panic left the response uncommitted, the middleware writes
-`500 Internal Server Error` instead of an empty `200`.
+By default panic reports carry `request.method`, `request.proto`, and the registered route pattern (`request.route`). Raw URL path, host, remote address, and user agent require `SendDefaultPII: true`; use `RequestAttributes` to contribute application-approved metadata. When a swallowed panic left the response uncommitted, the middleware writes `500 Internal Server Error` instead of an empty `200`.
+
+Handlers receive the middleware's own `http.ResponseWriter`. It offers `http.Flusher` and `http.Hijacker` whenever the writer underneath (or one behind its `Unwrap` method) supports them, and works with `http.NewResponseController`; a response that was flushed, or a connection that was hijacked, is never written to after a panic.
 
 ## Legacy global API
 
@@ -157,23 +177,27 @@ Notes:
 
 ## Thread-safety contract
 
-`Client` methods, the package-level reporting functions, `SetAttribute`,
-`AddBreadcrumb`, `Flush`, and `Close` are safe for concurrent use. The
-`Options` struct and `Config` maps are read when reports are captured;
-mutate them only before reporting starts (or via `SetAttribute`).
+`Client` methods, the package-level reporting functions, `SetAttribute`, `AddBreadcrumb`, `Flush`, and `Close` are safe for concurrent use. The `Options` struct and `Config` maps are read when reports are captured; mutate them only before reporting starts (or via `SetAttribute`).
+
+## Extension points and guarantees
+
+The SDK's guarantees are precise, and it is worth knowing exactly where they end:
+
+- **SDK-controlled queue and network operations are bounded.** Submission carries an SDK-owned deadline, the queue never blocks callers, and shutdown is time-bounded.
+- **Panics from your code are contained.** Panicking `Error()`, `String()`, `MarshalJSON`, `MarshalText`, `BeforeSend`, `Logger`, `RequestAttributes`, and `Tracer` implementations, and a panicking HTTP client or `RoundTripper` you supplied, are recovered and reported as errors or dropped reports — never a process crash.
+- **Blocking is a different matter.** Go cannot forcibly stop a callback that never returns. Custom `Tracer`s, `BeforeSend`, `RequestAttributes`, `Logger`s, and `http.RoundTripper`s are **trusted extension points and must return promptly**; one that blocks forever will hold the goroutine that called it.
+- **Credential redaction covers SDK-known credentials.** Backtrace submission tokens are stripped from every SDK diagnostic and error. Report *content* is yours: attributes, breadcrumbs, attachments, error messages, and (with `SendEnvVars`) environment values may contain secrets. Prefer `EnvVars` (exact allowlist) and scrub with `BeforeSend`; the built-in name/shape redaction is defense in depth, not a proof.
+- **Values you pass are detached when the call returns.** Attribute and breadcrumb values are normalised into the SDK's own copy on your goroutine, so you may mutate your maps afterwards. The work is bounded (nesting, number of values, bytes): an oversized value is cut with a visible marker instead of being walked in full. Do not mutate a collection *concurrently with* the reporting call itself.
+- **Redirects are never followed.** A report or snapshot is sent to the configured endpoint only. This also holds for an `http.Client` you pass in: the SDK works on a copy whose `CheckRedirect` it replaces.
 
 ## Migration and security
 
-- [MIGRATION.md](MIGRATION.md) — upgrading from pre-1.1.0 (Go floor, source
-  capture opt-in, panic-helper semantics, shutdown behavior).
+- [MIGRATION.md](MIGRATION.md) — upgrading from pre-1.1.0 (Go floor, source capture opt-in, panic-helper semantics, shutdown behavior).
 - [SECURITY.md](SECURITY.md) — private vulnerability reporting.
 
 ## Scope
 
-This SDK reports errors, messages, and recovered panics from within the
-process. Crashes that bypass Go panics (native/cgo faults, runtime aborts)
-require out-of-process capture: use the bcd tracer integration below, or
-the Backtrace Coresnap workflow, for robust fatal-crash coverage.
+This SDK reports errors, messages, and recovered panics from within the process. Crashes that bypass Go panics (native/cgo faults, runtime aborts) require out-of-process capture: use the bcd tracer integration below, or the Backtrace Coresnap workflow, for robust fatal-crash coverage.
 
 ## bcd (out-of-process tracing)
 
