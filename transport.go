@@ -40,20 +40,54 @@ const rateLimitMaxPause = 5 * time.Minute
 type httpTransport struct {
 	client  *http.Client
 	timeout time.Duration
+	// ownsClient is true when the SDK created the http.Client and the
+	// connection pool behind it, so it may close idle connections on
+	// shutdown. A caller-supplied client, like a transport shared with the
+	// rest of the process, is left untouched.
+	ownsClient bool
 
 	mu         sync.Mutex
 	pauseUntil time.Time
 }
 
+// noRedirect refuses to follow redirects: a report or multipart body must
+// never be replayed to a host other than the configured endpoint. A 3xx is
+// returned to the caller and handled by the non-2xx rejection branch.
+func noRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 func newHTTPTransport(client *http.Client, timeout time.Duration) *httpTransport {
-	if client == nil {
-		client = &http.Client{}
+	t := &httpTransport{timeout: timeout}
+	if client != nil {
+		// Copy, so the no-redirect policy is enforced without mutating the
+		// caller's shared client.
+		cloned := *client
+		cloned.CheckRedirect = noRedirect
+		t.client = &cloned
+		return t
 	}
-	return &httpTransport{client: client, timeout: timeout}
+
+	// The SDK's own client gets its own connection pool, configured like
+	// the process default (proxy, TLS, timeouts). A client with a nil
+	// Transport would share http.DefaultTransport with the application,
+	// and closing idle connections at shutdown would close the
+	// application's as well.
+	t.client = &http.Client{CheckRedirect: noRedirect}
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		t.client.Transport = base.Clone()
+		t.ownsClient = true
+	}
+	// A replaced http.DefaultTransport (instrumentation, a custom
+	// RoundTripper) cannot be copied: it is used as it is and, being
+	// shared, left alone at shutdown.
+	return t
 }
 
 func (t *httpTransport) closeIdleConnections() {
-	if t != nil && t.client != nil {
+	// Only close connections the SDK owns: a shared pool's idle
+	// connections may belong to unrelated application traffic.
+	if t != nil && t.client != nil && t.ownsClient {
 		t.client.CloseIdleConnections()
 	}
 }
@@ -138,6 +172,13 @@ func (t *httpTransport) send(
 		pause := retryAfter(resp)
 		t.pause(pause)
 		return dropRateLimit, fmt.Errorf("bt: server rate limit (429), pausing submissions for %s", pause)
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		// Say why: a redirecting gateway is a configuration to fix, and
+		// "rejected" alone does not point at it. The target is not named;
+		// it is whatever the answering server chose to send.
+		return dropServerReject, fmt.Errorf(
+			"bt: server answered %s; redirects are never followed, set the final URL as the endpoint",
+			resp.Status)
 	default:
 		return dropServerReject, fmt.Errorf("bt: server rejected report: %s", resp.Status)
 	}
@@ -150,7 +191,9 @@ func sanitizeHTTPError(err error, rawURL string) string {
 	if err == nil {
 		return ""
 	}
-	text := err.Error()
+	// The error may come from an application-supplied http.Client, so its
+	// Error method is called behind panic containment.
+	text := safeErrorString(err)
 	if rawURL != "" {
 		text = strings.ReplaceAll(text, rawURL, redactURL(rawURL))
 	}
@@ -198,11 +241,12 @@ func safeMultipartName(path string) string {
 }
 
 // buildMultipart assembles the multipart body documented for Backtrace
-// submissions: the report JSON in an "upload_file" part plus one
-// "attachment_<basename>" part per admitted attachment. Unreadable,
-// non-regular, oversized, or over-budget files — and files that fail while
-// being read — are skipped, never failing the report itself. Size caps are
-// enforced at read time (a file may grow between stat and copy).
+// submissions: the report JSON in an "upload_file" part, one
+// "attachment_<basename>" part per admitted file, then the SDK's own inline
+// parts while the budgets allow. Unreadable, non-regular, oversized, or
+// over-budget files — and files that fail while being read — are skipped,
+// never failing the report itself. Size caps are enforced at read time (a
+// file may grow between stat and copy).
 func buildMultipart(body []byte, attachments []string, inline []inlinePart, limits multipartLimits, d diag) (io.Reader, string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -215,36 +259,36 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 		return nil, "", err
 	}
 
-	used := map[string]bool{}
-	for _, p := range inline {
-		used[p.name] = true
-		part, err := w.CreateFormFile("attachment_"+p.name, p.name)
-		if err == nil {
-			_, err = part.Write(p.data)
-		}
-		if err != nil {
-			return nil, "", err
-		}
-	}
-
 	var (
 		count      int
 		totalBytes int64
 	)
+
+	// The names of the SDK's own parts (bt-breadcrumbs-0) are reserved
+	// first: a file that happens to share one is renamed, not the part the
+	// server looks up by name.
+	used := map[string]bool{}
+	for _, p := range inline {
+		used[p.name] = true
+	}
+
 	for _, path := range attachments {
+		// Diagnostics name the file, not its location: a path can carry
+		// a user or tenant name.
+		label := safeMultipartName(path)
 		if limits.maxAttachments < 0 {
-			d.logf("attachment %q skipped: attachments disabled (MaxAttachments < 0)", path)
+			d.logf("attachment %q skipped: attachments disabled (MaxAttachments < 0)", label)
 			continue
 		}
 		if count >= limits.maxAttachments {
 			d.logf("attachment %q skipped: attachment count limit (%d) reached",
-				path, limits.maxAttachments)
+				label, limits.maxAttachments)
 			continue
 		}
 		remaining := limits.maxTotalBytes - totalBytes
 		if remaining <= 0 {
 			d.logf("attachment %q skipped: aggregate attachment budget (%d bytes) exhausted",
-				path, limits.maxTotalBytes)
+				label, limits.maxTotalBytes)
 			continue
 		}
 		perFile := limits.maxAttachmentBytes
@@ -254,7 +298,12 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 
 		file, err := os.Open(path)
 		if err != nil {
-			d.logf("attachment %q skipped: %v", path, err)
+			// The *PathError text repeats the full path: log its cause.
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				err = pathErr.Err
+			}
+			d.logf("attachment %q skipped: %v", label, err)
 			continue
 		}
 		// Stat the opened handle (not the path) so a file swapped
@@ -262,19 +311,19 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 		info, err := file.Stat()
 		if err != nil || !info.Mode().IsRegular() {
 			file.Close()
-			d.logf("attachment %q skipped: not a readable regular file", path)
+			d.logf("attachment %q skipped: not a readable regular file", label)
 			continue
 		}
 		if info.Size() > perFile {
 			file.Close()
 			d.logf("attachment %q skipped: %d bytes exceeds the %d-byte budget",
-				path, info.Size(), perFile)
+				label, info.Size(), perFile)
 			continue
 		}
 
 		// Attachments from different directories may share a basename;
 		// uniquify so no part overwrites another.
-		name := safeMultipartName(path)
+		name := label
 		if used[name] {
 			ext := filepath.Ext(name)
 			stem := strings.TrimSuffix(name, ext)
@@ -301,18 +350,48 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 		if err != nil {
 			buf.Truncate(mark)
 			delete(used, name)
-			d.logf("attachment %q skipped: read failed: %v", path, err)
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				err = pathErr.Err
+			}
+			d.logf("attachment %q skipped: read failed: %v", label, err)
 			continue
 		}
 		if copied > perFile {
 			buf.Truncate(mark)
 			delete(used, name)
 			d.logf("attachment %q skipped: grew beyond the %d-byte budget while reading",
-				path, perFile)
+				label, perFile)
 			continue
 		}
 		count++
 		totalBytes += copied
+	}
+
+	// The SDK's own parts share the attachment budgets and come after the
+	// files the application asked for: when a budget is tight, the
+	// explicit attachment wins. A negative MaxAttachments disables them
+	// along with file attachments.
+	for _, p := range inline {
+		if limits.maxAttachments < 0 {
+			d.logf("inline attachment %q skipped: attachments disabled (MaxAttachments < 0)", p.name)
+			continue
+		}
+		size := int64(len(p.data))
+		if count >= limits.maxAttachments || totalBytes+size > limits.maxTotalBytes ||
+			size > limits.maxAttachmentBytes {
+			d.logf("inline attachment %q skipped: attachment budget exhausted", p.name)
+			continue
+		}
+		part, err := w.CreateFormFile("attachment_"+p.name, p.name)
+		if err == nil {
+			_, err = part.Write(p.data)
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		count++
+		totalBytes += size
 	}
 
 	if err := w.Close(); err != nil {
