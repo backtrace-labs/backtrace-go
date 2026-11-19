@@ -28,6 +28,12 @@ type Client struct {
 	// later global changes cannot reroute queued reports.
 	cfgFn func() Config
 
+	// stableConfig is true when cfgFn always returns the same normalised,
+	// SDK-owned configuration (clients created by NewClient). The legacy
+	// global client rebuilds its configuration from the mutable bt.Options
+	// on every call and must detach it per report.
+	stableConfig bool
+
 	// internalDiag is fixed at construction and used on recovery paths,
 	// where re-reading configuration could itself fail.
 	internalDiag diag
@@ -42,8 +48,11 @@ type Client struct {
 	queue     chan clientJob
 	enqueueMu sync.Mutex // guards closed, accepted, and queue admission
 	closed    bool
-	accepted  uint64
-	processed atomic.Uint64
+	// closedFast mirrors closed for the lock-free rejection at the top of
+	// capture; admission still re-checks closed under enqueueMu.
+	closedFast atomic.Bool
+	accepted   uint64
+	processed  atomic.Uint64
 
 	// progress is a broadcast channel: replaced (and the old one closed)
 	// each time the worker finishes a job or the client closes, waking
@@ -103,15 +112,16 @@ func NewClient(cfg Config) (*Client, error) {
 	if err := n.validate(); err != nil {
 		return nil, err
 	}
-	return startClient(func() Config { return n }), nil
+	return startClient(func() Config { return n }, true), nil
 }
 
 // startClient wires up a client around a config source and starts its worker.
-func startClient(cfgFn func() Config) *Client {
+func startClient(cfgFn func() Config, stable bool) *Client {
 	cfg := cfgFn()
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		cfgFn:           cfgFn,
+		stableConfig:    stable,
 		transport:       newHTTPTransport(cfg.HTTPClient, cfg.Timeout),
 		ctx:             ctx,
 		cancel:          cancel,
@@ -214,14 +224,19 @@ func panicCaptureInput(value interface{}, extra map[string]interface{}) captureI
 }
 
 // SetAttribute sets a client-wide attribute included in every subsequent
-// report. Safe for concurrent use.
+// report. Safe for concurrent use. The value is normalised into a detached
+// copy before the call returns (see ReportData for the value model), so the
+// caller may keep changing its own maps and slices afterwards.
 func (c *Client) SetAttribute(key string, value interface{}) {
 	if c == nil {
 		return
 	}
+	// Freeze on the caller's goroutine so a value the caller keeps
+	// mutating cannot later race the worker.
+	frozen := freezeValue(value, c.cfgFn().valueLimits())
 	c.amu.Lock()
 	defer c.amu.Unlock()
-	c.attributes[key] = value
+	c.attributes[key] = frozen
 }
 
 // SetAttributes sets multiple client-wide attributes atomically. The map is
@@ -230,9 +245,10 @@ func (c *Client) SetAttributes(attrs map[string]interface{}) {
 	if c == nil {
 		return
 	}
+	frozen := freezeAttributes(attrs, c.cfgFn().valueLimits())
 	c.amu.Lock()
 	defer c.amu.Unlock()
-	for k, v := range attrs {
+	for k, v := range frozen {
 		c.attributes[k] = v
 	}
 }
@@ -375,6 +391,7 @@ func (c *Client) beginClose() {
 	c.closeOnce.Do(func() {
 		c.enqueueMu.Lock()
 		c.closed = true
+		c.closedFast.Store(true)
 		close(c.queue)
 		c.enqueueMu.Unlock()
 		c.signalProgress()
@@ -404,13 +421,30 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 		}
 	}()
 
-	cfg := cloneConfig(c.cfgFn())
+	// Cheap rejections first: a closed client and sampled-out reports must
+	// not pay for normalising attributes, /proc, runtime, error-graph and
+	// stack capture only to be dropped. Neither check takes a lock.
+	if c.closedFast.Load() {
+		c.stats.drop(dropClosed)
+		c.internalDiag.logf("report dropped: client closed")
+		return 0, false
+	}
+
+	cfg := c.cfgFn()
 
 	if cfg.SampleRate < 1 && rand.Float64() >= cfg.SampleRate {
 		c.stats.drop(dropSampled)
 		c.internalDiag.logf("report sampled out (SampleRate=%v)", cfg.SampleRate)
 		return 0, false
 	}
+
+	if !c.stableConfig {
+		// Legacy path: cfg was just built from the mutable bt.Options, so
+		// its attributes may still alias caller memory. Detach them now.
+		cfg = cloneConfig(cfg)
+	}
+
+	limits := cfg.valueLimits()
 
 	attributes := map[string]interface{}{}
 	for k, v := range staticAttributes() {
@@ -419,11 +453,12 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 	updateAttrsWithProcMemInfo(attributes, c.internalDiag)
 	runtimeAttributes(attributes)
 
-	// Config-level attributes (cloned at capture; safe to iterate).
+	// Config-level attributes: normalised at NewClient (or just above for
+	// the legacy path), so the values are SDK-owned and immutable.
 	for k, v := range cfg.Attributes {
 		attributes[k] = v
 	}
-	// Client-wide attributes set via SetAttribute.
+	// Client-wide attributes set via SetAttribute (normalised at store time).
 	c.amu.Lock()
 	for k, v := range c.attributes {
 		attributes[k] = v
@@ -444,14 +479,21 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 		}
 	}
 
-	// Per-call attributes win over everything; the caller's map is copied,
-	// never retained or mutated.
-	for k, v := range in.extra {
+	// Per-call attributes win over everything. They are normalised here, on
+	// the caller's goroutine and under one shared budget, so the queued
+	// report can never share a live map or slice with the caller (which
+	// would race the worker's json.Marshal).
+	for k, v := range freezeAttributes(in.extra, limits) {
 		attributes[k] = v
 	}
 
-	if cfg.SendEnvVars {
-		annotations["Environment Variables"] = getEnvVars(cfg.ScrubEnvVars)
+	if len(cfg.EnvVars) > 0 || cfg.SendEnvVars {
+		annotations["Environment Variables"] = getEnvVars(envCaptureOptions{
+			allowlist:     cfg.EnvVars,
+			extraPatterns: cfg.ScrubEnvVars,
+			maxVars:       cfg.MaxEnvVars,
+			maxBytes:      cfg.MaxEnvBytes,
+		})
 	}
 	if crumbs := c.crumbs.snapshot(); len(crumbs) > 0 {
 		annotations["breadcrumbs"] = crumbs
@@ -535,6 +577,15 @@ func (c *Client) worker() {
 func (c *Client) processAndSend(qr *queuedReport) {
 	defer c.recoverInternal("processAndSend")
 
+	// Forced shutdown: the deadline expired and the root context was
+	// cancelled. Skip the remaining local work (metadata, source, hooks,
+	// serialization) instead of preparing a report the transport will
+	// immediately fail.
+	if c.ctx.Err() != nil {
+		c.stats.drop(dropShutdown)
+		return
+	}
+
 	cfg := qr.cfg
 	d := diag{logger: cfg.Logger, debug: cfg.Debug, busy: &c.logBusy}
 
@@ -577,8 +628,13 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		maxTotal:     cfg.MaxSourceBytes,
 	})
 
+	// eventID is the SDK-private identity of this report: diagnostics
+	// always use it, so a BeforeSend hook cannot make log lines refer to
+	// a UUID that was never submitted.
+	eventID := uuid4()
+
 	report := &ReportData{
-		UUID:        uuid4(),
+		UUID:        eventID,
 		Timestamp:   qr.timestamp,
 		Classifiers: qr.classifiers,
 		Attributes:  qr.attributes,
@@ -594,27 +650,41 @@ func (c *Client) processAndSend(qr *queuedReport) {
 	}
 
 	if cfg.BeforeSend != nil {
-		if modified := c.runBeforeSend(cfg.BeforeSend, report, d); modified == nil {
+		// Values that came from Config.Attributes or SetAttribute, and the
+		// dependency list, are shared between reports. Give the hook its
+		// own copy, so "mutating maps and slices in place is safe" holds
+		// for this report only. The copy also widens the SDK's own plain
+		// numbers, so the hook sees value-model types throughout.
+		report.Attributes = copyModelMap(report.Attributes)
+		if deps, ok := report.Annotations["Dependencies"].([]string); ok {
+			report.Annotations["Dependencies"] = append([]string(nil), deps...)
+		}
+
+		modified := c.runBeforeSend(cfg.BeforeSend, report, d)
+		if modified == nil {
 			// Counts both deliberate drops (hook returned nil) and
 			// panicking hooks (fail closed).
 			c.stats.drop(dropBeforeSend)
-			d.logf("report %s dropped by BeforeSend", report.UUID)
+			d.logf("report %s dropped by BeforeSend", eventID)
 			return
-		} else {
-			report = modified
+		}
+		report = modified
+		enforceReportInvariants(report, eventID, qr, threads, mainThread)
+		if cfg.MaxAttachments < 0 {
+			report.Attachments = nil
 		}
 	}
 
 	body, err := json.Marshal(report.toWire())
 	if err != nil {
 		c.stats.drop(dropSerialization)
-		d.logf("report %s dropped: serialization failed (%T)", report.UUID, err)
+		d.logf("report %s dropped: serialization failed (%T)", eventID, err)
 		return
 	}
 	if len(body) > cfg.MaxReportBytes {
 		c.stats.drop(dropOversize)
 		d.logf("report %s dropped: %d bytes exceeds the %d-byte report limit",
-			report.UUID, len(body), cfg.MaxReportBytes)
+			eventID, len(body), cfg.MaxReportBytes)
 		return
 	}
 
@@ -633,18 +703,88 @@ func (c *Client) processAndSend(qr *queuedReport) {
 	// logged (debug logging is often enabled during incidents, exactly
 	// when secrets are most likely to be present).
 	d.logf("sending report %s (type=%s, json_bytes=%d, attachments=%d, destination=%s)",
-		report.UUID, qr.reportType, len(body),
+		eventID, qr.reportType, len(body),
 		len(report.Attachments)+len(inline), redactURL(cfg.submissionURL()))
 
 	reason, err := c.transport.send(c.ctx, cfg.submissionURL(), body,
 		report.Attachments, inline, cfg.attachmentLimits(), d)
 	if err != nil {
 		c.stats.drop(reason)
-		d.logf("report %s dropped: %v", report.UUID, err)
+		d.logf("report %s dropped: %v", eventID, err)
 		return
 	}
 	c.stats.delivered.Add(1)
-	d.logf("report %s delivered", report.UUID)
+	d.logf("report %s delivered", eventID)
+}
+
+// enforceReportInvariants turns whatever a BeforeSend hook returned into a
+// valid submission WITHOUT undoing the hook's edits. The hook exists to
+// scrub, so removing source text, frames or whole threads must stick; only
+// the report identity is SDK-owned. What is enforced is what the wire format
+// requires: an id, a timestamp, at least one thread, a main thread that names
+// one of them, and no frame pointing at a source entry that is gone.
+func enforceReportInvariants(report *ReportData, eventID string, qr *queuedReport, threads map[string]Thread, mainThread string) {
+	report.UUID = eventID
+	if report.Timestamp <= 0 {
+		report.Timestamp = qr.timestamp
+	}
+	if len(report.Classifiers) == 0 {
+		report.Classifiers = qr.classifiers
+	}
+	if report.Attributes == nil {
+		report.Attributes = map[string]interface{}{}
+	}
+	if report.Annotations == nil {
+		report.Annotations = map[string]interface{}{}
+	}
+
+	if len(report.Threads) == 0 {
+		// A report without threads is rejected by the server.
+		report.Threads = threads
+		report.MainThread = mainThread
+	}
+	if _, ok := report.Threads[report.MainThread]; !ok {
+		report.MainThread = pickMainThread(report.Threads, mainThread)
+	}
+
+	for id, thread := range report.Threads {
+		var frames []StackFrame // copied only when a frame has to change
+		for i, frame := range thread.Stacks {
+			if frame.SourceCodeID == "" {
+				continue
+			}
+			if _, ok := report.SourceCode[frame.SourceCodeID]; ok {
+				continue
+			}
+			if frames == nil {
+				frames = append([]StackFrame(nil), thread.Stacks...)
+			}
+			frames[i].SourceCodeID = ""
+		}
+		if frames != nil {
+			thread.Stacks = frames
+			report.Threads[id] = thread
+		}
+	}
+}
+
+// pickMainThread chooses the main thread among the threads a hook left:
+// the original one when it survived, else the faulting one, else the
+// smallest key (so the choice is deterministic).
+func pickMainThread(threads map[string]Thread, original string) string {
+	if _, ok := threads[original]; ok {
+		return original
+	}
+	best := ""
+	for id, thread := range threads {
+		if thread.Fault {
+			return id
+		}
+		if best == "" || id < best {
+			best = id
+		}
+	}
+	return best
 }
 
 // runBeforeSend isolates user hook panics from the worker. A panicking hook

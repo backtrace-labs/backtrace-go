@@ -312,6 +312,70 @@ func TestSetAttributeIsConcurrencySafe(t *testing.T) {
 	}
 }
 
+// TestLegacySetAttributeNormalisesAtStore pins that the package-level
+// SetAttribute stores a detached copy. Stored raw, a nested map would be
+// walked at capture time without any lock while the application may still
+// be writing to it: a concurrent map access, which is fatal.
+func TestLegacySetAttributeNormalisesAtStore(t *testing.T) {
+	legacyServer.reset()
+
+	nested := map[string]interface{}{"state": "stored"}
+	SetAttribute("legacy.nested", nested)
+	t.Cleanup(func() {
+		legacyAttrMu.Lock()
+		delete(Options.Attributes, "legacy.nested")
+		legacyAttrMu.Unlock()
+	})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			nested["state"] = i
+			nested["extra"] = i
+		}
+	}()
+	for i := 0; i < 50; i++ {
+		Report(errors.New("legacy normalised"), nil)
+	}
+	close(stop)
+	wg.Wait()
+	Flush(10 * time.Second)
+
+	got, _ := attrsOf(t, legacyServer.last())["legacy.nested"].(map[string]interface{})
+	if len(got) != 1 || got["state"] != "stored" {
+		t.Errorf("stored value follows later changes to the caller's map: %v", got)
+	}
+}
+
+// TestLegacyEnvVarsOption pins that Options.EnvVars reaches capture through
+// the package-level API.
+func TestLegacyEnvVarsOption(t *testing.T) {
+	t.Setenv("BT_LEGACY_WANTED", "keep")
+	t.Setenv("BT_LEGACY_OTHER", "drop")
+	legacyServer.reset()
+
+	previous := Options.EnvVars
+	Options.EnvVars = []string{"BT_LEGACY_WANTED"}
+	t.Cleanup(func() { Options.EnvVars = previous })
+
+	Report(errors.New("legacy env"), nil)
+	Flush(10 * time.Second)
+
+	annotations, _ := legacyServer.last()["annotations"].(map[string]interface{})
+	env, _ := annotations["Environment Variables"].(map[string]interface{})
+	if len(env) != 1 || env["BT_LEGACY_WANTED"] != "keep" {
+		t.Errorf("Options.EnvVars capture = %v, want only BT_LEGACY_WANTED", env)
+	}
+}
+
 // resetDefaultClientForTest detaches the process-global default client so a
 // test can exercise the unconfigured path, restoring everything afterwards.
 func resetDefaultClientForTest(t *testing.T) {

@@ -53,9 +53,11 @@ func newBreadcrumbRing(capacity int) *breadcrumbRing {
 	return &breadcrumbRing{buf: make([]Breadcrumb, capacity)}
 }
 
-// cloneBreadcrumb detaches the attribute map from caller ownership.
+// cloneBreadcrumb detaches the attribute map from caller ownership,
+// freezing nested values so a breadcrumb attribute the caller keeps
+// mutating cannot later race the worker's serialization.
 func cloneBreadcrumb(b Breadcrumb) Breadcrumb {
-	b.Attributes = cloneAnyMap(b.Attributes)
+	b.Attributes = freezeAttributes(b.Attributes, valueLimits{})
 	return b
 }
 
@@ -98,9 +100,14 @@ func (r *breadcrumbRing) snapshot() []Breadcrumb {
 	if r.size == 0 {
 		return nil
 	}
+	// Entries were normalised on add. Each report still gets its own copy
+	// of the attribute maps, so a BeforeSend hook that edits one report's
+	// breadcrumbs cannot change the ring or any later report.
 	out := make([]Breadcrumb, r.size)
 	for i := 0; i < r.size; i++ {
-		out[i] = cloneBreadcrumb(r.buf[(r.head+i)%len(r.buf)])
+		crumb := r.buf[(r.head+i)%len(r.buf)]
+		crumb.Attributes = copyModelMap(crumb.Attributes)
+		out[i] = crumb
 	}
 	return out
 }

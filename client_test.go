@@ -927,6 +927,240 @@ func TestNegativeMaxAttachmentsDisables(t *testing.T) {
 	}
 }
 
+// TestNegativeMaxAttachmentsDisablesInlineToo pins that the inline
+// breadcrumb attachment respects the attachment budgets: disabling
+// attachments disables it as well.
+func TestNegativeMaxAttachmentsDisablesInlineToo(t *testing.T) {
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.MaxAttachments = -1
+	})
+	c.AddBreadcrumb(Breadcrumb{Message: "crumb"})
+	c.ReportMessage("no attachments at all", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if atts := rs.lastAttachments(); len(atts) != 0 {
+		t.Errorf("inline attachment sent despite MaxAttachments=-1: %v", atts)
+	}
+}
+
+// TestBeforeSendCannotBreakInvariants pins that a hook returning a bare
+// report still produces a valid submission: the identity is SDK-owned and
+// whatever the wire format requires is repaired.
+func TestBeforeSendCannotBreakInvariants(t *testing.T) {
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			return &ReportData{
+				UUID:       "not-a-real-uuid",
+				Attributes: map[string]interface{}{"hook": true},
+				MainThread: "no-such-thread",
+			}
+		}
+	})
+	c.ReportMessage("invariants", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	payload := rs.last()
+	if payload["uuid"] == "not-a-real-uuid" {
+		t.Error("BeforeSend overwrote the SDK event ID")
+	}
+	if ts, _ := payload["timestamp"].(float64); ts <= 0 {
+		t.Errorf("report left without a timestamp: %v", payload["timestamp"])
+	}
+	threads, _ := payload["threads"].(map[string]interface{})
+	if len(threads) == 0 {
+		t.Error("report left without threads")
+	}
+	if main, _ := payload["mainThread"].(string); threads[main] == nil {
+		t.Errorf("mainThread %q does not name a submitted thread", payload["mainThread"])
+	}
+	if classifiers, _ := payload["classifiers"].([]interface{}); len(classifiers) == 0 {
+		t.Error("report left without classifiers")
+	}
+	if attrs := attrsOf(t, payload); attrs["hook"] != true {
+		t.Error("BeforeSend attribute changes were lost")
+	}
+}
+
+// TestBeforeSendScrubbingSticks pins that removing data in the hook is
+// honoured. A hook exists to scrub: restoring what it removed would send
+// source text or frames the application decided not to send.
+func TestBeforeSendScrubbingSticks(t *testing.T) {
+	var threadsSeen atomic.Int32
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.CaptureAllGoroutines = true
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			threadsSeen.Store(int32(len(r.Threads)))
+			r.SourceCode = nil
+			// A new map, not an in-place delete: the SDK still holds the
+			// original and must not put it back.
+			r.Threads = map[string]Thread{r.MainThread: r.Threads[r.MainThread]}
+			r.Timestamp = 1234567890
+			return r
+		}
+	})
+	c.ReportError(errors.New("scrub me"), nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if threadsSeen.Load() < 2 {
+		t.Fatalf("test needs several goroutines, the hook saw %d", threadsSeen.Load())
+	}
+
+	payload := rs.last()
+	if source, _ := payload["sourceCode"].(map[string]interface{}); len(source) != 0 {
+		t.Errorf("source entries the hook removed were restored: %d", len(source))
+	}
+	threads, _ := payload["threads"].(map[string]interface{})
+	if len(threads) != 1 {
+		t.Errorf("threads the hook removed were restored: %d submitted", len(threads))
+	}
+	for id, raw := range threads {
+		thread, _ := raw.(map[string]interface{})
+		frames, _ := thread["stack"].([]interface{})
+		if len(frames) == 0 {
+			t.Errorf("thread %s lost its frames", id)
+		}
+		for _, f := range frames {
+			if frame, _ := f.(map[string]interface{}); frame["sourceCode"] != nil {
+				t.Errorf("frame still refers to removed source entry %v", frame["sourceCode"])
+			}
+		}
+	}
+	if payload["timestamp"] != float64(1234567890) {
+		t.Errorf("timestamp set by the hook was replaced: %v", payload["timestamp"])
+	}
+}
+
+// TestBeforeSendSeesNormalisedTypes pins the value model a hook observes,
+// and that a scrubber written against it works.
+func TestBeforeSendSeesNormalisedTypes(t *testing.T) {
+	type user struct {
+		ID int `json:"id"`
+	}
+	keys := []string{"int", "strings", "headers", "when", "user", "big", "ratio"}
+	var mu sync.Mutex
+	seen := map[string]string{}
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, k := range keys {
+				seen[k] = fmt.Sprintf("%T", r.Attributes[k])
+			}
+			// The contract covers the attributes the SDK adds as well
+			// (process.id, runtime.goroutines, memory counters, ...).
+			for k, v := range r.Attributes {
+				assertModel(t, k, v)
+			}
+			if h, ok := r.Attributes["headers"].(map[string]interface{}); ok {
+				delete(h, "Authorization")
+			}
+			return r
+		}
+	})
+	c.ReportMessage("types", map[string]interface{}{
+		"int":     7,
+		"strings": []string{"a"},
+		"headers": map[string]string{"Authorization": "Bearer x", "Accept": "*/*"},
+		"when":    time.Unix(0, 0).UTC(),
+		"user":    &user{ID: 1},
+		"big":     ^uint64(0),
+		"ratio":   float32(0.5),
+	})
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	want := map[string]string{
+		"int": "int64", "strings": "[]interface {}", "headers": "map[string]interface {}",
+		"when": "string", "user": "map[string]interface {}", "big": "uint64", "ratio": "float64",
+	}
+	mu.Lock()
+	for _, k := range keys {
+		if seen[k] != want[k] {
+			t.Errorf("hook saw %q as %s, want %s", k, seen[k], want[k])
+		}
+	}
+	mu.Unlock()
+
+	headers, _ := attrsOf(t, rs.last())["headers"].(map[string]interface{})
+	if _, leaked := headers["Authorization"]; leaked {
+		t.Error("the scrubber did not match: Authorization was sent")
+	}
+	if headers["Accept"] != "*/*" {
+		t.Errorf("unrelated header lost: %v", headers)
+	}
+}
+
+// TestBeforeSendEditsStayInOneReport pins that a hook edits its own copy:
+// values that came from Config.Attributes, SetAttribute or the breadcrumb
+// ring are shared between reports and must not carry one report's edits.
+func TestBeforeSendEditsStayInOneReport(t *testing.T) {
+	// The dependency list is one slice for the whole process. A test binary
+	// has none, so stand one in (after the real lookup has settled).
+	buildInfoAttributes()
+	realModules := buildInfoModules
+	buildInfoModules = []string{"example.com/dep@v1.0.0"}
+	t.Cleanup(func() { buildInfoModules = realModules })
+
+	var calls atomic.Int32
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.Attributes = map[string]interface{}{"cfg": map[string]interface{}{"k": "v"}}
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			if calls.Add(1) != 1 {
+				return r
+			}
+			r.Attributes["cfg"].(map[string]interface{})["first-only"] = true
+			r.Attributes["client"].(map[string]interface{})["first-only"] = true
+			if crumbs, ok := r.Annotations["breadcrumbs"].([]Breadcrumb); ok && len(crumbs) > 0 {
+				crumbs[0].Attributes["first-only"] = true
+			}
+			if deps, ok := r.Annotations["Dependencies"].([]string); ok && len(deps) > 0 {
+				deps[0] = "first-only"
+			}
+			return r
+		}
+	})
+	c.SetAttribute("client", map[string]interface{}{"k": "v"})
+	c.AddBreadcrumb(Breadcrumb{Message: "crumb", Attributes: map[string]interface{}{"k": "v"}})
+
+	for _, msg := range []string{"first", "second"} {
+		c.ReportMessage(msg, nil)
+		if !c.Flush(5 * time.Second) {
+			t.Fatal("Flush timed out")
+		}
+	}
+
+	second := rs.last()
+	attrs := attrsOf(t, second)
+	for _, key := range []string{"cfg", "client"} {
+		nested, _ := attrs[key].(map[string]interface{})
+		if nested["k"] != "v" {
+			t.Fatalf("attribute %q missing from the second report: %v", key, attrs[key])
+		}
+		if _, leaked := nested["first-only"]; leaked {
+			t.Errorf("an edit to %q in the first report leaked into the second", key)
+		}
+	}
+	annotations, _ := second["annotations"].(map[string]interface{})
+	crumbs, _ := annotations["breadcrumbs"].([]interface{})
+	if len(crumbs) == 0 {
+		t.Fatal("no breadcrumbs in the second report")
+	}
+	crumb, _ := crumbs[0].(map[string]interface{})
+	crumbAttrs, _ := crumb["attributes"].(map[string]interface{})
+	if _, leaked := crumbAttrs["first-only"]; leaked {
+		t.Error("an edit to a breadcrumb in the first report leaked into the second")
+	}
+	deps, _ := annotations["Dependencies"].([]interface{})
+	if len(deps) != 1 || deps[0] != "example.com/dep@v1.0.0" {
+		t.Errorf("an edit to the dependency list in the first report leaked into the second: %v", deps)
+	}
+}
+
 // TestSourceRootsSymlinkDenied pins the symlink-resolution fix: a link
 // under an allowed root pointing outside it must not smuggle content in.
 func TestSourceRootsSymlinkDenied(t *testing.T) {
@@ -967,5 +1201,308 @@ func TestUUID4Format(t *testing.T) {
 			t.Fatalf("duplicate uuid generated: %q", u)
 		}
 		seen[u] = true
+	}
+}
+
+// TestReportOwnershipAfterReturn pins the ownership contract: once a
+// reporting call returns, mutating the map the caller passed in cannot
+// change what is submitted (and cannot race the worker's json.Marshal).
+func TestReportOwnershipAfterReturn(t *testing.T) {
+	block := make(chan struct{})
+	c, rs := newTestClient(t, nil)
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+
+	rs.mu.Lock()
+	rs.block = block
+	rs.mu.Unlock()
+
+	// First report occupies the worker so the second waits in the queue.
+	c.ReportMessage("occupies the worker", nil)
+	select {
+	case <-rs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never reached the transport")
+	}
+
+	nested := map[string]interface{}{"state": "before"}
+	c.ReportMessage("ownership", map[string]interface{}{"nested": nested})
+
+	// Mutate after the call returned: the queued report must not see it.
+	nested["state"] = "after"
+	nested["added"] = "later"
+
+	unblock()
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	got, _ := attrsOf(t, rs.last())["nested"].(map[string]interface{})
+	if got == nil {
+		t.Fatal("nested attribute missing")
+	}
+	if got["state"] != "before" {
+		t.Errorf("post-return mutation leaked into the report: state = %v", got["state"])
+	}
+	if _, present := got["added"]; present {
+		t.Error("post-return insertion leaked into the report")
+	}
+}
+
+// TestWorkerNeverRacesCaller exercises the path that risked the runtime's
+// fatal concurrent-map failure: the worker serializing queued reports while
+// the caller keeps mutating the map it passed in earlier. Every mutation
+// happens after its Report call returned, which is the documented contract,
+// so this must be race-free and every report must arrive. Run under -race.
+func TestWorkerNeverRacesCaller(t *testing.T) {
+	const reports = 200
+	c, rs := newTestClient(t, func(cfg *Config) { cfg.QueueSize = 2 * reports })
+
+	shared := map[string]interface{}{"k": 0, "nested": map[string]interface{}{"n": 0}}
+	for i := 0; i < reports; i++ {
+		c.ReportMessage("sequential", map[string]interface{}{"shared": shared})
+		shared["k"] = i
+		shared["nested"].(map[string]interface{})["n"] = i
+	}
+	if !c.Flush(30 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := rs.count(); got != reports {
+		t.Errorf("delivered %d of %d reports", got, reports)
+	}
+}
+
+// TestSetAttributeFreezes pins that SetAttribute detaches its value too.
+func TestSetAttributeFreezes(t *testing.T) {
+	c, rs := newTestClient(t, nil)
+
+	live := map[string]interface{}{"v": "before"}
+	c.SetAttribute("held", live)
+	live["v"] = "after"
+
+	c.ReportMessage("attr", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	held, _ := attrsOf(t, rs.last())["held"].(map[string]interface{})
+	if held == nil || held["v"] != "before" {
+		t.Errorf("SetAttribute value not detached: %v", held)
+	}
+}
+
+// TestBreadcrumbAttributesFrozen pins the same for breadcrumbs.
+func TestBreadcrumbAttributesFrozen(t *testing.T) {
+	c, rs := newTestClient(t, nil)
+
+	attrs := map[string]interface{}{"v": "before"}
+	c.AddBreadcrumb(Breadcrumb{Message: "crumb", Attributes: attrs})
+	attrs["v"] = "after"
+
+	c.ReportMessage("with crumb", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	annotations, _ := rs.last()["annotations"].(map[string]interface{})
+	crumbs, _ := annotations["breadcrumbs"].([]interface{})
+	if len(crumbs) == 0 {
+		t.Fatal("no breadcrumbs in payload")
+	}
+	first, _ := crumbs[0].(map[string]interface{})
+	crumbAttrs, _ := first["attributes"].(map[string]interface{})
+	if crumbAttrs["v"] != "before" {
+		t.Errorf("breadcrumb attribute not detached: %v", crumbAttrs["v"])
+	}
+}
+
+// TestNegativeMaxErrorDepthDisablesChain pins the documented meaning of a
+// negative MaxErrorDepth: accepted, and no error chain is captured.
+func TestNegativeMaxErrorDepthDisablesChain(t *testing.T) {
+	c, rs := newTestClient(t, func(cfg *Config) { cfg.MaxErrorDepth = -1 })
+
+	c.ReportError(fmt.Errorf("outer: %w", errors.New("inner")), nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	payload := rs.last()
+	if payload == nil {
+		t.Fatal("no report delivered")
+	}
+	annotations, _ := payload["annotations"].(map[string]interface{})
+	if _, present := annotations["Error Chain"]; present {
+		t.Error("error chain captured although MaxErrorDepth is negative")
+	}
+}
+
+// TestForcedShutdownSkipsQueuedWork pins the short-circuit after a close
+// deadline: the request in flight is aborted and the reports still queued
+// are counted as Shutdown instead of being prepared and failed one by one.
+func TestForcedShutdownSkipsQueuedWork(t *testing.T) {
+	block := make(chan struct{})
+	c, rs := newTestClient(t, nil)
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+
+	rs.mu.Lock()
+	rs.block = block
+	rs.mu.Unlock()
+
+	const queued = 5
+	for i := 0; i < queued; i++ {
+		c.ReportMessage(fmt.Sprintf("queued %d", i), nil)
+	}
+	select {
+	case <-rs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never reached the transport")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if c.CloseContext(ctx) {
+		t.Fatal("CloseContext reported a clean drain while the endpoint was blocked")
+	}
+	unblock()
+	select {
+	case <-c.workerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not exit after the forced shutdown")
+	}
+
+	stats := c.Stats()
+	if stats.Shutdown != queued-1 {
+		t.Errorf("Shutdown = %d, want %d (every report still queued at the deadline)", stats.Shutdown, queued-1)
+	}
+	if stats.Delivered != 0 {
+		t.Errorf("Delivered = %d after a forced shutdown", stats.Delivered)
+	}
+	if stats.Accepted != queued || c.DroppedReports() != queued {
+		t.Errorf("accounting does not add up: accepted %d, dropped %d", stats.Accepted, c.DroppedReports())
+	}
+}
+
+// TestClosedClientRejectsBeforeCapture pins the fast path: a report on a
+// closed client is counted and costs nothing (no attribute map, no stack).
+func TestClosedClientRejectsBeforeCapture(t *testing.T) {
+	c, rs := newTestClient(t, nil)
+	c.Close()
+	delivered := rs.count()
+
+	c.ReportMessage("after close", nil)
+	if got := c.Stats().Closed; got != 1 {
+		t.Errorf("Closed = %d, want 1", got)
+	}
+	if rs.count() != delivered {
+		t.Error("a report was delivered through a closed client")
+	}
+	if allocs := testing.AllocsPerRun(100, func() { c.ReportMessage("after close", nil) }); allocs > 2 {
+		t.Errorf("a report on a closed client costs %.0f allocations; capture ran before the check", allocs)
+	}
+}
+
+// envAnnotation returns the "Environment Variables" annotation of the last
+// report, or nil when the report has none.
+func envAnnotation(t *testing.T, rs *recordingServer) map[string]interface{} {
+	t.Helper()
+	annotations, _ := rs.last()["annotations"].(map[string]interface{})
+	env, _ := annotations["Environment Variables"].(map[string]interface{})
+	return env
+}
+
+// TestEnvVarsOptionsReachCapture pins that the environment options of a
+// Config are the ones capture applies: nothing by default, the allow-list
+// names exactly what is sent, and the limits bound a whole-environment
+// capture.
+func TestEnvVarsOptionsReachCapture(t *testing.T) {
+	t.Setenv("BT_WIRE_WANTED", "keep")
+	t.Setenv("BT_WIRE_OTHER", "drop")
+
+	report := func(mutate func(*Config)) map[string]interface{} {
+		c, rs := newTestClient(t, mutate)
+		c.ReportMessage("env", nil)
+		if !c.Flush(5 * time.Second) {
+			t.Fatal("Flush timed out")
+		}
+		return envAnnotation(t, rs)
+	}
+
+	if env := report(nil); env != nil {
+		t.Errorf("environment sent without being asked for: %d variables", len(env))
+	}
+
+	env := report(func(cfg *Config) { cfg.EnvVars = []string{"BT_WIRE_WANTED", "BT_WIRE_UNSET"} })
+	if len(env) != 1 || env["BT_WIRE_WANTED"] != "keep" {
+		t.Errorf("allow-list capture = %v, want only BT_WIRE_WANTED", env)
+	}
+
+	env = report(func(cfg *Config) {
+		cfg.SendEnvVars = true
+		cfg.MaxEnvVars = 2
+	})
+	if len(env) != 2 {
+		t.Errorf("MaxEnvVars = 2 captured %d variables", len(env))
+	}
+
+	env = report(func(cfg *Config) {
+		cfg.SendEnvVars = true
+		cfg.MaxEnvBytes = 64
+	})
+	total := 0
+	for name, value := range env {
+		text, _ := value.(string)
+		total += len(name) + len(text)
+	}
+	if len(env) == 0 || total > 64 {
+		t.Errorf("MaxEnvBytes = 64 captured %d variables in %d bytes", len(env), total)
+	}
+}
+
+// lineLogger records diagnostic lines.
+type lineLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *lineLogger) Printf(format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+}
+
+func (l *lineLogger) all() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
+// TestDiagnosticsNameTheReportNotItsContent pins the two halves of the
+// debug-log contract: a line can be matched to a report by its id, and
+// neither the report's content nor the location of its files is written.
+func TestDiagnosticsNameTheReportNotItsContent(t *testing.T) {
+	logger := &lineLogger{}
+	missing := filepath.Join(t.TempDir(), "tenant-4711", "missing.log")
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.Debug = true
+		cfg.Logger = logger
+		cfg.AttachmentPaths = []string{missing}
+	})
+	c.ReportMessage("s3cr3t message text", map[string]interface{}{"card": "4111-1111-1111-1111"})
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	id, _ := rs.last()["uuid"].(string)
+	logged := logger.all()
+	if id == "" || !strings.Contains(logged, id) {
+		t.Errorf("no diagnostic line names report %q:\n%s", id, logged)
+	}
+	if !strings.Contains(logged, "missing.log") {
+		t.Errorf("the skipped attachment is not named:\n%s", logged)
+	}
+	for _, private := range []string{"s3cr3t message text", "4111-1111-1111-1111", "tenant-4711", "client-test-token"} {
+		if strings.Contains(logged, private) {
+			t.Errorf("diagnostics contain %q:\n%s", private, logged)
+		}
 	}
 }

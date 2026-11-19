@@ -16,6 +16,7 @@ const (
 	dropNetwork
 	dropServerReject
 	dropInternal
+	dropShutdown
 	dropReasonCount
 )
 
@@ -55,6 +56,9 @@ type ClientStats struct {
 	Network       uint64
 	ServerReject  uint64
 	Internal      uint64
+	// Shutdown counts reports discarded because Close's deadline expired
+	// before they could be processed.
+	Shutdown uint64
 }
 
 func (s *internalStats) snapshot() ClientStats {
@@ -71,5 +75,6 @@ func (s *internalStats) snapshot() ClientStats {
 		Network:       s.drops[dropNetwork].Load(),
 		ServerReject:  s.drops[dropServerReject].Load(),
 		Internal:      s.drops[dropInternal].Load(),
+		Shutdown:      s.drops[dropShutdown].Load(),
 	}
 }

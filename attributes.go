@@ -162,37 +162,76 @@ var urlUserinfoPattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^/@\s]+:
 
 const redactedValue = "[REDACTED]"
 
-// getEnvVars returns the process environment with secret-looking values
-// redacted: variable names matching the scrub patterns, plus any value that
-// embeds URL credentials. extraPatterns extends the built-in pattern list.
-func getEnvVars(extraPatterns []string) map[string]string {
-	patterns := make([]string, 0, len(defaultEnvScrubPatterns)+len(extraPatterns))
-	patterns = append(patterns, defaultEnvScrubPatterns...)
-	patterns = append(patterns, extraPatterns...)
+// envCaptureOptions controls environment capture.
+type envCaptureOptions struct {
+	// allowlist, when non-empty, restricts capture to these exact names.
+	allowlist []string
+	// extraPatterns extends the built-in redaction patterns.
+	extraPatterns []string
+	maxVars       int
+	maxBytes      int
+}
 
-	result := map[string]string{}
-	for _, line := range os.Environ() {
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
+// getEnvVars returns the process environment (or an allowlisted subset) with
+// secret-looking values redacted: variable names matching the scrub
+// patterns, plus any value that embeds URL credentials. Capture is bounded
+// by maxVars and maxBytes.
+func getEnvVars(opts envCaptureOptions) map[string]string {
+	patterns := make([]string, 0, len(defaultEnvScrubPatterns)+len(opts.extraPatterns))
+	patterns = append(patterns, defaultEnvScrubPatterns...)
+	patterns = append(patterns, opts.extraPatterns...)
+
+	redact := func(key, value string) string {
 		upper := strings.ToUpper(key)
 		for _, p := range patterns {
 			if p != "" && strings.Contains(upper, strings.ToUpper(p)) {
-				value = redactedValue
-				break
+				return redactedValue
 			}
 		}
-		if value != redactedValue && urlUserinfoPattern.MatchString(value) {
-			value = redactedValue
+		if urlUserinfoPattern.MatchString(value) {
+			return redactedValue
 		}
 		// Submission-URL shapes (the SDK's own BACKTRACE_ENDPOINT, or any
 		// variable holding a tokenized submit URL) get their token
 		// redacted while keeping the rest of the URL readable.
-		if value != redactedValue {
-			value = redactSubmissionValue(value)
+		return redactSubmissionValue(value)
+	}
+
+	result := map[string]string{}
+	total := 0
+	// add stores one variable unless it would exceed the byte budget. An
+	// oversized variable is skipped on its own: it must not end the capture
+	// of the variables after it.
+	add := func(key, value string) {
+		value = redact(key, value)
+		size := len(key) + len(value)
+		if opts.maxBytes > 0 && total+size > opts.maxBytes {
+			return
 		}
+		total += size
 		result[key] = value
+	}
+
+	if len(opts.allowlist) > 0 {
+		// Exact-name capture: read only the listed variables. The count cap
+		// does not apply, because the caller chose every name.
+		for _, name := range opts.allowlist {
+			if v, ok := os.LookupEnv(name); ok {
+				add(name, v)
+			}
+		}
+		return result
+	}
+
+	for _, line := range os.Environ() {
+		if opts.maxVars > 0 && len(result) >= opts.maxVars {
+			break
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		add(key, value)
 	}
 	return result
 }

@@ -173,6 +173,66 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+// TestConfigCeilings pins the upper bounds on explicit resource limits: an
+// extreme value must be rejected, not allocated (make([]Breadcrumb, huge)
+// would crash NewClient before a single report is sent).
+func TestConfigCeilings(t *testing.T) {
+	base := func() Config {
+		return Config{Endpoint: "https://submit.backtrace.io/u/t/json"}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		// ceiling+1 rather than a huge literal: the int fields are 32 bits
+		// wide on linux/arm, where 1<<40 does not even compile.
+		{"breadcrumbs", func(c *Config) { c.MaxBreadcrumbs = maxBreadcrumbsCeiling + 1 }},
+		{"error nodes", func(c *Config) { c.MaxErrorNodes = maxErrorNodesCeiling + 1 }},
+		{"error depth", func(c *Config) { c.MaxErrorDepth = maxErrorDepthCeiling + 1 }},
+		{"attachments", func(c *Config) { c.MaxAttachments = maxAttachmentsCeiling + 1 }},
+		{"stack bytes", func(c *Config) { c.MaxStackBytes = maxStackBytesCeiling + 1 }},
+		{"report bytes", func(c *Config) { c.MaxReportBytes = maxReportBytesCeiling + 1 }},
+		{"source bytes", func(c *Config) { c.MaxSourceBytes = maxSourceBytesCeiling + 1 }},
+		{"queue size", func(c *Config) { c.QueueSize = maxQueueSize + 1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mutate(&cfg)
+			if _, err := NewClient(cfg); err == nil {
+				t.Error("extreme resource limit accepted")
+			}
+		})
+	}
+}
+
+// TestEndpointFormValidation pins the structural checks on the documented
+// hosted forms.
+func TestEndpointFormValidation(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envToken, "")
+
+	// {universe}.sp.backtrace.io without a token would POST to the root.
+	if _, err := NewClient(Config{Endpoint: "https://example.sp.backtrace.io"}); err == nil {
+		t.Error("sp.backtrace.io endpoint without Token accepted")
+	}
+	// With a token it is the documented legacy form.
+	if _, err := NewClient(Config{Endpoint: "https://example.sp.backtrace.io", Token: "t"}); err != nil {
+		t.Errorf("valid legacy form rejected: %v", err)
+	}
+	// submit.backtrace.io requires the {universe}/{token}/{format} path.
+	if _, err := NewClient(Config{Endpoint: "https://submit.backtrace.io/universe"}); err == nil {
+		t.Error("malformed submit.backtrace.io path accepted")
+	}
+	if _, err := NewClient(Config{Endpoint: "https://submit.backtrace.io/u/t/json"}); err != nil {
+		t.Errorf("valid submit form rejected: %v", err)
+	}
+	// Self-hosted gateways stay unconstrained.
+	if _, err := NewClient(Config{Endpoint: "https://errors.internal.example.com/ingest"}); err != nil {
+		t.Errorf("custom endpoint rejected: %v", err)
+	}
+}
+
 // TestValidateNeverLeaksToken pins the credential-redaction contract: even
 // unparsable endpoints (where url.Error — or its inner error — would quote
 // raw URL fragments) must not leak an embedded token through NewClient

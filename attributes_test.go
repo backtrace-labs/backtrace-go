@@ -12,7 +12,7 @@ func TestGetEnvVarsSplitAndScrub(t *testing.T) {
 	t.Setenv("BT_ATTR_TEST_API_KEY", "sensitive")
 	t.Setenv("BT_ATTR_TEST_CUSTOM", "sensitive")
 
-	env := getEnvVars([]string{"BT_ATTR_TEST_CUSTOM"})
+	env := getEnvVars(envCaptureOptions{extraPatterns: []string{"BT_ATTR_TEST_CUSTOM"}})
 
 	if env["BT_ATTR_TEST_PLAIN"] != "a=b=c" {
 		t.Errorf("value truncated at '=': %q", env["BT_ATTR_TEST_PLAIN"])
@@ -45,7 +45,7 @@ func TestGetEnvVarsScrubsCommonSecretShapes(t *testing.T) {
 	// Plain URLs without credentials survive.
 	t.Setenv("BT_SHAPE_HOMEPAGE", "https://example.com/path")
 
-	env := getEnvVars(nil)
+	env := getEnvVars(envCaptureOptions{})
 	for _, name := range redactedNames {
 		if env[name] != redactedValue {
 			t.Errorf("%s not redacted: %q", name, env[name])
@@ -66,7 +66,7 @@ func TestGetEnvVarsRedactsSubmissionURLs(t *testing.T) {
 	t.Setenv("BACKTRACE_ENDPOINT", "https://submit.backtrace.io/universe/SECRETSUBMITTOKEN/json")
 	t.Setenv("BT_SHAPE_LEGACY_ENDPOINT_URL", "https://uni.sp.backtrace.io/post?format=json&token=SECRETQUERYTOKEN")
 
-	env := getEnvVars(nil)
+	env := getEnvVars(envCaptureOptions{})
 	if strings.Contains(env["BACKTRACE_ENDPOINT"], "SECRETSUBMITTOKEN") {
 		t.Errorf("submit-path token leaked: %q", env["BACKTRACE_ENDPOINT"])
 	}
@@ -75,6 +75,51 @@ func TestGetEnvVarsRedactsSubmissionURLs(t *testing.T) {
 	}
 	if strings.Contains(env["BT_SHAPE_LEGACY_ENDPOINT_URL"], "SECRETQUERYTOKEN") {
 		t.Errorf("query token leaked: %q", env["BT_SHAPE_LEGACY_ENDPOINT_URL"])
+	}
+}
+
+// TestGetEnvVarsAllowlist pins exact-name capture: only listed variables are
+// read, everything else is omitted.
+func TestGetEnvVarsAllowlist(t *testing.T) {
+	t.Setenv("BT_ALLOW_WANTED", "keep")
+	t.Setenv("BT_ALLOW_UNWANTED", "drop")
+
+	env := getEnvVars(envCaptureOptions{allowlist: []string{"BT_ALLOW_WANTED", "BT_ALLOW_MISSING"}})
+	if env["BT_ALLOW_WANTED"] != "keep" {
+		t.Errorf("allowlisted var missing: %q", env["BT_ALLOW_WANTED"])
+	}
+	if _, present := env["BT_ALLOW_UNWANTED"]; present {
+		t.Error("non-allowlisted var captured")
+	}
+	if _, present := env["BT_ALLOW_MISSING"]; present {
+		t.Error("unset allowlisted var should be absent, not empty")
+	}
+}
+
+// TestGetEnvVarsBudgets pins the two limits of whole-environment capture
+// and that the exact allow-list is exempt from the count cap, as documented.
+func TestGetEnvVarsBudgets(t *testing.T) {
+	t.Setenv("BT_BUDGET_SMALL_A", "a")
+	t.Setenv("BT_BUDGET_HUGE", strings.Repeat("x", 4096))
+	t.Setenv("BT_BUDGET_SMALL_B", "b")
+
+	if env := getEnvVars(envCaptureOptions{maxVars: 3}); len(env) != 3 {
+		t.Errorf("maxVars=3 captured %d variables", len(env))
+	}
+
+	// The count cap applies to whole-environment capture only.
+	allow := []string{"BT_BUDGET_SMALL_A", "BT_BUDGET_HUGE", "BT_BUDGET_SMALL_B"}
+	if env := getEnvVars(envCaptureOptions{allowlist: allow, maxVars: 1}); len(env) != 3 {
+		t.Errorf("allow-list was cut by maxVars: %d of 3 captured", len(env))
+	}
+
+	// One oversized variable is skipped; the ones after it still arrive.
+	env := getEnvVars(envCaptureOptions{allowlist: allow, maxBytes: 256})
+	if _, present := env["BT_BUDGET_HUGE"]; present {
+		t.Error("variable larger than the byte budget was captured")
+	}
+	if env["BT_BUDGET_SMALL_A"] != "a" || env["BT_BUDGET_SMALL_B"] != "b" {
+		t.Errorf("an oversized variable ended capture of the others: %v", env)
 	}
 }
 

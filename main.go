@@ -78,6 +78,8 @@ type OptionsStruct struct {
 	BeforeSend func(report *ReportData) *ReportData
 	// ScrubEnvVars extends the built-in redaction patterns; see Config.ScrubEnvVars.
 	ScrubEnvVars []string
+	// EnvVars is an exact allowlist of env var names to capture; see Config.EnvVars.
+	EnvVars []string
 	// SendMachineID includes a stable machine identifier; see
 	// Config.SendMachineID. Default false.
 	SendMachineID bool
@@ -141,6 +143,7 @@ func optionsToConfig() Config {
 		SampleRate:               Options.SampleRate,
 		BeforeSend:               Options.BeforeSend,
 		ScrubEnvVars:             cloneStringSlice(Options.ScrubEnvVars),
+		EnvVars:                  cloneStringSlice(Options.EnvVars),
 		SendMachineID:            Options.SendMachineID,
 		Logger:                   Options.Logger,
 		HTTPClient:               Options.HTTPClient,
@@ -193,7 +196,7 @@ func defaultClient() *Client {
 	// patterns (mutating bt.Options at runtime) keep working; queue size,
 	// timeout, and HTTP client are fixed at creation, and each report
 	// snapshots the delivery configuration at capture time.
-	c := startClient(optionsToConfig)
+	c := startClient(optionsToConfig, false)
 	defaultClientV = c
 	defaultClientMu.Unlock()
 	return c
@@ -284,25 +287,40 @@ func ReportPanicValueAndFlush(value interface{}, extraAttributes map[string]inte
 
 // SetAttribute sets a global attribute included in every subsequent report.
 // Safe for concurrent use; prefer this over mutating Options.Attributes.
+//
+// The value is normalised and copied before it is stored, so changing a map
+// or slice after the call returns does not change later reports.
 func SetAttribute(key string, value interface{}) {
+	// Normalise before taking the lock: it may run the value's own
+	// MarshalJSON / MarshalText / Error methods, which are application code.
+	frozen := freezeValue(value, legacyValueLimits())
 	legacyAttrMu.Lock()
 	if Options.Attributes == nil {
 		Options.Attributes = map[string]interface{}{}
 	}
-	Options.Attributes[key] = value
+	Options.Attributes[key] = frozen
 	legacyAttrMu.Unlock()
 }
 
 // SetAttributes sets multiple global attributes atomically.
+// Values are normalised and copied before they are stored.
 func SetAttributes(attrs map[string]interface{}) {
+	frozen := freezeAttributes(attrs, legacyValueLimits())
 	legacyAttrMu.Lock()
 	if Options.Attributes == nil {
 		Options.Attributes = map[string]interface{}{}
 	}
-	for k, v := range attrs {
+	for k, v := range frozen {
 		Options.Attributes[k] = v
 	}
 	legacyAttrMu.Unlock()
+}
+
+// legacyValueLimits is the normalisation budget for values stored through
+// the package-level SetAttribute(s). It deliberately does not read
+// bt.Options: those fields are not synchronised.
+func legacyValueLimits() valueLimits {
+	return valueLimits{maxTotalBytes: DefaultMaxReportBytes}
 }
 
 // AddBreadcrumb records a breadcrumb on the legacy global reporter.

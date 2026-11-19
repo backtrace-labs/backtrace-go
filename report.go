@@ -15,7 +15,39 @@ import (
 // Config.BeforeSend hook for scrubbing, enrichment, or dropping.
 //
 // Mutating maps and slices in place is safe: the hook runs on the SDK worker
-// goroutine and the report is serialized immediately afterwards.
+// goroutine, on this report's own copy, and the report is serialized
+// immediately afterwards.
+//
+// # Value model
+//
+// Attribute values, and the attributes of breadcrumbs, are normalised when
+// the application hands them to the SDK. A hook therefore sees only these
+// types in Attributes, for the attributes the SDK adds as well as for the
+// application's own:
+//
+//	nil, bool, string, int64, uint64, float64,
+//	[]interface{}, map[string]interface{}
+//
+// An int arrives as int64, a []string as []interface{}, a
+// map[string]string as map[string]interface{}, a time.Time as an RFC 3339
+// string and a struct as a map of its exported fields. Type assertions in a
+// hook must use these types:
+//
+//	if h, ok := r.Attributes["headers"].(map[string]interface{}); ok {
+//		delete(h, "Authorization")
+//	}
+//
+// Annotations are assembled by the SDK and keep its types: "breadcrumbs" is
+// a []Breadcrumb, "Environment Variables" a map[string]string and
+// "Dependencies" a []string.
+//
+// # What a hook may change
+//
+// Everything except UUID, which identifies the report in SDK diagnostics and
+// is always restored. Removing data sticks: SourceCode may be set to nil,
+// Threads may be trimmed. The SDK only repairs what the wire format requires
+// (a positive Timestamp, at least one thread, a MainThread that exists, no
+// frame referring to a removed SourceCode entry).
 type ReportData struct {
 	// UUID uniquely identifies the report (RFC 4122 version 4).
 	UUID string

@@ -81,8 +81,24 @@ const (
 	// DefaultMaxAttachments caps the number of attachments per report.
 	DefaultMaxAttachments = 16
 
-	// maxQueueSize is a sanity ceiling for explicit queue sizes.
-	maxQueueSize = 1 << 20
+	// DefaultMaxEnvVars caps environment variables captured under SendEnvVars.
+	DefaultMaxEnvVars = 1024
+
+	// DefaultMaxEnvBytes caps the total bytes of captured environment values.
+	DefaultMaxEnvBytes = 256 << 10
+
+	// Upper ceilings on explicitly-set resource limits. These exist so an
+	// extreme configuration value cannot exhaust memory or crash NewClient
+	// (e.g. make([]Breadcrumb, huge)) before a single report is sent. They
+	// are generous relative to realistic backend ingestion limits.
+	maxQueueSize          = 1 << 20
+	maxBreadcrumbsCeiling = 100_000
+	maxErrorNodesCeiling  = 100_000
+	maxErrorDepthCeiling  = 4096
+	maxAttachmentsCeiling = 4096
+	maxStackBytesCeiling  = 256 << 20
+	maxReportBytesCeiling = 256 << 20
+	maxSourceBytesCeiling = 256 << 20
 )
 
 // Byte budgets for source and attachment capture.
@@ -149,21 +165,40 @@ type Config struct {
 	// TabWidth is reported to the Backtrace UI for source rendering. Default: 8.
 	TabWidth int
 
-	// Attributes are added to every report sent by the client.
+	// Attributes are added to every report sent by the client. Like every
+	// value handed to the SDK they are normalised into a detached copy
+	// (see ReportData for the value model), so the map may be reused
+	// after NewClient returns.
 	Attributes map[string]interface{}
 
-	// SendEnvVars attaches the process environment to every report as an
-	// annotation. Values are redacted when the variable name contains
-	// any of: TOKEN, SECRET, PASS, KEY, CREDENTIAL, AUTH, DSN, COOKIE,
-	// SESSION, SIGNATURE, BEARER, CONN (case-insensitive), or when the
-	// value embeds URL credentials (scheme://user:pass@...). Extend the
-	// list with ScrubEnvVars; use BeforeSend for anything beyond
-	// name/shape matching.
+	// EnvVars is an exact allowlist of environment variable names to
+	// attach to every report (as the "Environment Variables" annotation).
+	// This is the recommended, predictable way to capture environment:
+	// only the listed names are read. Name/shape scrubbing (see
+	// SendEnvVars) still applies as defense in depth.
+	EnvVars []string
+
+	// SendEnvVars attaches the ENTIRE process environment to every report.
+	// Best-effort only: values are redacted when the variable name
+	// contains any of TOKEN, SECRET, PASS, KEY, CREDENTIAL, AUTH, DSN,
+	// COOKIE, SESSION, SIGNATURE, BEARER, CONN (case-insensitive) or when
+	// the value embeds URL credentials — but this cannot catch every
+	// secret (generically named vars, JWTs, ?password= query params).
+	// Prefer EnvVars, or scrub with BeforeSend. Ignored when EnvVars is
+	// set.
 	SendEnvVars bool
 
 	// ScrubEnvVars adds case-insensitive substrings to the built-in list
 	// of environment variable name patterns whose values are redacted.
 	ScrubEnvVars []string
+
+	// MaxEnvVars caps how many environment variables are captured under
+	// SendEnvVars. Default: 1024. Ignored for the EnvVars allowlist.
+	MaxEnvVars int
+
+	// MaxEnvBytes caps the total bytes of captured environment values.
+	// Default: 256 KiB.
+	MaxEnvBytes int
 
 	// SendMachineID includes a stable machine identifier (the "guid"
 	// attribute) with every report. Default false: stable hardware
@@ -188,6 +223,10 @@ type Config struct {
 	// it. Runs on the SDK's worker goroutine — do not call Flush or Close
 	// from inside the hook. A panic inside the hook is recovered and the
 	// report is DROPPED (never sent half-scrubbed) and counted in Stats.
+	//
+	// The hook edits its own copy of the report, attribute values have
+	// the types listed under ReportData ("Value model"), and what it
+	// removes stays removed; see ReportData for the full contract.
 	BeforeSend func(report *ReportData) *ReportData
 
 	// MaxErrorDepth caps error-graph unwrapping depth. Default: 32.
@@ -249,12 +288,20 @@ type Config struct {
 }
 
 // cloneConfig detaches all top-level collections from caller ownership.
+// Config.Attributes is deep-frozen (not just shallow-cloned) so nested
+// caller-owned maps/slices cannot later race the worker's serialization.
 func cloneConfig(c Config) Config {
-	c.Attributes = cloneAnyMap(c.Attributes)
+	c.Attributes = freezeAttributes(c.Attributes, c.valueLimits())
 	c.ScrubEnvVars = cloneStringSlice(c.ScrubEnvVars)
 	c.AttachmentPaths = cloneStringSlice(c.AttachmentPaths)
 	c.SourceRoots = cloneStringSlice(c.SourceRoots)
+	c.EnvVars = cloneStringSlice(c.EnvVars)
 	return c
+}
+
+// valueLimits derives the freezing budget from the report byte cap.
+func (c Config) valueLimits() valueLimits {
+	return valueLimits{maxTotalBytes: c.MaxReportBytes}
 }
 
 // normalize applies defaults to zero values only. It does not mutate c.
@@ -318,6 +365,12 @@ func (c Config) normalize() Config {
 	if c.MaxTotalAttachmentBytes == 0 {
 		c.MaxTotalAttachmentBytes = DefaultMaxTotalAttachmentBytes
 	}
+	if c.MaxEnvVars == 0 {
+		c.MaxEnvVars = DefaultMaxEnvVars
+	}
+	if c.MaxEnvBytes == 0 {
+		c.MaxEnvBytes = DefaultMaxEnvBytes
+	}
 	return c
 }
 
@@ -340,10 +393,31 @@ func (c Config) validate() error {
 	if c.ContextLineCount < 0 || c.TabWidth < 1 {
 		return errors.New("bt: Config.ContextLineCount must be >= 0 and Config.TabWidth >= 1")
 	}
+	// MaxErrorDepth is deliberately absent: a negative value is the
+	// documented way to disable error-chain capture.
 	if c.MaxErrorNodes < 1 || c.MaxStackBytes < 1 || c.MaxReportBytes < 1 ||
 		c.MaxSourceFileBytes < 1 || c.MaxSourceBytes < 1 ||
-		c.MaxAttachmentBytes < 1 || c.MaxTotalAttachmentBytes < 1 {
+		c.MaxAttachmentBytes < 1 || c.MaxTotalAttachmentBytes < 1 ||
+		c.MaxEnvVars < 1 || c.MaxEnvBytes < 1 {
 		return errors.New("bt: one or more resource limits are invalid (must be positive)")
+	}
+	// Reject extreme values that could exhaust memory or crash NewClient
+	// before any report is sent.
+	switch {
+	case c.MaxBreadcrumbs > maxBreadcrumbsCeiling:
+		return fmt.Errorf("bt: Config.MaxBreadcrumbs exceeds %d", maxBreadcrumbsCeiling)
+	case c.MaxErrorNodes > maxErrorNodesCeiling:
+		return fmt.Errorf("bt: Config.MaxErrorNodes exceeds %d", maxErrorNodesCeiling)
+	case c.MaxErrorDepth > maxErrorDepthCeiling:
+		return fmt.Errorf("bt: Config.MaxErrorDepth exceeds %d", maxErrorDepthCeiling)
+	case c.MaxAttachments > maxAttachmentsCeiling:
+		return fmt.Errorf("bt: Config.MaxAttachments exceeds %d", maxAttachmentsCeiling)
+	case c.MaxStackBytes > maxStackBytesCeiling:
+		return fmt.Errorf("bt: Config.MaxStackBytes exceeds %d", maxStackBytesCeiling)
+	case c.MaxReportBytes > maxReportBytesCeiling:
+		return fmt.Errorf("bt: Config.MaxReportBytes exceeds %d", maxReportBytesCeiling)
+	case c.MaxSourceBytes > maxSourceBytesCeiling || c.MaxSourceFileBytes > maxSourceBytesCeiling:
+		return fmt.Errorf("bt: source byte limit exceeds %d", maxSourceBytesCeiling)
 	}
 	if c.MaxAttachmentBytes > c.MaxTotalAttachmentBytes {
 		return errors.New("bt: Config.MaxAttachmentBytes exceeds MaxTotalAttachmentBytes")
@@ -388,6 +462,29 @@ func (c Config) validate() error {
 	if c.Token != "" && u.RawQuery != "" &&
 		!strings.EqualFold(u.Hostname(), "submit.backtrace.io") {
 		return fmt.Errorf("bt: Config.Endpoint must not carry a query string when Token is set, got %q", redactURL(c.Endpoint))
+	}
+
+	// Structural validation of the documented hosted forms, so a common
+	// misconfiguration fails at NewClient instead of silently POSTing to
+	// the wrong path. Self-hosted/custom gateways (any other host) are
+	// unconstrained.
+	host := strings.ToLower(u.Hostname())
+	trimmedPath := strings.Trim(u.Path, "/")
+	switch {
+	case host == "submit.backtrace.io":
+		// Complete submission URL: {universe}/{token}/{format}.
+		if segs := strings.Split(trimmedPath, "/"); len(segs) < 3 || segs[0] == "" || segs[1] == "" || segs[2] == "" {
+			return fmt.Errorf("bt: submit.backtrace.io Config.Endpoint must be of the form " +
+				"https://submit.backtrace.io/{universe}/{token}/{format}")
+		}
+	case strings.HasSuffix(host, ".sp.backtrace.io"):
+		// The {universe}.sp.backtrace.io form pairs the host with a
+		// Token; without one (and without an explicit submission path)
+		// the client would POST to the host root.
+		if c.Token == "" && trimmedPath == "" {
+			return errors.New("bt: a *.sp.backtrace.io Config.Endpoint requires Config.Token " +
+				"(or set BACKTRACE_TOKEN)")
+		}
 	}
 	return nil
 }
