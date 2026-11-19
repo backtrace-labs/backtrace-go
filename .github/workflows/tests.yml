@@ -128,7 +128,7 @@ jobs:
           check-latest: true
       - name: Fuzz parsers and redaction briefly
         run: |
-          for target in FuzzBuildThreads FuzzRedactURL FuzzRetryAfter FuzzSplitQualifiedFunction FuzzSafeMultipartName; do
+          for target in FuzzBuildThreads FuzzRedactURL FuzzRetryAfter FuzzSplitQualifiedFunction FuzzSafeMultipartName FuzzFreezeValue; do
             go test -run "^$target$" -fuzz "^$target$" -fuzztime 20s .
           done
 
