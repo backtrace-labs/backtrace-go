@@ -466,6 +466,139 @@ func TestSourceBudgets(t *testing.T) {
 	}
 }
 
+// sourceTextFor runs one frame at path through buildThreads with the given
+// roots and returns the source text embedded for it.
+func sourceTextFor(path string, roots ...string) string {
+	stack := "goroutine 1 [running]:\n" +
+		"main.a()\n" +
+		"\t" + path + ":2 +0x1\n"
+	_, sources, _ := buildThreads([]byte(stack), sourceOptions{
+		mode: SourceCodeContext, contextLines: 2, tabWidth: 8,
+		roots: roots,
+	})
+	var text strings.Builder
+	for _, sc := range sources {
+		text.WriteString(sc.Text)
+	}
+	return text.String()
+}
+
+// TestSourceRootsSymlinkReplacementDenied pins traversal resistance: a
+// symlink under an allowed root that is REPLACED to point outside it (the
+// check/use race a separate EvalSymlinks+Open could not close) must not
+// yield the target's content. os.Root refuses escaping resolution at open
+// time, so the outcome does not depend on timing.
+func TestSourceRootsSymlinkReplacementDenied(t *testing.T) {
+	parent := t.TempDir()
+	allowedDir := filepath.Join(parent, "allowed")
+	secretDir := filepath.Join(parent, "secret")
+	for _, dir := range []string{allowedDir, secretDir} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(allowedDir, "benign.go"), []byte("safe\nlines\nhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(secretDir, "secret.go")
+	if err := os.WriteFile(secret, []byte("classified\nclassified\nclassified\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(allowedDir, "swapped.go")
+	if err := os.Symlink("benign.go", link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	// Control: while the link stays inside the root it is read. Without
+	// this the assertions below would also pass if nothing were readable.
+	if got := sourceTextFor(link, allowedDir); !strings.Contains(got, "lines") {
+		t.Fatalf("a symlink that stays inside the root was not read: %q", got)
+	}
+
+	// Swap the link to escape the root, as an attacker (or build tooling)
+	// could between validation and open: by a relative and by an absolute
+	// target.
+	for _, target := range []string{filepath.Join("..", "secret", "secret.go"), secret} {
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if got := sourceTextFor(link, allowedDir); got != "" {
+			t.Errorf("symlink to %q escaped SourceRoots: %q", target, got)
+		}
+	}
+}
+
+// TestSourceRootsMatchThroughSymlinks pins that a root and a frame may name
+// the same directory differently: the build saw /tmp/app, the root was
+// given as /private/tmp/app, or the other way round. Both are the allowed
+// directory and both must yield source.
+func TestSourceRootsMatchThroughSymlinks(t *testing.T) {
+	parent := t.TempDir()
+	realDir := filepath.Join(parent, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "in.go"), []byte("one\ntwo\nthree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(parent, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	otherDir := filepath.Join(parent, "other")
+	if err := os.Mkdir(otherDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherDir, "out.go"), []byte("out\nof\nroot\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct{ name, root, frame string }{
+		{"root is the link, frame the directory", linkDir, filepath.Join(realDir, "in.go")},
+		{"root is the directory, frame the link", realDir, filepath.Join(linkDir, "in.go")},
+		{"both the link", linkDir, filepath.Join(linkDir, "in.go")},
+	}
+	for _, c := range cases {
+		if got := sourceTextFor(c.frame, c.root); !strings.Contains(got, "two") {
+			t.Errorf("%s: no source embedded (%q)", c.name, got)
+		}
+	}
+
+	// Resolving names must not widen the allow-list.
+	for _, root := range []string{linkDir, realDir} {
+		if got := sourceTextFor(filepath.Join(otherDir, "out.go"), root); got != "" {
+			t.Errorf("file outside root %s was read: %q", root, got)
+		}
+	}
+}
+
+// TestSourceRootsUnopenableFailsClosed pins the fail-closed rule: when
+// roots are configured but none can be opened, no source text is read.
+func TestSourceRootsUnopenableFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.go")
+	if err := os.WriteFile(path, []byte("secret\nlines\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stack := "goroutine 1 [running]:\n" +
+		"main.a()\n" +
+		"\t" + path + ":1 +0x1\n"
+
+	_, sources, _ := buildThreads([]byte(stack), sourceOptions{
+		mode: SourceCodeContext, contextLines: 2, tabWidth: 8,
+		roots: []string{filepath.Join(dir, "does-not-exist")},
+	})
+	for _, sc := range sources {
+		if sc.Text != "" {
+			t.Errorf("unopenable roots fell back to unrestricted reads: %q", sc.Text)
+		}
+	}
+}
+
 func TestIsSDKFrameBoundary(t *testing.T) {
 	cases := []struct {
 		name string
