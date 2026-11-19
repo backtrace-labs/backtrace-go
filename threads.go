@@ -2,6 +2,7 @@ package bt
 
 import (
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -75,6 +76,7 @@ func ParseThreadsFromStack(stackTrace []byte) (map[string]Thread, map[string]Sou
 func buildThreads(stackTrace []byte, opts sourceOptions) (map[string]Thread, map[string]SourceCode, string) {
 	threads := map[string]Thread{}
 	sources := newSourceBuilder(opts)
+	defer sources.close()
 
 	var (
 		current   *Thread
@@ -244,6 +246,15 @@ func trimCreatedBy(line string) string {
 	return line
 }
 
+// openedRoot pairs an os.Root handle with the absolute paths that name the
+// directory: as configured and, when that differs, with symbolic links
+// resolved (/tmp on macOS, a symlinked checkout). A frame carries whichever
+// form the build saw.
+type openedRoot struct {
+	names []string
+	root  *os.Root
+}
+
 // sourceBuilder deduplicates and extracts source snippets for stack frames,
 // under per-file and per-report byte budgets and an optional root allowlist.
 type sourceBuilder struct {
@@ -254,27 +265,58 @@ type sourceBuilder struct {
 	failed    map[string]bool
 	nextID    int
 	usedBytes int64 // embedded source text so far (budget accounting)
+
+	// roots are traversal-resistant handles opened once per report when
+	// SourceRoots is configured. rootsRequired records that roots WERE
+	// configured, so a failure to open them fails closed (never falls
+	// back to unrestricted reads).
+	roots         []openedRoot
+	rootsRequired bool
+	// resolvedDirs caches symlink-resolved frame directories for the
+	// report ("" when resolving failed or changed nothing).
+	resolvedDirs map[string]string
 }
 
 func newSourceBuilder(opts sourceOptions) *sourceBuilder {
-	// Normalize roots to absolute paths once: stack traces carry absolute
-	// file paths, so a relative root would silently never match.
-	if len(opts.roots) > 0 {
-		normalized := make([]string, 0, len(opts.roots))
-		for _, root := range opts.roots {
-			if abs, err := filepath.Abs(root); err == nil {
-				normalized = append(normalized, abs)
-			}
-		}
-		opts.roots = normalized
-	}
-	return &sourceBuilder{
+	b := &sourceBuilder{
 		opts:    opts,
 		ids:     map[string]string{},
 		entries: map[string]SourceCode{},
 		files:   map[string][]string{},
 		failed:  map[string]bool{},
 	}
+	if len(opts.roots) > 0 && opts.mode != SourceCodeNone && opts.mode != SourceCodeMetadata {
+		b.rootsRequired = true
+		for _, root := range opts.roots {
+			abs, err := filepath.Abs(root)
+			if err != nil {
+				continue
+			}
+			// os.OpenRoot confines subsequent opens: symlinks and ".."
+			// that escape the root are refused at open time, closing the
+			// check/use race that a separate EvalSymlinks+Open had.
+			handle, err := os.OpenRoot(abs)
+			if err != nil {
+				continue
+			}
+			names := []string{filepath.Clean(abs)}
+			if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+				if resolved = filepath.Clean(resolved); resolved != names[0] {
+					names = append(names, resolved)
+				}
+			}
+			b.roots = append(b.roots, openedRoot{names: names, root: handle})
+		}
+	}
+	return b
+}
+
+// close releases any opened root handles.
+func (b *sourceBuilder) close() {
+	for _, r := range b.roots {
+		_ = r.root.Close()
+	}
+	b.roots = nil
 }
 
 // reference registers a (path, line) pair and returns the snippet ID a frame
@@ -363,29 +405,76 @@ func (b *sourceBuilder) extract(path, lineNo string) SourceCode {
 	return sc
 }
 
-// pathAllowed applies the SourceRoots allowlist: when roots are configured,
-// only files under one of them may be read. Both the candidate and the
-// roots are symlink-resolved so a link placed under an allowed root cannot
-// smuggle in content from outside it; an unresolvable candidate is denied.
-func (b *sourceBuilder) pathAllowed(path string) bool {
-	if len(b.opts.roots) == 0 {
-		return true
+// openSource opens a source file, confined to the configured roots when
+// SourceRoots is set. It never falls back to an unrestricted open once
+// roots were required.
+func (b *sourceBuilder) openSource(path string) (*os.File, error) {
+	if !b.rootsRequired {
+		return os.Open(path)
 	}
-	resolved, err := filepath.EvalSymlinks(path)
+	if len(b.roots) == 0 {
+		// Roots were configured but none could be opened: fail closed.
+		return nil, fs.ErrPermission
+	}
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		return false
+		return nil, err
 	}
-	for _, root := range b.opts.roots {
-		resolvedRoot, err := filepath.EvalSymlinks(root)
-		if err != nil {
-			continue
-		}
-		if resolved == resolvedRoot ||
-			strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) {
-			return true
+	abs = filepath.Clean(abs)
+	if file, matched, err := b.openInRoots(abs); matched {
+		return file, err
+	}
+	// The frame may reach the file through a symbolic link above the root
+	// (built in /tmp/app, root given as /private/tmp/app). Resolving the
+	// directory only decides which root the file belongs to: the open is
+	// still made through os.Root, and the file name itself is left for
+	// os.Root to judge.
+	if dir := b.resolveDir(filepath.Dir(abs)); dir != "" {
+		if file, matched, err := b.openInRoots(filepath.Join(dir, filepath.Base(abs))); matched {
+			return file, err
 		}
 	}
-	return false
+	return nil, fs.ErrPermission
+}
+
+// openInRoots opens abs through the first root that contains it. matched
+// reports that a root claimed the path, whatever the open returned: a
+// refused open is final and never retried under another name.
+func (b *sourceBuilder) openInRoots(abs string) (file *os.File, matched bool, err error) {
+	for _, r := range b.roots {
+		for _, name := range r.names {
+			rel, relErr := filepath.Rel(name, abs)
+			if relErr != nil || rel == ".." ||
+				strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
+			// root.Open resolves rel traversal-resistantly (symlinks and
+			// ".." that would escape the root are refused).
+			file, err = r.root.Open(rel)
+			return file, true, err
+		}
+	}
+	return nil, false, nil
+}
+
+// resolveDir returns dir with symbolic links resolved, or "" when that
+// fails or changes nothing. Cached per report: frames of one package share
+// a directory.
+func (b *sourceBuilder) resolveDir(dir string) string {
+	if resolved, ok := b.resolvedDirs[dir]; ok {
+		return resolved
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		resolved = ""
+	} else if resolved = filepath.Clean(resolved); resolved == dir {
+		resolved = ""
+	}
+	if b.resolvedDirs == nil {
+		b.resolvedDirs = map[string]string{}
+	}
+	b.resolvedDirs[dir] = resolved
+	return resolved
 }
 
 // readLines reads and caches a source file for the duration of one report,
@@ -402,11 +491,8 @@ func (b *sourceBuilder) readLines(path string) []string {
 		b.failed[path] = true
 		return nil
 	}
-	if !b.pathAllowed(path) {
-		return fail()
-	}
 
-	file, err := os.Open(path)
+	file, err := b.openSource(path)
 	if err != nil {
 		return fail()
 	}
