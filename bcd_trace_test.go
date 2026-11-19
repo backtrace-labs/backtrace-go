@@ -3,6 +3,8 @@
 package bt
 
 import (
+	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -168,4 +170,120 @@ func TestTraceSuccess(t *testing.T) {
 	if err := Trace(tr, nil, &TraceOptions{Timeout: 5 * time.Second}); err != nil {
 		t.Fatalf("Trace = %v, want nil", err)
 	}
+}
+
+// failingKill makes the tracer kill report a failure (after really killing
+// the process, so nothing is left behind) until the test ends.
+func failingKill(t *testing.T) error {
+	t.Helper()
+	failure := errors.New("kill refused (test)")
+	original := killTracer
+	killTracer = func(p *os.Process) error {
+		_ = p.Kill()
+		return failure
+	}
+	t.Cleanup(func() { killTracer = original })
+	return failure
+}
+
+// panicOnKillFailure switches the documented default back on for a test
+// that started from traceTestConfig.
+func panicOnKillFailure() {
+	UpdateConfig(GlobalConfig{
+		PanicOnKillFailure: true,
+		ResendSignal:       true,
+		RateLimit:          time.Millisecond,
+		SynchronousPut:     true,
+	})
+}
+
+// recoveredFrom runs fn and returns the value it panicked with, or nil.
+func recoveredFrom(fn func()) (recovered interface{}) {
+	defer func() { recovered = recover() }()
+	fn()
+	return nil
+}
+
+func sleepingTracer() *fakeTracer {
+	return &fakeTracer{
+		makeCmd: func() *exec.Cmd { return exec.Command("sleep", "60") },
+		dto:     TraceOptions{Timeout: 5 * time.Second},
+	}
+}
+
+func healthyTrace(t *testing.T) {
+	t.Helper()
+	tr := &fakeTracer{
+		makeCmd: func() *exec.Cmd { return exec.Command("true") },
+		dto:     TraceOptions{Timeout: 5 * time.Second},
+	}
+	if err := Trace(tr, nil, &TraceOptions{Timeout: 5 * time.Second}); err != nil {
+		t.Errorf("Trace afterwards = %v, want nil (trace lock leaked?)", err)
+	}
+}
+
+// TestKillFailurePanicsFromTrace pins GlobalConfig.PanicOnKillFailure: a
+// tracer that outlives its deadline and cannot be killed raises a panic
+// carrying the kill error itself, not an ErrTracerCallback error, and only
+// after the trace lock has been given back.
+func TestKillFailurePanicsFromTrace(t *testing.T) {
+	defer traceTestConfig()()
+	panicOnKillFailure()
+	failure := failingKill(t)
+
+	recovered := recoveredFrom(func() {
+		_ = Trace(sleepingTracer(), nil, &TraceOptions{Timeout: 100 * time.Millisecond})
+	})
+	if recovered != failure {
+		t.Fatalf("Trace panicked with %#v, want the kill error", recovered)
+	}
+	healthyTrace(t)
+}
+
+// TestKillFailureIsAnErrorWhenNotPanicking is the same failure with the
+// option off: an error return, no panic.
+func TestKillFailureIsAnErrorWhenNotPanicking(t *testing.T) {
+	defer traceTestConfig()()
+	failingKill(t)
+
+	var err error
+	recovered := recoveredFrom(func() {
+		err = Trace(sleepingTracer(), nil, &TraceOptions{Timeout: 100 * time.Millisecond})
+	})
+	if recovered != nil {
+		t.Fatalf("Trace panicked with %#v although PanicOnKillFailure is off", recovered)
+	}
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("err = %v, want the timeout error", err)
+	}
+	healthyTrace(t)
+}
+
+// TestRecoverRaisesKillFailure pins what Recover does with it. With repanic
+// the application's own panic is what continues; without, nothing of the
+// application's is left to raise, so the PanicOnKillFailure panic is, as
+// it is from Trace. Swallowing it would turn the option off silently.
+func TestRecoverRaisesKillFailure(t *testing.T) {
+	defer traceTestConfig()()
+	panicOnKillFailure()
+	failure := failingKill(t)
+	options := &TraceOptions{Timeout: 100 * time.Millisecond}
+
+	recovered := recoveredFrom(func() {
+		defer Recover(sleepingTracer(), false, options)
+		panic("application panic")
+	})
+	if recovered != failure {
+		t.Errorf("Recover without repanic raised %#v, want the kill error", recovered)
+	}
+	healthyTrace(t)
+
+	recovered = recoveredFrom(func() {
+		defer Recover(sleepingTracer(), true, options)
+		panic("application panic")
+	})
+	if recovered != "application panic" {
+		t.Errorf("Recover with repanic raised %#v, want the application's panic", recovered)
+	}
+	healthyTrace(t)
 }

@@ -19,7 +19,9 @@ type PutOptions struct {
 	Client http.Client
 
 	// HTTPClient, when set, is used for snapshot uploads. Requests carry
-	// an SDK-owned deadline (Timeout) either way.
+	// an SDK-owned deadline (Timeout) either way. Redirects are never
+	// followed: the client is copied and its CheckRedirect replaced, so a
+	// snapshot is not replayed to another host.
 	HTTPClient *http.Client
 
 	// Timeout bounds each snapshot upload. Default: 30s.

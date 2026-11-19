@@ -3,6 +3,7 @@
 package bt
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -209,4 +211,104 @@ func TestTracerLoggerConcurrency(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestSnapshotUploadRefusesRedirects pins that an upload never follows a
+// redirect, and that the policy is applied to a copy of the client the
+// application passed in. Followed, a 302 turns the upload into a GET
+// elsewhere: a 200 from there would count as "uploaded" and, with Unlink,
+// delete a snapshot that was never stored.
+func TestSnapshotUploadRefusesRedirects(t *testing.T) {
+	for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			dir := t.TempDir()
+			snapshot := filepath.Join(dir, "snap.btt")
+			if err := os.WriteFile(snapshot, []byte("snapshot-bytes"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var targetHits atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetHits.Add(1)
+			}))
+			defer target.Close()
+			var originHits atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				originHits.Add(1)
+				http.Redirect(w, r, target.URL, status)
+			}))
+			defer origin.Close()
+
+			var consulted atomic.Bool
+			shared := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+				consulted.Store(true)
+				return nil
+			}}
+			const token = "s3cr3t-upload-credential"
+			tr := New(NewOptions{})
+			if err := tr.ConfigurePut(origin.URL, token, PutOptions{HTTPClient: shared, Unlink: true}); err != nil {
+				t.Fatal(err)
+			}
+
+			err := tr.Put([]byte(snapshot))
+			if err == nil || !strings.Contains(err.Error(), http.StatusText(status)) {
+				t.Errorf("Put through a redirecting endpoint = %v, want a failure naming the redirect", err)
+			}
+			if err != nil && strings.Contains(err.Error(), token) {
+				t.Errorf("the upload error carries the token: %v", err)
+			}
+			if got := targetHits.Load(); got != 0 {
+				t.Errorf("the redirect target received %d requests", got)
+			}
+			if got := originHits.Load(); got != 1 {
+				t.Errorf("the endpoint received %d requests, want 1", got)
+			}
+			if consulted.Load() {
+				t.Error("the caller's redirect policy was used; the SDK's must replace it")
+			}
+			if shared.CheckRedirect == nil {
+				t.Error("the caller's http.Client was modified")
+			}
+			if _, statErr := os.Stat(snapshot); statErr != nil {
+				t.Errorf("the snapshot of a refused upload was unlinked: %v", statErr)
+			}
+		})
+	}
+}
+
+type panickyRoundTripper struct{}
+
+func (panickyRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	panic("hostile round tripper")
+}
+
+// TestDirectPutContainsPanickingClient pins that a panic in the upload HTTP
+// client is an error for every way an upload starts, not only under Trace.
+func TestDirectPutContainsPanickingClient(t *testing.T) {
+	dir := t.TempDir()
+	snapshot := filepath.Join(dir, "snap.btt")
+	if err := os.WriteFile(snapshot, []byte("snapshot-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := New(NewOptions{})
+	client := &http.Client{Transport: panickyRoundTripper{}}
+	if err := tr.ConfigurePut("https://snapshots.example.com", "tok", PutOptions{HTTPClient: client}); err != nil {
+		t.Fatal(err)
+	}
+
+	uploads := map[string]func() error{
+		"Put":    func() error { return tr.Put([]byte(snapshot)) },
+		"PutDir": func() error { return tr.PutDir(dir) },
+	}
+	for name, upload := range uploads {
+		var err error
+		if recovered := recoveredFrom(func() { err = upload() }); recovered != nil {
+			t.Errorf("%s let the client's panic through: %v", name, recovered)
+			continue
+		}
+		if !errors.Is(err, ErrTracerCallback) {
+			t.Errorf("%s = %v, want an error wrapping ErrTracerCallback", name, err)
+		}
+	}
 }

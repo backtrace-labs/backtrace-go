@@ -289,6 +289,12 @@ func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) erro
 	if options.HTTPClient == nil {
 		options.HTTPClient = &options.Client
 	}
+	// Never follow redirects: a snapshot must not be replayed to another
+	// host. This replaces a CheckRedirect the caller set; the copy keeps
+	// the caller's own client unmodified.
+	uploadClient := *options.HTTPClient
+	uploadClient.CheckRedirect = noRedirect
+	options.HTTPClient = &uploadClient
 
 	t.putMu.Lock()
 	t.put = uploader{endpoint: putURL, options: options}
@@ -331,7 +337,9 @@ func (t *BTTracer) Put(snapshot []byte) error {
 // The first error encountered terminates the directory walk, thus
 // skipping snapshots which would have been processed later in the walk.
 func (t *BTTracer) PutDir(path string) error {
-	t.Logf(LogDebug, "Uploading snapshots from %s...\n", path)
+	// Diagnostics name files, not locations: a path can carry a user or
+	// tenant name.
+	t.Logf(LogDebug, "Uploading snapshots from directory %s...\n", filepath.Base(path))
 	return filepath.Walk(path, putDirWalk(t))
 }
 
@@ -357,8 +365,17 @@ func putDirWalk(t *BTTracer) filepath.WalkFunc {
 	}
 }
 
-func (t *BTTracer) putSnapshotFile(path string) error {
-	t.Logf(LogDebug, "Attempting to upload snapshot %s...\n", path)
+func (t *BTTracer) putSnapshotFile(path string) (err error) {
+	// The upload goes through an HTTP client the application may have
+	// supplied. A panic in it becomes an error whether the upload was
+	// started by Trace, by PutDir or by a direct Put.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w (%T)", ErrTracerCallback, r)
+		}
+	}()
+
+	t.Logf(LogDebug, "Attempting to upload snapshot %s...\n", filepath.Base(path))
 
 	t.putMu.RLock()
 	u := t.put
