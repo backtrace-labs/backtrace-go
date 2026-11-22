@@ -215,9 +215,45 @@ and [examples/bcd/main.go](examples/bcd/main.go).
 
 ## Development
 
+### Getting started (macOS)
+
+1. Install Go (1.25+ required; CI also tests 1.26) with [Homebrew](https://brew.sh):
+
+   ```sh
+   brew install go
+   go version
+   ```
+
+2. Add Go's tool directory to your `PATH` so that installed tools such as `golangci-lint` and `govulncheck` are found. Add this line to `~/.zshrc`:
+
+   ```sh
+   export PATH="$PATH:$(go env GOPATH)/bin"
+   ```
+
+   Then reload your shell config: `source ~/.zshrc`.
+
+3. Install the lint and vulnerability tools at the versions CI uses:
+
+   ```sh
+   make tools   # golangci-lint v2.12.2 + govulncheck v1.1.4
+   ```
+
+   You can also run `brew install golangci-lint`, but that installs the latest release, which may report different findings than CI.
+
+4. Fetch dependencies and verify the setup:
+
+   ```sh
+   go mod download
+   make check   # gofmt, vet, race tests, lint, go.mod tidiness — same as CI
+   ```
+
+### Make targets
+
 ```
 make help    # list targets
+make check   # run the main CI checks locally
 make race    # go test -race ./...
 make lint    # golangci-lint v2
+make vuln    # govulncheck ./...
 make cross   # cross-compile all supported platforms
 ```
