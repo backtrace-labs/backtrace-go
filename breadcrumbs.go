@@ -1,6 +1,8 @@
 package bt
 
 import (
+	"encoding/json"
+	"math"
 	"sync"
 	"time"
 )
@@ -11,9 +13,30 @@ const (
 	BreadcrumbInfo    = "info"
 	BreadcrumbWarning = "warning"
 	BreadcrumbError   = "error"
+	BreadcrumbFatal   = "fatal"
+)
+
+// Breadcrumb types understood by the Backtrace UI.
+const (
+	BreadcrumbTypeManual        = "manual"
+	BreadcrumbTypeLog           = "log"
+	BreadcrumbTypeNavigation    = "navigation"
+	BreadcrumbTypeHTTP          = "http"
+	BreadcrumbTypeSystem        = "system"
+	BreadcrumbTypeUser          = "user"
+	BreadcrumbTypeConfiguration = "configuration"
+)
+
+const (
+	maxBreadcrumbMessageBytes = 1024
+	maxBreadcrumbBytes        = 4096
 )
 
 // Breadcrumb is a lightweight trail entry recorded before an error occurs.
+//
+// Each breadcrumb is limited to 4 KiB of JSON. The message is cut to fit,
+// and the attributes are dropped when they do not fit even without a
+// message. A breadcrumb that still does not fit is discarded.
 // Breadcrumbs are attached to every report as the "breadcrumbs" annotation.
 type Breadcrumb struct {
 	// Timestamp in Unix milliseconds. Filled automatically by AddBreadcrumb
@@ -23,17 +46,19 @@ type Breadcrumb struct {
 	// ID is a monotonically increasing sequence number.
 	ID uint64 `json:"id"`
 
-	// Level is one of the Breadcrumb* constants; defaults to "info".
+	// Level is one of the Breadcrumb level constants; defaults to "info".
 	Level string `json:"level"`
 
 	// Type categorizes the breadcrumb ("manual", "http", "log", ...);
 	// defaults to "manual".
 	Type string `json:"type"`
 
-	// Message is the human-readable description.
+	// Message is the human-readable description. It is cut at 1024 bytes.
 	Message string `json:"message"`
 
-	// Attributes carry optional structured metadata.
+	// Attributes carry optional structured metadata. Values are converted
+	// like report attributes, except that maps, slices and structs become
+	// JSON text and nil values are dropped.
 	Attributes map[string]interface{} `json:"attributes,omitempty"`
 }
 
@@ -53,19 +78,7 @@ func newBreadcrumbRing(capacity int) *breadcrumbRing {
 	return &breadcrumbRing{buf: make([]Breadcrumb, capacity)}
 }
 
-// cloneBreadcrumb detaches the attribute map from caller ownership,
-// freezing nested values so a breadcrumb attribute the caller keeps
-// mutating cannot later race the worker's serialization.
-func cloneBreadcrumb(b Breadcrumb) Breadcrumb {
-	b.Attributes = freezeAttributes(b.Attributes, valueLimits{})
-	return b
-}
-
-func (r *breadcrumbRing) add(b Breadcrumb) {
-	if r == nil {
-		return
-	}
-	b = cloneBreadcrumb(b)
+func prepareBreadcrumb(b Breadcrumb) (Breadcrumb, bool) {
 	if b.Timestamp == 0 {
 		b.Timestamp = time.Now().UnixMilli()
 	}
@@ -74,6 +87,78 @@ func (r *breadcrumbRing) add(b Breadcrumb) {
 	}
 	if b.Type == "" {
 		b.Type = "manual"
+	}
+	b.Message = truncateUTF8(b.Message, maxBreadcrumbMessageBytes)
+	b.Attributes = breadcrumbAttributes(b.Attributes)
+
+	id := b.ID
+	// The real ID is assigned later. Measure with the widest one.
+	b.ID = math.MaxUint64
+	b, ok := fitBreadcrumb(b)
+	b.ID = id
+	return b, ok
+}
+
+func breadcrumbAttributes(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	frozen := freezeAttributes(in, valueLimits{})
+	out := make(map[string]any, len(frozen))
+	for k, v := range frozen {
+		value, kind := scalarValue(v)
+		switch kind {
+		case valueNil:
+			continue
+		case valueComposite:
+			value = string(encodeComposite(v))
+		}
+		out[k] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func fitBreadcrumb(b Breadcrumb) (Breadcrumb, bool) {
+	if encodedBreadcrumbSize(b) <= maxBreadcrumbBytes {
+		return b, true
+	}
+	msg := b.Message
+	b.Message = ""
+	if encodedBreadcrumbSize(b) > maxBreadcrumbBytes {
+		b.Attributes = nil
+	}
+	lo, hi := 0, len(msg)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		b.Message = truncateUTF8(msg, mid)
+		if encodedBreadcrumbSize(b) <= maxBreadcrumbBytes {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	b.Message = truncateUTF8(msg, lo)
+	return b, encodedBreadcrumbSize(b) <= maxBreadcrumbBytes
+}
+
+func encodedBreadcrumbSize(b Breadcrumb) int {
+	data, err := json.Marshal(b)
+	if err != nil {
+		return math.MaxInt
+	}
+	return len(data)
+}
+
+func (r *breadcrumbRing) add(b Breadcrumb) {
+	if r == nil {
+		return
+	}
+	b, ok := prepareBreadcrumb(b)
+	if !ok {
+		return
 	}
 
 	r.mu.Lock()

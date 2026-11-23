@@ -33,12 +33,12 @@ type StackFrame struct {
 
 // SourceCode is a source snippet referenced by stack frames.
 type SourceCode struct {
-	Text        string `json:"text"`
+	Text        string `json:"text,omitempty"`
 	Path        string `json:"path"`
-	StartLine   int    `json:"startLine"`
-	StartColumn int    `json:"startColumn"`
-	StartPos    int    `json:"startPos"`
-	TabWidth    int    `json:"tabWidth"`
+	StartLine   int    `json:"startLine,omitempty"`
+	StartColumn int    `json:"startColumn,omitempty"`
+	StartPos    int    `json:"startPos,omitempty"`
+	TabWidth    int    `json:"tabWidth,omitempty"`
 }
 
 // sourceOptions controls source snippet embedding; see SourceCodeMode.

@@ -349,7 +349,7 @@ func TestLegacySetAttributeNormalisesAtStore(t *testing.T) {
 	wg.Wait()
 	Flush(10 * time.Second)
 
-	got, _ := attrsOf(t, legacyServer.last())["legacy.nested"].(map[string]interface{})
+	got, _ := annotationsOf(t, legacyServer.last())["legacy.nested"].(map[string]any)
 	if len(got) != 1 || got["state"] != "stored" {
 		t.Errorf("stored value follows later changes to the caller's map: %v", got)
 	}
@@ -452,5 +452,23 @@ func TestLegacyEnvVarAnnotations(t *testing.T) {
 	}
 	if env["BT_TEST_DATABASE_URL"] != redactedValue {
 		t.Errorf("connection string with credentials not redacted: %v", env["BT_TEST_DATABASE_URL"])
+	}
+}
+
+func TestLegacySetAttributeNilSuppressesDefault(t *testing.T) {
+	legacyServer.reset()
+	SetAttribute("hostname", nil)
+	t.Cleanup(func() {
+		legacyAttrMu.Lock()
+		delete(Options.Attributes, "hostname")
+		legacyAttrMu.Unlock()
+	})
+
+	Report(errors.New("no hostname"), nil)
+	if !Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if _, ok := attrsOf(t, legacyServer.last())["hostname"]; ok {
+		t.Error("hostname sent after SetAttribute(hostname, nil)")
 	}
 }

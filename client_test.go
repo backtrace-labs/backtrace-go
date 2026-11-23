@@ -707,6 +707,9 @@ func TestSourceMetadataDefault(t *testing.T) {
 		if path, _ := sc["path"].(string); path == "" {
 			t.Errorf("source entry %s missing path", id)
 		}
+		if len(sc) != 1 {
+			t.Errorf("source entry %s = %v, want only a path", id, sc)
+		}
 	}
 }
 
@@ -984,6 +987,30 @@ func TestBeforeSendCannotBreakInvariants(t *testing.T) {
 	}
 }
 
+func TestBeforeSendEmptyingThreadsInPlaceKeepsMainThread(t *testing.T) {
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			clear(r.Threads)
+			return r
+		}
+	})
+	c.ReportMessage("cleared", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	payload := rs.last()
+	threads, _ := payload["threads"].(map[string]any)
+	main, _ := payload["mainThread"].(string)
+	if main == "" || threads[main] == nil {
+		t.Fatalf("mainThread %q does not name a submitted thread (%d submitted)", main, len(threads))
+	}
+	thread, _ := threads[main].(map[string]any)
+	if frames, _ := thread["stack"].([]any); len(frames) == 0 {
+		t.Error("restored main thread has no frames")
+	}
+}
+
 // TestBeforeSendScrubbingSticks pins that removing data in the hook is
 // honoured. A hook exists to scrub: restoring what it removed would send
 // source text or frames the application decided not to send.
@@ -1086,7 +1113,7 @@ func TestBeforeSendSeesNormalisedTypes(t *testing.T) {
 	}
 	mu.Unlock()
 
-	headers, _ := attrsOf(t, rs.last())["headers"].(map[string]interface{})
+	headers, _ := annotationsOf(t, rs.last())["headers"].(map[string]any)
 	if _, leaked := headers["Authorization"]; leaked {
 		t.Error("the scrubber did not match: Authorization was sent")
 	}
@@ -1135,23 +1162,21 @@ func TestBeforeSendEditsStayInOneReport(t *testing.T) {
 	}
 
 	second := rs.last()
-	attrs := attrsOf(t, second)
+	annotations := annotationsOf(t, second)
 	for _, key := range []string{"cfg", "client"} {
-		nested, _ := attrs[key].(map[string]interface{})
+		nested, _ := annotations[key].(map[string]any)
 		if nested["k"] != "v" {
-			t.Fatalf("attribute %q missing from the second report: %v", key, attrs[key])
+			t.Fatalf("attribute %q missing from the second report: %v", key, annotations[key])
 		}
 		if _, leaked := nested["first-only"]; leaked {
 			t.Errorf("an edit to %q in the first report leaked into the second", key)
 		}
 	}
-	annotations, _ := second["annotations"].(map[string]interface{})
-	crumbs, _ := annotations["breadcrumbs"].([]interface{})
+	crumbs := breadcrumbsOf(t, rs.lastAttachments())
 	if len(crumbs) == 0 {
 		t.Fatal("no breadcrumbs in the second report")
 	}
-	crumb, _ := crumbs[0].(map[string]interface{})
-	crumbAttrs, _ := crumb["attributes"].(map[string]interface{})
+	crumbAttrs, _ := crumbs[0]["attributes"].(map[string]any)
 	if _, leaked := crumbAttrs["first-only"]; leaked {
 		t.Error("an edit to a breadcrumb in the first report leaked into the second")
 	}
@@ -1238,7 +1263,7 @@ func TestReportOwnershipAfterReturn(t *testing.T) {
 		t.Fatal("Flush timed out")
 	}
 
-	got, _ := attrsOf(t, rs.last())["nested"].(map[string]interface{})
+	got, _ := annotationsOf(t, rs.last())["nested"].(map[string]any)
 	if got == nil {
 		t.Fatal("nested attribute missing")
 	}
@@ -1285,7 +1310,7 @@ func TestSetAttributeFreezes(t *testing.T) {
 	if !c.Flush(5 * time.Second) {
 		t.Fatal("Flush timed out")
 	}
-	held, _ := attrsOf(t, rs.last())["held"].(map[string]interface{})
+	held, _ := annotationsOf(t, rs.last())["held"].(map[string]any)
 	if held == nil || held["v"] != "before" {
 		t.Errorf("SetAttribute value not detached: %v", held)
 	}

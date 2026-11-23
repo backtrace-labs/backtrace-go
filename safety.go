@@ -40,7 +40,7 @@ func cloneStringSlice(in []string) []string {
 }
 
 // cloneAnyMap detaches the map header from caller ownership. Nested reference
-// values are documented as immutable after the reporting call returns.
+// values are frozen by cloneConfig.
 func cloneAnyMap(in map[string]interface{}) map[string]interface{} {
 	if in == nil {
 		return nil

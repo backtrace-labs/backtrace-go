@@ -3,8 +3,11 @@ package bt
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"math/rand/v2"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,6 +96,7 @@ type queuedReport struct {
 	classifiers []string
 	reportType  string // SDK-known type for diagnostics (never user data)
 	timestamp   int64
+	err         error
 }
 
 // nonBlocking is a pre-canceled context: queue admission under it makes one
@@ -227,6 +231,8 @@ func panicCaptureInput(value interface{}, extra map[string]interface{}) captureI
 // report. Safe for concurrent use. The value is normalised into a detached
 // copy before the call returns (see ReportData for the value model), so the
 // caller may keep changing its own maps and slices afterwards.
+// A nil value removes the attribute from reports, including SDK defaults
+// such as "hostname".
 func (c *Client) SetAttribute(key string, value interface{}) {
 	if c == nil {
 		return
@@ -507,6 +513,7 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 		classifiers: classifiers,
 		reportType:  in.reportType,
 		timestamp:   time.Now().Unix(),
+		err:         in.err,
 	}})
 }
 
@@ -642,7 +649,10 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		Threads:     threads,
 		SourceCode:  sourceCode,
 		MainThread:  mainThread,
+		Error:       qr.err,
 	}
+	ensureMainThread(report)
+	threads, mainThread = report.Threads, report.MainThread
 	// A negative MaxAttachments disables attachments entirely (documented);
 	// don't even open the files.
 	if cfg.MaxAttachments >= 0 {
@@ -656,6 +666,9 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		// for this report only. The copy also widens the SDK's own plain
 		// numbers, so the hook sees value-model types throughout.
 		report.Attributes = copyModelMap(report.Attributes)
+		report.Classifiers = slices.Clone(report.Classifiers)
+		// A hook may clear r.Threads in place. threads must keep the originals.
+		report.Threads = maps.Clone(report.Threads)
 		if deps, ok := report.Annotations["Dependencies"].([]string); ok {
 			report.Annotations["Dependencies"] = append([]string(nil), deps...)
 		}
@@ -675,7 +688,20 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		}
 	}
 
+	normalizeAttributes(report.Attributes, report.Annotations)
 	body, err := json.Marshal(report.toWire())
+	if err == nil && len(body) > cfg.MaxReportBytes {
+		size := len(body)
+		var steps []string
+		body, steps, err = shrinkReport(report, cfg.MaxReportBytes)
+		if err == nil && body == nil {
+			c.stats.drop(dropOversize)
+			d.logf("report %s dropped: %d bytes exceeds the %d-byte report limit",
+				eventID, size, cfg.MaxReportBytes)
+			return
+		}
+		d.logf("report %s trimmed from %d bytes (%s)", eventID, size, strings.Join(steps, ","))
+	}
 	if err != nil {
 		c.stats.drop(dropSerialization)
 		d.logf("report %s dropped: serialization failed (%T)", eventID, err)
@@ -728,6 +754,7 @@ func enforceReportInvariants(report *ReportData, eventID string, qr *queuedRepor
 	if report.Timestamp <= 0 {
 		report.Timestamp = qr.timestamp
 	}
+	report.Classifiers = slices.DeleteFunc(slices.Clone(report.Classifiers), func(c string) bool { return c == "" })
 	if len(report.Classifiers) == 0 {
 		report.Classifiers = qr.classifiers
 	}

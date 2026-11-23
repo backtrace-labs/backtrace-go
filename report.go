@@ -3,10 +3,12 @@ package bt
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -30,8 +32,8 @@ import (
 //
 // An int arrives as int64, a []string as []interface{}, a
 // map[string]string as map[string]interface{}, a time.Time as an RFC 3339
-// string and a struct as a map of its exported fields. Type assertions in a
-// hook must use these types:
+// string and a struct as a map of its exported fields. Field names follow
+// the json tags. Type assertions in a hook must use these types:
 //
 //	if h, ok := r.Attributes["headers"].(map[string]interface{}); ok {
 //		delete(h, "Authorization")
@@ -46,8 +48,8 @@ import (
 // Everything except UUID, which identifies the report in SDK diagnostics and
 // is always restored. Removing data sticks: SourceCode may be set to nil,
 // Threads may be trimmed. The SDK only repairs what the wire format requires
-// (a positive Timestamp, at least one thread, a MainThread that exists, no
-// frame referring to a removed SourceCode entry).
+// (a positive Timestamp, a non-empty classifier, at least one thread, a
+// MainThread that exists, no frame referring to a removed SourceCode entry).
 type ReportData struct {
 	// UUID uniquely identifies the report (RFC 4122 version 4).
 	UUID string
@@ -62,7 +64,9 @@ type ReportData struct {
 	Classifiers []string
 
 	// Attributes are indexed key/value pairs used for search and
-	// aggregation.
+	// aggregation. After BeforeSend, values become strings, booleans or
+	// non-negative integers, maps and slices move to Annotations, and nil
+	// values are dropped.
 	Attributes map[string]interface{}
 
 	// Annotations carry larger, non-indexed structured data
@@ -82,6 +86,11 @@ type ReportData struct {
 	// "attachment_<basename>" multipart parts. Seeded from
 	// Config.AttachmentPaths; BeforeSend may add or remove entries.
 	Attachments []string
+
+	// Error is the reported error, or nil for messages, other panic values
+	// and crash reports. It is not a copy and it is not sent. BeforeSend can
+	// inspect it with errors.Is and errors.As.
+	Error error `json:"-"`
 }
 
 // toWire converts the report to the Backtrace JSON submission format.
@@ -95,11 +104,127 @@ func (r *ReportData) toWire() map[string]interface{} {
 		"agentVersion": Version,
 		"classifiers":  r.Classifiers,
 		"attributes":   r.Attributes,
-		"annotations":  r.Annotations,
+		"annotations":  encodeAnnotations(r.Annotations),
 		"threads":      r.Threads,
 		"mainThread":   r.MainThread,
 		"sourceCode":   r.SourceCode,
 	}
+}
+
+func ensureMainThread(r *ReportData) {
+	if r.MainThread == "" {
+		r.MainThread = "main"
+	}
+	if _, ok := r.Threads[r.MainThread]; !ok {
+		r.Threads[r.MainThread] = Thread{Name: "main", Fault: true, Stacks: []StackFrame{}}
+	}
+}
+
+const (
+	maxTrimmedAttributeBytes = 4096
+	maxTrimmedErrorChain     = 10
+	truncatedAttribute       = "backtrace.truncated"
+)
+
+var trimSteps = []struct {
+	name  string
+	apply func(*ReportData) bool
+}{
+	{"source_text", dropSourceText},
+	{"threads", dropOtherThreads},
+	{"dependencies_env", dropBulkAnnotations},
+	{"error_chain", trimErrorChain},
+	{"long_attributes", truncateLongAttributes},
+	{"annotations", dropAnnotations},
+}
+
+func shrinkReport(r *ReportData, limit int) (body []byte, steps []string, err error) {
+	for _, step := range trimSteps {
+		if !step.apply(r) {
+			continue
+		}
+		steps = append(steps, step.name)
+		r.Attributes[truncatedAttribute] = strings.Join(steps, ",")
+		if body, err = json.Marshal(r.toWire()); err != nil || len(body) <= limit {
+			return body, steps, err
+		}
+	}
+	return nil, steps, nil
+}
+
+func dropSourceText(r *ReportData) bool {
+	changed := false
+	for id, sc := range r.SourceCode {
+		if sc != (SourceCode{Path: sc.Path}) {
+			r.SourceCode[id] = SourceCode{Path: sc.Path}
+			changed = true
+		}
+	}
+	return changed
+}
+
+func dropOtherThreads(r *ReportData) bool {
+	changed := false
+	for id, t := range r.Threads {
+		if id != r.MainThread && !t.Fault {
+			delete(r.Threads, id)
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	referenced := map[string]bool{}
+	for _, t := range r.Threads {
+		for _, f := range t.Stacks {
+			referenced[f.SourceCodeID] = true
+		}
+	}
+	for id := range r.SourceCode {
+		if !referenced[id] {
+			delete(r.SourceCode, id)
+		}
+	}
+	return true
+}
+
+func dropBulkAnnotations(r *ReportData) bool {
+	changed := false
+	for _, k := range []string{"Dependencies", "Environment Variables"} {
+		if _, ok := r.Annotations[k]; ok {
+			delete(r.Annotations, k)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func trimErrorChain(r *ReportData) bool {
+	chain, ok := r.Annotations["Error Chain"].([]errorChainLink)
+	if !ok || len(chain) <= maxTrimmedErrorChain {
+		return false
+	}
+	r.Annotations["Error Chain"] = chain[:maxTrimmedErrorChain]
+	return true
+}
+
+func truncateLongAttributes(r *ReportData) bool {
+	changed := false
+	for k, v := range r.Attributes {
+		if s, ok := v.(string); ok && len(s) > maxTrimmedAttributeBytes {
+			r.Attributes[k] = truncateUTF8(s, maxTrimmedAttributeBytes)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func dropAnnotations(r *ReportData) bool {
+	if len(r.Annotations) == 0 {
+		return false
+	}
+	r.Annotations = map[string]any{}
+	return true
 }
 
 var uuidFallbackCounter atomic.Uint64

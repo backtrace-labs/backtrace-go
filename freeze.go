@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -87,18 +87,39 @@ var (
 // methods, each call guarded against panics, so common values such as
 // time.Time, net.IP or a UUID keep the representation encoding/json gives
 // them. Those methods are application code and run on the caller's
-// goroutine, during the reporting call.
+// goroutine, during the reporting call. IsZero methods, used for omitzero,
+// run there too. Struct fields follow the rules of encoding/json v1.
 type freezer struct {
 	limits valueLimits
 	nodes  int
 	bytes  int
 	// visiting tracks pointer, map and slice headers on the current path
 	// for cycle detection.
-	visiting map[uintptr]bool
+	visiting []visitKey
+}
+
+// typ separates containers that share an address, such as a struct and its first field.
+type visitKey struct {
+	kind reflect.Kind
+	typ  reflect.Type
+	ptr  uintptr
+	len  int
+}
+
+func (f *freezer) enter(k visitKey) bool {
+	if slices.Contains(f.visiting, k) {
+		return false
+	}
+	f.visiting = append(f.visiting, k)
+	return true
+}
+
+func (f *freezer) leave() {
+	f.visiting = f.visiting[:len(f.visiting)-1]
 }
 
 func newFreezer(limits valueLimits) *freezer {
-	return &freezer{limits: limits.normalize(), visiting: map[uintptr]bool{}}
+	return &freezer{limits: limits.normalize()}
 }
 
 // freezeAttributes normalises every value of in under ONE shared budget.
@@ -146,10 +167,19 @@ func (f *freezer) marker(format string, a ...interface{}) string {
 }
 
 func (f *freezer) freeze(rv reflect.Value, depth int) interface{} {
+	return f.freezeWith(rv, depth, false)
+}
+
+// encoding/json applies the ",string" option behind pointers too.
+func (f *freezer) freezeWith(rv reflect.Value, depth int, quoted bool) any {
 	f.nodes++
+	var declared reflect.Type
 	for rv.IsValid() && rv.Kind() == reflect.Interface {
 		if rv.IsNil() {
 			return nil
+		}
+		if rv.CanInterface() && rv.NumMethod() > 0 {
+			declared = rv.Type()
 		}
 		rv = rv.Elem()
 	}
@@ -159,51 +189,67 @@ func (f *freezer) freeze(rv reflect.Value, depth int) interface{} {
 	if depth > f.limits.maxDepth {
 		return f.marker("value truncated: max depth")
 	}
-	if v, ok := f.convert(rv, depth); ok {
+	if declared != nil {
+		if v, ok := f.convertDeclared(rv, declared, depth); ok {
+			return v
+		}
+	}
+	if v, ok := f.convert(rv, depth, quoted); ok {
 		return v
 	}
 
 	switch rv.Kind() {
 	case reflect.Bool:
+		if quoted {
+			return f.freezeString(strconv.FormatBool(rv.Bool()))
+		}
 		f.bytes += scalarCost
 		return rv.Bool()
 	case reflect.String:
+		if quoted {
+			return f.freezeQuotedString(rv.String())
+		}
 		return f.freezeString(rv.String())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if quoted {
+			return f.freezeString(strconv.FormatInt(rv.Int(), 10))
+		}
 		f.bytes += scalarCost
 		return rv.Int()
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if quoted {
+			return f.freezeString(strconv.FormatUint(rv.Uint(), 10))
+		}
 		f.bytes += scalarCost
 		return rv.Uint()
 	case reflect.Float32:
-		return f.freezeFloat(rv.Float(), 32)
+		return f.freezeFloat(rv.Float(), 32, quoted)
 	case reflect.Float64:
-		return f.freezeFloat(rv.Float(), 64)
+		return f.freezeFloat(rv.Float(), 64, quoted)
 	case reflect.Pointer:
 		if rv.IsNil() {
 			return nil
 		}
-		ptr := rv.Pointer()
-		if f.visiting[ptr] {
+		k := visitKey{kind: reflect.Pointer, typ: rv.Type(), ptr: rv.Pointer()}
+		if !f.enter(k) {
 			return f.marker("cycle")
 		}
-		f.visiting[ptr] = true
-		defer delete(f.visiting, ptr)
-		return f.freeze(rv.Elem(), depth+1)
+		defer f.leave()
+		return f.freezeWith(rv.Elem(), depth+1, quoted)
 	case reflect.Slice:
 		if rv.IsNil() {
 			return nil
 		}
-		if rv.Type().Elem().Kind() == reflect.Uint8 {
+		if isByteSlice(rv.Type()) {
 			return f.freezeBytes(rv.Bytes())
 		}
 		ptr := rv.Pointer()
 		if ptr != 0 && rv.Len() > 0 {
-			if f.visiting[ptr] {
+			k := visitKey{kind: reflect.Slice, typ: rv.Type(), ptr: ptr, len: rv.Len()}
+			if !f.enter(k) {
 				return f.marker("cycle")
 			}
-			f.visiting[ptr] = true
-			defer delete(f.visiting, ptr)
+			defer f.leave()
 		}
 		return f.freezeList(rv, depth)
 	case reflect.Array:
@@ -212,17 +258,14 @@ func (f *freezer) freeze(rv reflect.Value, depth int) interface{} {
 		if rv.IsNil() {
 			return nil
 		}
-		ptr := rv.Pointer()
-		if f.visiting[ptr] {
+		k := visitKey{kind: reflect.Map, ptr: rv.Pointer()}
+		if !f.enter(k) {
 			return f.marker("cycle")
 		}
-		f.visiting[ptr] = true
-		defer delete(f.visiting, ptr)
+		defer f.leave()
 		return f.freezeMap(rv, depth)
 	case reflect.Struct:
-		out := map[string]interface{}{}
-		f.freezeStructInto(out, rv, depth)
-		return out
+		return f.freezeStruct(rv, depth)
 	default:
 		// Funcs, channels, complex numbers and unsafe pointers have no
 		// JSON form.
@@ -232,8 +275,9 @@ func (f *freezer) freeze(rv reflect.Value, depth int) interface{} {
 
 // convert handles types that carry their own representation. It mirrors the
 // precedence of encoding/json (Marshaler before TextMarshaler) and adds
-// error values, which encoding/json would render as an empty object.
-func (f *freezer) convert(rv reflect.Value, depth int) (interface{}, bool) {
+// error values, which encoding/json would render as an empty object. A
+// pointer receiver is used when the value is addressable.
+func (f *freezer) convert(rv reflect.Value, depth int, quoted bool) (interface{}, bool) {
 	if !rv.CanInterface() {
 		return nil, false
 	}
@@ -244,23 +288,52 @@ func (f *freezer) convert(rv reflect.Value, depth int) (interface{}, bool) {
 		return nil, true
 	}
 
+	addressable := t.Kind() != reflect.Pointer && rv.CanAddr()
 	switch {
 	case t == timeType:
 		return f.freezeString(rv.Interface().(time.Time).Format(time.RFC3339Nano)), true
 	case t == jsonNumberType:
-		return f.freezeNumber(rv.String()), true
+		s := rv.String()
+		if s == "" {
+			s = "0"
+		}
+		if quoted {
+			return f.freezeString(s), true
+		}
+		return f.freezeNumber(s), true
+	case addressable && reflect.PointerTo(t).Implements(jsonMarshalerType):
+		return f.fromJSONMarshaler(rv.Addr(), depth), true
 	case t.Implements(jsonMarshalerType):
 		return f.fromJSONMarshaler(rv, depth), true
+	case addressable && reflect.PointerTo(t).Implements(textMarshalerType):
+		return f.fromTextMarshaler(rv.Addr()), true
 	case t.Implements(textMarshalerType):
-		text, ok := safeMarshalText(rv.Interface().(encoding.TextMarshaler))
-		if !ok {
-			return f.marker("MarshalText failed for %s", t), true
-		}
-		return f.freezeString(text), true
+		return f.fromTextMarshaler(rv), true
 	case t.Implements(errorType):
 		return f.freezeString(safeErrorString(rv.Interface().(error))), true
 	}
 	return nil, false
+}
+
+// encoding/json v1 takes the method from the declared interface type and calls it on a nil pointer too.
+func (f *freezer) convertDeclared(rv reflect.Value, declared reflect.Type, depth int) (any, bool) {
+	switch {
+	case declared.Implements(jsonMarshalerType):
+		if rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return f.fromJSONMarshaler(rv, depth), true
+		}
+	case declared.Implements(textMarshalerType):
+		return f.fromTextMarshaler(rv), true
+	}
+	return nil, false
+}
+
+func (f *freezer) fromTextMarshaler(rv reflect.Value) any {
+	text, ok := safeMarshalText(rv.Interface().(encoding.TextMarshaler))
+	if !ok {
+		return f.marker("MarshalText failed for %s", rv.Type())
+	}
+	return f.freezeString(text)
 }
 
 // fromJSONMarshaler runs a user MarshalJSON under panic containment, then
@@ -323,10 +396,18 @@ func (f *freezer) freezeNumber(s string) interface{} {
 	return f.freezeString(s)
 }
 
-func (f *freezer) freezeFloat(x float64, bits int) interface{} {
+func (f *freezer) freezeFloat(x float64, bits int, quoted bool) interface{} {
 	if math.IsNaN(x) || math.IsInf(x, 0) {
 		// Not representable in JSON.
 		return f.marker("non-finite float %v", x)
+	}
+	if quoted {
+		v := any(x)
+		if bits == 32 {
+			v = float32(x)
+		}
+		text, _ := json.Marshal(v)
+		return f.freezeString(string(text))
 	}
 	f.bytes += scalarCost
 	if bits == 32 {
@@ -338,6 +419,14 @@ func (f *freezer) freezeFloat(x float64, bits int) interface{} {
 		}
 	}
 	return x
+}
+
+func (f *freezer) freezeQuotedString(s string) string {
+	if len(s) > f.limits.maxStringBytes {
+		s = truncateUTF8(s, f.limits.maxStringBytes)
+	}
+	quoted, _ := json.Marshal(s)
+	return f.freezeString(string(quoted))
 }
 
 // freezeString clips s to the per-string cap and to what is left of the
@@ -451,64 +540,72 @@ func (f *freezer) freezeMap(rv reflect.Value, depth int) interface{} {
 // freezeMapKey renders a map key as a JSON object key. It follows
 // encoding/json: string kinds as they are, TextMarshaler keys through
 // MarshalText, everything else formatted (fmt recovers a panicking String).
+// Integer keys are written in decimal, and a nil TextMarshaler pointer key
+// is "".
 func freezeMapKey(k reflect.Value) string {
 	if k.Kind() == reflect.String {
 		return k.String()
 	}
 	if k.CanInterface() {
 		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
+			if k.Kind() == reflect.Pointer && k.IsNil() {
+				return ""
+			}
 			if text, ok := safeMarshalText(tm); ok {
 				return text
 			}
+		}
+		switch k.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return strconv.FormatInt(k.Int(), 10)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			return strconv.FormatUint(k.Uint(), 10)
 		}
 		return safeSprint(k.Interface())
 	}
 	return fmt.Sprintf("<%s>", k.Type())
 }
 
-// freezeStructInto adds the exported fields of a struct to out, named as
-// encoding/json would name them: the json tag when present, "-" skipped,
-// omitempty honoured, untagged embedded structs flattened.
-func (f *freezer) freezeStructInto(out map[string]interface{}, rv reflect.Value, depth int) {
-	t := rv.Type()
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		tag, tagged := field.Tag.Lookup("json")
-		if tag == "-" {
-			continue
-		}
-		name, opts, _ := strings.Cut(tag, ",")
-		value := rv.Field(i)
-
-		if field.Anonymous && (!tagged || name == "") {
-			embedded := value
-			for embedded.Kind() == reflect.Pointer && !embedded.IsNil() {
-				embedded = embedded.Elem()
+func (f *freezer) freezeStruct(rv reflect.Value, depth int) map[string]any {
+	fields := cachedStructFields(rv.Type())
+	out := make(map[string]any, len(fields))
+	mark := len(f.visiting)
+	for i := range fields {
+		sf := &fields[i]
+		value, ok, cycle := f.enterField(rv, sf.index)
+		if ok && !sf.omit(value) {
+			if f.exhausted() {
+				f.visiting = f.visiting[:mark]
+				out[truncatedKey] = f.marker("fields of %s omitted", rv.Type())
+				break
 			}
-			if embedded.Kind() == reflect.Pointer && embedded.Type().Elem().Kind() == reflect.Struct {
-				continue // nil embedded struct pointer: nothing to promote
-			}
-			if embedded.Kind() == reflect.Struct && embedded.Type() != timeType {
-				f.freezeStructInto(out, embedded, depth)
-				continue
+			f.bytes += len(sf.name)
+			if cycle {
+				out[sf.name] = f.marker("cycle")
+			} else {
+				out[sf.name] = f.freezeWith(value, depth+1, sf.quoted)
 			}
 		}
-		if !field.IsExported() {
-			continue
-		}
-		if name == "" {
-			name = field.Name
-		}
-		if strings.Contains(","+opts+",", ",omitempty,") && value.IsZero() {
-			continue
-		}
-		if f.exhausted() {
-			out[truncatedKey] = f.marker("fields of %s omitted", t)
-			return
-		}
-		f.bytes += len(name)
-		out[name] = f.freeze(value, depth+1)
+		f.visiting = f.visiting[:mark]
 	}
+	return out
+}
+
+// The embedded pointers it passes stay on f.visiting until the caller cuts it back.
+func (f *freezer) enterField(v reflect.Value, index []int) (field reflect.Value, ok, cycle bool) {
+	for _, i := range index {
+		if v.Kind() == reflect.Pointer {
+			if v.IsNil() {
+				return reflect.Value{}, false, cycle // nil embedded struct pointer: nothing to promote
+			}
+			if !f.enter(visitKey{kind: reflect.Pointer, typ: v.Type(), ptr: v.Pointer()}) {
+				cycle = true
+			}
+			v = v.Elem()
+		}
+		v = v.Field(i)
+	}
+	return v, true, cycle
 }
 
 // copyModel returns a deep copy of a value-model graph. Only []interface{}

@@ -128,8 +128,7 @@ const (
 // required (directly or via the BACKTRACE_ENDPOINT environment variable).
 //
 // NewClient clones every top-level map and slice, so the caller may reuse or
-// mutate the Config afterwards. Values stored INSIDE attribute maps are
-// retained as given and must not be mutated concurrently with reporting.
+// mutate the Config afterwards.
 type Config struct {
 	// Endpoint is the Backtrace submission URL. Two forms are supported:
 	//
@@ -169,6 +168,8 @@ type Config struct {
 	// value handed to the SDK they are normalised into a detached copy
 	// (see ReportData for the value model), so the map may be reused
 	// after NewClient returns.
+	// Values are converted for the backend as described on
+	// ReportData.Attributes.
 	Attributes map[string]interface{}
 
 	// EnvVars is an exact allowlist of environment variable names to
@@ -223,6 +224,7 @@ type Config struct {
 	// it. Runs on the SDK's worker goroutine — do not call Flush or Close
 	// from inside the hook. A panic inside the hook is recovered and the
 	// report is DROPPED (never sent half-scrubbed) and counted in Stats.
+	// ReportData.Error holds the reported error, for errors.Is and errors.As.
 	//
 	// The hook edits its own copy of the report, attribute values have
 	// the types listed under ReportData ("Value model"), and what it
@@ -263,8 +265,8 @@ type Config struct {
 	MaxStackBytes           int   // raw goroutine dump cap (default 4 MiB)
 	MaxSourceFileBytes      int64 // single source file read cap (default 2 MiB)
 	MaxSourceBytes          int64 // total embedded source per report (default 4 MiB)
-	MaxReportBytes          int   // serialized JSON report cap (default 8 MiB)
-	MaxAttachments          int   // attachments per report (default 16); negative disables attachments
+	MaxReportBytes          int   // serialized JSON report cap (default 8 MiB); larger reports are trimmed first
+	MaxAttachments          int   // attachments per report, breadcrumbs included and counted last (default 16); negative disables attachments
 	MaxAttachmentBytes      int64 // one attachment (default 10 MiB)
 	MaxTotalAttachmentBytes int64 // aggregate attachments per report (default 25 MiB)
 
