@@ -1,5 +1,6 @@
 // Package bthttp provides net/http middleware that reports panics in HTTP
-// handlers to Backtrace.
+// handlers to Backtrace, and an http.RoundTripper that records outbound
+// requests as breadcrumbs.
 //
 //	handler := bthttp.New(bthttp.Options{})
 //	http.ListenAndServe(":8080", handler.Handle(mux))
@@ -41,16 +42,21 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	bt "github.com/backtrace-labs/backtrace-go"
 )
 
 // Attribute length bounds; attacker-controlled request fields are truncated.
 const (
+	maxMethodLength    = 64
 	maxRouteLength     = 2048
 	maxURLLength       = 4096
 	maxHostLength      = 1024
@@ -58,12 +64,20 @@ const (
 	maxUserAgentLength = 2048
 )
 
+const fingerprintAttribute = "_mod_fingerprint"
+
 // Options configures the middleware.
 type Options struct {
 	// Repanic re-raises the panic after reporting so outer middleware or
 	// the net/http server recovery can run. When false the panic is
 	// swallowed and, if the handler had not committed a response, the
-	// middleware writes 500 Internal Server Error.
+	// middleware writes 500 Internal Server Error. The 500 keeps only the
+	// headers set before the request reached the middleware. On a committed
+	// response the middleware panics with http.ErrAbortHandler instead, and
+	// the client sees a broken response.
+	//
+	// A panic with http.ErrAbortHandler is never reported and is always
+	// re-raised.
 	Repanic bool
 
 	// WaitForDelivery blocks the failing request until the report is
@@ -82,15 +96,26 @@ type Options struct {
 	Client *bt.Client
 
 	// SendDefaultPII includes the raw request path, host, remote address,
-	// and user agent with panic reports. Default false: these fields can
-	// carry personal data, tenant identifiers, or session-bearing path
-	// components.
+	// and user agent with the middleware's reports. Default false: these
+	// fields can carry personal data, tenant identifiers, or
+	// session-bearing path components.
 	SendDefaultPII bool
 
 	// RequestAttributes, when set, contributes application-approved
-	// request metadata to panic reports. The returned map is copied by
-	// the SDK; a panic inside the callback is contained and ignored.
+	// request metadata to the middleware's reports. The returned map is
+	// copied by the SDK; a panic inside the callback is contained and
+	// ignored.
 	RequestAttributes func(*http.Request) map[string]interface{}
+
+	// ReportStatus, when set, is called after a handler returns without a
+	// panic, with the status it wrote (200 when it wrote none). When it
+	// returns true, the middleware reports the message "HTTP <status>
+	// <status text>" with the request attributes and "response.status".
+	// The "_mod_fingerprint" attribute groups these reports by status and
+	// route. RequestAttributes can override it.
+	// ReportStatus is not called for hijacked connections. A panic inside it
+	// counts as false.
+	ReportStatus func(status int, r *http.Request) bool
 }
 
 // Handler wraps HTTP handlers with panic reporting.
@@ -128,6 +153,9 @@ func (h *Handler) recoverAndReport(w *trackingWriter, r *http.Request, st *reque
 	if v == nil {
 		return
 	}
+	if v == http.ErrAbortHandler {
+		panic(v)
+	}
 
 	attrs := h.requestAttributes(r, st)
 	if c := h.client(); c != nil {
@@ -143,21 +171,56 @@ func (h *Handler) recoverAndReport(w *trackingWriter, r *http.Request, st *reque
 	if h.opts.Repanic {
 		panic(v)
 	}
+	if w.wroteHeader && !w.hijacked {
+		panic(http.ErrAbortHandler)
+	}
 	// Swallowing the panic means net/http's default handling never runs;
 	// an uncommitted response would otherwise become an empty 200 OK.
 	// Never write after a hijack — the connection no longer belongs to us.
 	if !w.wroteHeader && !w.hijacked {
+		hdr := w.Header()
+		clear(hdr)
+		maps.Copy(hdr, w.outerHeader)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
 }
 
+func (h *Handler) reportStatus(w *trackingWriter, r *http.Request, st *requestState) {
+	if h.opts.ReportStatus == nil || w.hijacked {
+		return
+	}
+	status := http.StatusOK
+	if w.wroteHeader {
+		status = w.status
+	}
+	if !h.safeReportStatus(status, r) {
+		return
+	}
+	c := h.client()
+	if c == nil {
+		return
+	}
+	attrs := h.requestAttributes(r, st)
+	attrs["response.status"] = status
+	if _, set := attrs[fingerprintAttribute]; !set {
+		attrs[fingerprintAttribute] = strings.TrimSpace("bthttp status " + strconv.Itoa(status) + " " + requestRoute(r, st))
+	}
+	message := strings.TrimSpace("HTTP " + strconv.Itoa(status) + " " + http.StatusText(status))
+	c.ReportContext(r.Context(), message, attrs)
+}
+
+func (h *Handler) safeReportStatus(status int, r *http.Request) bool {
+	defer func() { _ = recover() }()
+	return h.opts.ReportStatus(status, r)
+}
+
 func (h *Handler) requestAttributes(r *http.Request, st *requestState) map[string]any {
 	attrs := map[string]interface{}{
-		"request.method": r.Method,
+		"request.method": boundedString(r.Method, maxMethodLength),
 		"request.proto":  r.Proto,
 	}
-	if r.Pattern != "" {
-		attrs["request.route"] = boundedString(r.Pattern, maxRouteLength)
+	if route := requestRoute(r, st); route != "" {
+		attrs["request.route"] = route
 	}
 	if h.opts.SendDefaultPII {
 		attrs["request.url"] = boundedString(r.URL.Path, maxURLLength)
@@ -171,9 +234,35 @@ func (h *Handler) requestAttributes(r *http.Request, st *requestState) map[strin
 	return attrs
 }
 
+func requestRoute(r *http.Request, st *requestState) string {
+	route := r.Pattern
+	if route == "" {
+		if p := st.route.Load(); p != nil {
+			route = *p
+		}
+	}
+	return boundedString(route, maxRouteLength)
+}
+
+// SetRoute sets the "request.route" attribute of the middleware's reports
+// for the request that ctx belongs to. Use it in routers that serve a copy
+// of the request, such as one made with r.WithContext. The Pattern set on
+// such a copy does not reach the middleware. A Pattern the middleware sees
+// still wins. SetRoute does nothing outside a request served by a Handler.
+// The route is capped at 2048 bytes.
+func SetRoute(ctx context.Context, pattern string) {
+	if ctx == nil {
+		return
+	}
+	if st, ok := ctx.Value(requestStateKey{}).(*requestState); ok {
+		st.route.Store(&pattern)
+	}
+}
+
 type requestStateKey struct{}
 
 type requestState struct {
+	route atomic.Pointer[string]
 }
 
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request, next http.Handler) {
@@ -181,8 +270,12 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, next http.Handle
 	inner := r.WithContext(context.WithValue(bt.WithScope(r.Context()), requestStateKey{}, st))
 	defer copyRouteMatch(r, inner)
 	tw := &trackingWriter{ResponseWriter: w}
+	if hdr := w.Header(); len(hdr) > 0 {
+		tw.outerHeader = hdr.Clone()
+	}
 	defer h.recoverAndReport(tw, inner, st)
 	next.ServeHTTP(wrapWriter(tw), inner)
+	h.reportStatus(tw, inner, st)
 }
 
 func copyRouteMatch(dst, src *http.Request) {
@@ -234,6 +327,9 @@ func (h *Handler) safeRequestAttributes(r *http.Request) (out map[string]interfa
 
 func boundedString(s string, max int) string {
 	if len(s) > max {
+		for i := 0; i < utf8.UTFMax && max > 0 && !utf8.RuneStart(s[max]); i++ {
+			max--
+		}
 		return s[:max]
 	}
 	return s
@@ -250,6 +346,7 @@ func boundedString(s string, max int) string {
 // falsely-advertised CloseNotify would block a handler forever.
 type trackingWriter struct {
 	http.ResponseWriter
+	outerHeader http.Header
 	wroteHeader bool
 	status      int
 	hijacked    bool
@@ -263,9 +360,12 @@ func (w *trackingWriter) WriteHeader(code int) {
 	if w.wroteHeader {
 		return
 	}
+	w.ResponseWriter.WriteHeader(code)
+	if code >= 100 && code <= 199 && code != http.StatusSwitchingProtocols {
+		return
+	}
 	w.wroteHeader = true
 	w.status = code
-	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *trackingWriter) Write(p []byte) (int, error) {

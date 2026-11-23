@@ -339,10 +339,10 @@ func TestFlushStartsResponse(t *testing.T) {
 				client, reports := newCaptureClient(t)
 				outer, under := wc.make()
 				h := New(Options{Client: client, WaitForDelivery: true, FlushTimeout: 2 * time.Second})
-				h.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				serveExpectingAbort(t, h.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					fc.flush(t, w)
 					panic("panic after flush")
-				})).ServeHTTP(outer, httptest.NewRequest(http.MethodGet, "/", nil))
+				})), outer, httptest.NewRequest(http.MethodGet, "/", nil))
 
 				if under.flushes != 1 {
 					t.Errorf("the flush reached the writer %d times, want 1", under.flushes)
@@ -447,13 +447,13 @@ func TestWriteStringStartsResponse(t *testing.T) {
 	client, _ := newCaptureClient(t)
 	rec := httptest.NewRecorder()
 	h := New(Options{Client: client})
-	h.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	serveExpectingAbort(t, h.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !implements[io.StringWriter](w) {
 			t.Error("io.StringWriter not offered")
 		}
 		_, _ = io.WriteString(w, "partial")
 		panic("panic after WriteString")
-	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	})), rec, httptest.NewRequest(http.MethodGet, "/", nil))
 
 	if rec.Code != http.StatusOK || rec.Body.String() != "partial" {
 		t.Errorf("response = %d %q, want the handler's 200 \"partial\" untouched", rec.Code, rec.Body.String())
