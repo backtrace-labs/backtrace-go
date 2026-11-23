@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/backtrace-labs/backtrace-go/internal/logbridge"
 )
 
 // Client is an instance-based Backtrace reporter. Multiple independent
@@ -737,6 +739,9 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 		qr.stack = captureStack(true, cfg.MaxStackBytes)
 	} else {
 		qr.pcs = callerPCs()
+		if i := slices.Index(qr.pcs, logbridge.CallSite(in.ctx)); i > 0 {
+			qr.pcs = qr.pcs[i:]
+		}
 		qr.threadName, qr.creator = callerGoroutine()
 	}
 	return c.enqueueContext(ctx, in.lane, clientJob{data: qr})

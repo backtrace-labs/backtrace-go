@@ -2,10 +2,12 @@ package bt_test
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	bt "github.com/backtrace-labs/backtrace-go"
+	"github.com/backtrace-labs/backtrace-go/btslog"
 )
 
 const testPackage = "github.com/backtrace-labs/backtrace-go_test"
@@ -321,5 +324,85 @@ func TestErrorWithoutUsableStackKeepsCallerThread(t *testing.T) {
 	reportFromHelper(c, fmt.Errorf("ctx: %w", stringTraceError{}))
 	if p := next(); p.MainThread != "0" || len(p.Threads) != 1 {
 		t.Errorf("mainThread = %q, threads = %d, want only the reporting goroutine", p.MainThread, len(p.Threads))
+	}
+}
+
+//go:noinline
+func logFromHelper(l *slog.Logger) (line int) {
+	_, _, line, _ = runtime.Caller(0)
+	l.Error("logged", "err", errors.New("boom"))
+	return line + 1
+}
+
+type wrappingHandler struct{ slog.Handler }
+
+func (w wrappingHandler) Handle(ctx context.Context, r slog.Record) error {
+	return w.Handler.Handle(ctx, r)
+}
+
+//go:noinline
+func otherFunctionPC() uintptr {
+	var pcs [1]uintptr
+	runtime.Callers(1, pcs[:])
+	return pcs[0]
+}
+
+func hasSlogFrame(stack []wireFrame) bool {
+	for _, f := range stack {
+		if strings.HasPrefix(f.Library, "log/slog") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSlogReportStartsAtLoggingCall(t *testing.T) {
+	for name, wrap := range map[string]func(slog.Handler) slog.Handler{
+		"btslog handler":        func(h slog.Handler) slog.Handler { return h },
+		"inside a user handler": func(h slog.Handler) slog.Handler { return wrappingHandler{h} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, next := newCaptureClient(t, false)
+			line := logFromHelper(slog.New(wrap(btslog.NewHandler(nil, btslog.Options{Client: c}))))
+			p := next()
+			stack := p.Threads[p.MainThread].Stack
+			if len(stack) < 2 {
+				t.Fatalf("stack = %+v", stack)
+			}
+			want := wireFrame{FuncName: "logFromHelper", Library: testPackage, Line: strconv.Itoa(line)}
+			if stack[0] != want {
+				t.Errorf("innermost frame = %+v, want %+v", stack[0], want)
+			}
+			if stack[1].Library != testPackage+".TestSlogReportStartsAtLoggingCall" {
+				t.Errorf("second frame = %+v, want the subtest function", stack[1])
+			}
+			if hasSlogFrame(stack) {
+				t.Errorf("stack has log/slog frames: %+v", stack)
+			}
+		})
+	}
+}
+
+func TestSlogCallSiteOnlyTrimsAMatchingStack(t *testing.T) {
+	c, next := newCaptureClient(t, false)
+	h := btslog.NewHandler(nil, btslog.Options{Client: c})
+	for name, pc := range map[string]uintptr{"no PC": 0, "PC not on the stack": otherFunctionPC()} {
+		if err := h.Handle(context.Background(), slog.NewRecord(time.Now(), slog.LevelError, name, pc)); err != nil {
+			t.Fatal(err)
+		}
+		p := next()
+		stack := p.Threads[p.MainThread].Stack
+		if len(stack) == 0 || stack[0].FuncName != "TestSlogCallSiteOnlyTrimsAMatchingStack" {
+			t.Errorf("%s: stack = %+v, want it to start at the calling test", name, stack)
+		}
+	}
+}
+
+func TestSlogCallSiteKeepsFullDumpStacks(t *testing.T) {
+	c, next := newCaptureClient(t, true)
+	logFromHelper(slog.New(btslog.NewHandler(nil, btslog.Options{Client: c})))
+	p := next()
+	if stack := p.Threads[p.MainThread].Stack; !hasSlogFrame(stack) {
+		t.Errorf("CaptureAllGoroutines stack = %+v, want the log/slog frames kept", stack)
 	}
 }

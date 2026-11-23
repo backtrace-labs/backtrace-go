@@ -4,6 +4,8 @@ import (
 	"log"
 	"os"
 	"sync/atomic"
+
+	"github.com/backtrace-labs/backtrace-go/internal/logbridge"
 )
 
 // Logger is the minimal logging interface used for SDK diagnostics.
@@ -14,6 +16,10 @@ type Logger interface {
 
 // defaultDiagLogger writes SDK diagnostics to stderr with a stable prefix.
 var defaultDiagLogger Logger = log.New(os.Stderr, "[backtrace] ", log.LstdFlags)
+
+const maxPendingDiagnostics = 16
+
+var pendingDiagnostics atomic.Int32
 
 // diag is an internal logging helper. logf lines are emitted only when debug
 // mode is enabled. warnf lines are always emitted. The reporting API never
@@ -36,6 +42,18 @@ func (d diag) logf(format string, v ...interface{}) {
 	if !d.debug {
 		return
 	}
+	if logbridge.InRecord() {
+		// The Logger may need a lock this goroutine already holds.
+		if pendingDiagnostics.Add(1) > maxPendingDiagnostics {
+			pendingDiagnostics.Add(-1)
+			return
+		}
+		go func() {
+			defer pendingDiagnostics.Add(-1)
+			d.logf(format, v...)
+		}()
+		return
+	}
 	l := d.logger
 	if l == nil {
 		l = defaultDiagLogger
@@ -52,7 +70,7 @@ func (d diag) logf(format string, v ...interface{}) {
 	// application or the SDK worker. Do not recursively attempt to log
 	// this panic.
 	defer func() { _ = recover() }()
-	l.Printf(format, v...)
+	logbridge.WriteDiagnostic(func() { l.Printf(format, v...) })
 }
 
 func (d diag) warnf(format string, v ...interface{}) {

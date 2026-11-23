@@ -324,6 +324,12 @@ type Config struct {
 	// A Logger that calls back into the SDK (a logging-adapter pattern)
 	// is also contained: while a diagnostic line is being written, nested
 	// diagnostics for the same client are suppressed to break recursion.
+	//
+	// When the Logger writes to a btslog handler on the calling goroutine,
+	// SDK diagnostics go to the wrapped handler only. They never become
+	// reports or breadcrumbs. This does not hold for a Logger that passes
+	// its lines to another goroutine first. With Debug on, such a Logger
+	// reports its own diagnostics in a loop.
 	Logger Logger
 }
 

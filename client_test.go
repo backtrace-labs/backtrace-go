@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/backtrace-labs/backtrace-go/internal/logbridge"
 )
 
 func newTestClient(t *testing.T, mutate func(*Config)) (*Client, *recordingServer) {
@@ -758,6 +760,44 @@ func TestReentrantLoggerIsContained(t *testing.T) {
 
 	if got := logger.max.Load(); got > 2 {
 		t.Errorf("re-entrant logger nested to depth %d; guard not effective", got)
+	}
+}
+
+type blockingLogger struct {
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (l *blockingLogger) Printf(string, ...any) {
+	l.calls.Add(1)
+	<-l.release
+}
+
+func TestDiagnosticsWhileHandlingARecordDoNotBlock(t *testing.T) {
+	l := &blockingLogger{release: make(chan struct{})}
+	d := diag{logger: l, debug: true}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		logbridge.HandleRecord(func() {
+			for range 3 * maxPendingDiagnostics {
+				d.logf("line")
+			}
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(l.release)
+		t.Fatal("logf blocked on the Logger while a record was being handled")
+	}
+
+	waitFor(t, "the Logger to take the pending lines", func() bool { return l.calls.Load() == maxPendingDiagnostics })
+	close(l.release)
+	waitFor(t, "the pending lines to drain", func() bool { return pendingDiagnostics.Load() == 0 })
+	if got := l.calls.Load(); got != maxPendingDiagnostics {
+		t.Errorf("Logger got %d lines, want %d: the rest are dropped while the Logger blocks", got, maxPendingDiagnostics)
 	}
 }
 
