@@ -2,19 +2,25 @@ package bt
 
 import (
 	"bytes"
+	"cmp"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	neturl "net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +37,12 @@ const rateLimitFallback = time.Minute
 // lifetime.
 const rateLimitMaxPause = 5 * time.Minute
 
+const (
+	retryBackoffBase = time.Second
+	retryBackoffCap  = 30 * time.Second
+	maxRetryWait     = 60 * time.Second
+)
+
 // httpTransport delivers serialized reports over HTTP. It is safe for
 // concurrent use, applies the configured deadline through an SDK-owned
 // request context (independent of any custom http.Client), verifies
@@ -40,14 +52,19 @@ const rateLimitMaxPause = 5 * time.Minute
 type httpTransport struct {
 	client  *http.Client
 	timeout time.Duration
+	backoff func(retry int) time.Duration
 	// ownsClient is true when the SDK created the http.Client and the
 	// connection pool behind it, so it may close idle connections on
 	// shutdown. A caller-supplied client, like a transport shared with the
 	// rest of the process, is left untouched.
 	ownsClient bool
 
-	mu         sync.Mutex
-	pauseUntil time.Time
+	mu          sync.Mutex
+	pauseUntil  time.Time
+	pauseReason dropReason
+	pauseErr    error
+
+	warnedPermanent atomic.Bool
 }
 
 // noRedirect refuses to follow redirects: a report or multipart body must
@@ -58,7 +75,7 @@ func noRedirect(_ *http.Request, _ []*http.Request) error {
 }
 
 func newHTTPTransport(client *http.Client, timeout time.Duration) *httpTransport {
-	t := &httpTransport{timeout: timeout}
+	t := &httpTransport{timeout: timeout, backoff: fullJitter}
 	if client != nil {
 		// Copy, so the no-redirect policy is enforced without mutating the
 		// caller's shared client.
@@ -92,17 +109,29 @@ func (t *httpTransport) closeIdleConnections() {
 	}
 }
 
-// rateLimited reports whether submissions are currently paused.
-func (t *httpTransport) rateLimited() bool {
+func (t *httpTransport) pauseState() (dropReason, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return time.Now().Before(t.pauseUntil)
+	if time.Now().Before(t.pauseUntil) {
+		return t.pauseReason, t.pauseErr
+	}
+	return 0, nil
 }
 
-func (t *httpTransport) pause(d time.Duration) {
+func (t *httpTransport) pause(d time.Duration, reason dropReason, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pauseUntil = time.Now().Add(d)
+	t.pauseReason = reason
+	t.pauseErr = err
+}
+
+func fullJitter(retry int) time.Duration {
+	ceiling := retryBackoffBase
+	for i := 0; i < retry && ceiling < retryBackoffCap; i++ {
+		ceiling *= 2
+	}
+	return rand.N(min(ceiling, retryBackoffCap))
 }
 
 // inlinePart is an in-memory attachment (e.g. the bt-breadcrumbs-0 file).
@@ -111,53 +140,135 @@ type inlinePart struct {
 	data []byte
 }
 
-// send POSTs body to url under an SDK-owned deadline derived from parent.
-// Attachments, when present, switch the request to the documented multipart
-// form ("upload_file" part for the report JSON, "attachment_<name>" parts
-// for files). It returns the drop reason alongside any error.
-func (t *httpTransport) send(
-	parent context.Context,
-	url string,
-	body []byte,
-	attachments []string,
-	inline []inlinePart,
-	limits multipartLimits,
-	d diag,
-) (dropReason, error) {
-	if t.rateLimited() {
-		return dropRateLimit, errRateLimited
+type payload struct {
+	body        []byte
+	contentType string
+	gzipped     bool
+}
+
+func buildPayload(body []byte, attachments []string, inline []inlinePart, limits multipartLimits, compress bool, warnedInline *atomic.Bool, d diag) (payload, error) {
+	p := payload{body: body, contentType: "application/json"}
+	if len(attachments) > 0 || len(inline) > 0 {
+		data, contentType, err := buildMultipart(body, attachments, inline, limits, warnedInline, d)
+		if err != nil {
+			return payload{}, fmt.Errorf("bt: building multipart request: %w", err)
+		}
+		p.body, p.contentType = data, contentType
 	}
+	if compress {
+		if zipped, err := gzipBytes(p.body); err == nil {
+			p.body, p.gzipped = zipped, true
+		}
+	}
+	return p, nil
+}
+
+func gzipBytes(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+type sendResult struct {
+	reason  dropReason
+	err     error
+	retries int
+}
+
+type attemptResult struct {
+	reason    dropReason
+	err       error
+	retry     bool
+	permanent bool
+}
+
+// send POSTs p.body to url under an SDK-owned deadline derived from parent.
+func (t *httpTransport) send(parent context.Context, url string, p payload, maxRetries int, wait func(time.Duration) bool, d diag) sendResult {
 	if parent == nil {
 		parent = context.Background()
 	}
+	var (
+		retries int
+		waited  time.Duration
+	)
+	if r, stop := t.blocked(parent, retries); stop {
+		return r
+	}
+	for {
+		res := t.attempt(parent, url, p)
+		if res.err == nil {
+			return sendResult{retries: retries}
+		}
+		if res.permanent && t.warnedPermanent.CompareAndSwap(false, true) {
+			d.warnf("%v (destination %s); not retried. Later rejections are logged only with Debug.",
+				res.err, urlOrigin(url))
+		}
+		if !res.retry || retries >= maxRetries || waited >= maxRetryWait {
+			return sendResult{reason: res.reason, err: res.err, retries: retries}
+		}
+		if r, stop := t.blocked(parent, retries); stop {
+			return r
+		}
+		delay := min(t.backoff(retries), maxRetryWait-waited)
+		d.logf("submission attempt %d failed: %v; retrying in %s", retries+1, res.err, delay)
+		if !wait(delay) {
+			return sendResult{reason: dropClosed, err: errors.New("bt: client closed while waiting to retry"), retries: retries}
+		}
+		waited += delay
+		if r, stop := t.blocked(parent, retries); stop {
+			return r
+		}
+		retries++
+	}
+}
+
+func (t *httpTransport) blocked(parent context.Context, retries int) (sendResult, bool) {
+	if reason, err := t.pauseState(); err != nil {
+		return sendResult{reason: reason, err: err, retries: retries}, true
+	}
+	if parent.Err() != nil {
+		return sendResult{reason: dropClosed, err: errors.New("bt: client closed before the report was sent"), retries: retries}, true
+	}
+	return sendResult{}, false
+}
+
+func (t *httpTransport) attempt(parent context.Context, url string, p payload) attemptResult {
 	ctx, cancel := context.WithTimeout(parent, t.timeout)
 	defer cancel()
+	var wrote atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				wrote.Store(true)
+			}
+		},
+	})
 
-	var (
-		reqBody     io.Reader = bytes.NewReader(body)
-		contentType           = "application/json"
-	)
-	if len(attachments) > 0 || len(inline) > 0 {
-		multipartBody, multipartType, err := buildMultipart(body, attachments, inline, limits, d)
-		if err != nil {
-			return dropSerialization, fmt.Errorf("bt: building multipart request: %w", err)
-		}
-		reqBody, contentType = multipartBody, multipartType
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reqBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(p.body))
 	if err != nil {
-		return dropSerialization, fmt.Errorf("bt: building request for %s: %s",
-			redactURL(url), sanitizeHTTPError(err, url))
+		return attemptResult{reason: dropSerialization, err: fmt.Errorf("bt: building request for %s: %s",
+			urlOrigin(url), sanitizeHTTPError(err, url))}
 	}
-	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Content-Type", p.contentType)
 	req.Header.Set("User-Agent", "backtrace-go/"+Version)
+	if p.gzipped {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
 		// Never return an error that retains a credential-bearing URL.
-		return dropNetwork, fmt.Errorf("bt: sending report to %s: %s",
-			redactURL(url), sanitizeHTTPError(err, url))
+		err = fmt.Errorf("bt: sending report to %s: %s", urlOrigin(url), sanitizeHTTPError(err, url))
+		if parent.Err() != nil {
+			return attemptResult{reason: dropClosed, err: err}
+		}
+		return attemptResult{reason: dropNetwork, err: err, retry: !wrote.Load()}
 	}
 	defer func() {
 		// Drain (bounded) so the keep-alive connection can be reused.
@@ -165,23 +276,45 @@ func (t *httpTransport) send(
 		_ = resp.Body.Close()
 	}()
 
+	res := attemptResult{reason: dropServerReject}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return 0, nil
+		return attemptResult{}
 	case resp.StatusCode == http.StatusTooManyRequests:
 		pause := retryAfter(resp)
-		t.pause(pause)
-		return dropRateLimit, fmt.Errorf("bt: server rate limit (429), pausing submissions for %s", pause)
+		t.pause(pause, dropRateLimit, errRateLimited)
+		res.reason = dropRateLimit
+		res.err = fmt.Errorf("bt: server rate limit (429), pausing submissions for %s", pause)
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
 		// Say why: a redirecting gateway is a configuration to fix, and
 		// "rejected" alone does not point at it. The target is not named;
 		// it is whatever the answering server chose to send.
-		return dropServerReject, fmt.Errorf(
+		res.err = fmt.Errorf(
 			"bt: server answered %s; redirects are never followed, set the final URL as the endpoint",
 			resp.Status)
+		res.permanent = true
 	default:
-		return dropServerReject, fmt.Errorf("bt: server rejected report: %s", resp.Status)
+		res.err = fmt.Errorf("bt: server rejected report: %s", resp.Status)
+		res.retry = retryableStatus[resp.StatusCode]
+		res.permanent = permanentStatus[resp.StatusCode]
 	}
+	return res
+}
+
+var retryableStatus = map[int]bool{
+	http.StatusRequestTimeout:      true,
+	http.StatusInternalServerError: true,
+	http.StatusBadGateway:          true,
+	http.StatusServiceUnavailable:  true,
+	http.StatusGatewayTimeout:      true,
+}
+
+var permanentStatus = map[int]bool{
+	http.StatusBadRequest:            true,
+	http.StatusUnauthorized:          true,
+	http.StatusForbidden:             true,
+	http.StatusNotFound:              true,
+	http.StatusRequestEntityTooLarge: true,
 }
 
 // sanitizeHTTPError renders err with every occurrence of the raw URL or its
@@ -194,17 +327,16 @@ func sanitizeHTTPError(err error, rawURL string) string {
 	// The error may come from an application-supplied http.Client, so its
 	// Error method is called behind panic containment.
 	text := safeErrorString(err)
-	if rawURL != "" {
-		text = strings.ReplaceAll(text, rawURL, redactURL(rawURL))
+	if rawURL == "" {
+		return text
 	}
+	origin := urlOrigin(rawURL)
+	text = strings.ReplaceAll(text, rawURL, origin)
 	if u, parseErr := neturl.Parse(rawURL); parseErr == nil {
-		if token := u.Query().Get("token"); token != "" {
-			text = strings.ReplaceAll(text, token, "REDACTED")
-		}
-		segments := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if pathEmbedsToken(u.Hostname(), segments) {
-			text = strings.ReplaceAll(text, segments[1], "REDACTED")
-		}
+		text = strings.ReplaceAll(text, u.String(), origin)
+	}
+	for _, secret := range submissionSecrets(rawURL, "") {
+		text = strings.ReplaceAll(text, secret, "REDACTED")
 	}
 	return text
 }
@@ -247,7 +379,7 @@ func safeMultipartName(path string) string {
 // over-budget files — and files that fail while being read — are skipped,
 // never failing the report itself. Size caps are enforced at read time (a
 // file may grow between stat and copy).
-func buildMultipart(body []byte, attachments []string, inline []inlinePart, limits multipartLimits, d diag) (io.Reader, string, error) {
+func buildMultipart(body []byte, attachments []string, inline []inlinePart, limits multipartLimits, warnedInline *atomic.Bool, d diag) ([]byte, string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 
@@ -372,7 +504,11 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 		size := int64(len(p.data))
 		if count >= limits.maxAttachments || totalBytes+size > limits.maxTotalBytes ||
 			size > limits.maxAttachmentBytes {
-			d.logf("inline attachment %q skipped: attachment budget exhausted", p.name)
+			if warnedInline.CompareAndSwap(false, true) {
+				d.warnf("inline attachment %q skipped: attachment budget exhausted. Later skips are logged only with Debug.", p.name)
+			} else {
+				d.logf("inline attachment %q skipped: attachment budget exhausted", p.name)
+			}
 			continue
 		}
 		part, err := w.CreateFormFile("attachment_"+p.name, p.name)
@@ -389,31 +525,45 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 	if err := w.Close(); err != nil {
 		return nil, "", err
 	}
-	return &buf, w.FormDataContentType(), nil
+	return buf.Bytes(), w.FormDataContentType(), nil
 }
 
-// redactURL hides credentials in diagnostics output: URL userinfo, the
-// ?token= query form, and the submit-style {universe}/{token}/{format}
-// path form.
-func redactURL(u string) string {
-	parsed, err := neturl.Parse(u)
-	if err != nil {
-		return "[REDACTED URL]"
+// Paths, queries and userinfo can carry a submission token.
+func urlOrigin(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "[invalid URL]"
 	}
-	if parsed.User != nil {
-		parsed.User = neturl.User("REDACTED")
+	return u.Scheme + "://" + u.Host
+}
+
+// Token segments count at any depth: an endpoint can sit behind a path prefix.
+func submissionSecrets(rawURL, token string) []string {
+	secrets := []string{token}
+	if u, err := neturl.Parse(rawURL); err == nil {
+		for _, pair := range strings.Split(u.RawQuery, "&") {
+			key, value, _ := strings.Cut(pair, "=")
+			if name, err := neturl.QueryUnescape(key); err == nil && strings.EqualFold(name, "token") {
+				secrets = append(secrets, value)
+				if unescaped, err := neturl.QueryUnescape(value); err == nil {
+					secrets = append(secrets, unescaped)
+				}
+			}
+		}
+		segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+		n := len(segments)
+		for i, segment := range segments {
+			if i == 1 && strings.EqualFold(u.Hostname(), "submit.backtrace.io") ||
+				n >= 3 && i == n-2 && submissionFormats[strings.ToLower(segments[n-1])] ||
+				hexTokenPattern.MatchString(segment) {
+				secrets = append(secrets, segment)
+			}
+		}
 	}
-	q := parsed.Query()
-	if q.Get("token") != "" {
-		q.Set("token", "REDACTED")
-		parsed.RawQuery = q.Encode()
-	}
-	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if pathEmbedsToken(parsed.Hostname(), segments) {
-		segments[1] = "REDACTED"
-		parsed.Path = "/" + strings.Join(segments, "/")
-	}
-	return parsed.String()
+	slices.SortFunc(secrets, func(a, b string) int {
+		return cmp.Or(cmp.Compare(len(b), len(a)), strings.Compare(a, b))
+	})
+	return slices.DeleteFunc(slices.Compact(secrets), func(s string) bool { return s == "" })
 }
 
 // submissionFormats are the final path segments of submit-style URLs

@@ -197,13 +197,6 @@ func panicOnKillFailure() {
 	})
 }
 
-// recoveredFrom runs fn and returns the value it panicked with, or nil.
-func recoveredFrom(fn func()) (recovered interface{}) {
-	defer func() { recovered = recover() }()
-	fn()
-	return nil
-}
-
 func sleepingTracer() *fakeTracer {
 	return &fakeTracer{
 		makeCmd: func() *exec.Cmd { return exec.Command("sleep", "60") },

@@ -1,6 +1,8 @@
 package bt
 
 import (
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,8 +10,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,9 +24,13 @@ type recordingServer struct {
 	mu          sync.Mutex
 	payloads    []map[string]interface{}
 	attachments []map[string]string // parallel to payloads; part name -> content
+	headers     []http.Header       // parallel to payloads
 	status      int
-	block       chan struct{} // when non-nil, handler blocks until closed
-	entered     chan struct{} // signaled when a handler starts blocking
+	statuses    []int                    // consumed one per request before status applies
+	block       chan struct{}            // when non-nil, handler blocks until closed
+	holds       map[string]chan struct{} // error.message -> handler blocks until closed
+	entered     chan struct{}            // signaled when a handler starts blocking
+	requests    int
 	srv         *httptest.Server
 }
 
@@ -32,16 +40,16 @@ func newRecordingServer() *recordingServer {
 		rs.mu.Lock()
 		block := rs.block
 		status := rs.status
+		if len(rs.statuses) > 0 {
+			status, rs.statuses = rs.statuses[0], rs.statuses[1:]
+		}
+		rs.requests++
 		rs.mu.Unlock()
 
-		if block != nil {
-			select {
-			case rs.entered <- struct{}{}:
-			default:
-			}
-			<-block
+		if err := gunzipRequest(r); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
-
 		var payload map[string]interface{}
 		atts := map[string]string{}
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
@@ -70,14 +78,69 @@ func newRecordingServer() *recordingServer {
 			}
 		}
 		if payload != nil {
+			msg, _ := attrsOrNil(payload)["error.message"].(string)
+			rs.mu.Lock()
+			if hold := rs.holds[msg]; hold != nil {
+				block = hold
+			}
+			rs.mu.Unlock()
+		}
+
+		if block != nil {
+			select {
+			case rs.entered <- struct{}{}:
+			default:
+			}
+			<-block
+		}
+
+		if payload != nil {
 			rs.mu.Lock()
 			rs.payloads = append(rs.payloads, payload)
 			rs.attachments = append(rs.attachments, atts)
+			rs.headers = append(rs.headers, r.Header.Clone())
 			rs.mu.Unlock()
 		}
 		w.WriteHeader(status)
 	}))
 	return rs
+}
+
+func gunzipRequest(r *http.Request) error {
+	if r.Header.Get("Content-Encoding") != "gzip" {
+		return nil
+	}
+	zr, err := gzip.NewReader(r.Body)
+	if err != nil {
+		return err
+	}
+	r.Body = io.NopCloser(zr)
+	return nil
+}
+
+func attrsOrNil(payload map[string]any) map[string]any {
+	attrs, _ := payload["attributes"].(map[string]any)
+	return attrs
+}
+
+func (rs *recordingServer) lastHeader() http.Header {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.headers) == 0 {
+		return nil
+	}
+	return rs.headers[len(rs.headers)-1]
+}
+
+func (rs *recordingServer) messages() []string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	var out []string
+	for _, p := range rs.payloads {
+		msg, _ := attrsOrNil(p)["error.message"].(string)
+		out = append(out, msg)
+	}
+	return out
 }
 
 func (rs *recordingServer) lastAttachments() map[string]string {
@@ -109,6 +172,7 @@ func (rs *recordingServer) reset() {
 	defer rs.mu.Unlock()
 	rs.payloads = nil
 	rs.attachments = nil
+	rs.headers = nil
 }
 
 func attrsOf(t *testing.T, payload map[string]interface{}) map[string]interface{} {
@@ -192,8 +256,8 @@ func TestLegacyReportDelivers(t *testing.T) {
 	}
 
 	classifiers, _ := payload["classifiers"].([]interface{})
-	if len(classifiers) == 0 || classifiers[0] != "error" {
-		t.Errorf("classifiers = %v, want [error ...]", classifiers)
+	if len(classifiers) == 0 || classifiers[0] != "*errors.errorString" {
+		t.Errorf("classifiers = %v, want [*errors.errorString ...]", classifiers)
 	}
 }
 
@@ -216,8 +280,8 @@ func TestLegacyReportDoesNotMutateCallerMap(t *testing.T) {
 		t.Error("caller's attribute map was mutated")
 	}
 	attrs := attrsOf(t, legacyServer.last())
-	if attrs["report_type"] != "message" {
-		t.Errorf("report_type = %v, want message", attrs["report_type"])
+	if attrs["report_type"] != "error" {
+		t.Errorf("report_type = %v, want error (v1.0.2 value for messages)", attrs["report_type"])
 	}
 }
 
@@ -381,13 +445,13 @@ func TestLegacyEnvVarsOption(t *testing.T) {
 func resetDefaultClientForTest(t *testing.T) {
 	t.Helper()
 	defaultClientMu.Lock()
-	oldClient := defaultClientV
-	defaultClientV = nil
+	oldClient, oldExplicit := defaultClientV, explicitClient
+	defaultClientV, explicitClient = nil, nil
 	defaultClientMu.Unlock()
 	oldOptions := Options
 	t.Cleanup(func() {
 		defaultClientMu.Lock()
-		defaultClientV = oldClient
+		defaultClientV, explicitClient = oldClient, oldExplicit
 		defaultClientMu.Unlock()
 		Options = oldOptions
 	})
@@ -470,5 +534,109 @@ func TestLegacySetAttributeNilSuppressesDefault(t *testing.T) {
 	}
 	if _, ok := attrsOf(t, legacyServer.last())["hostname"]; ok {
 		t.Error("hostname sent after SetAttribute(hostname, nil)")
+	}
+}
+
+func TestClearedEndpointDisablesLegacyReporting(t *testing.T) {
+	resetDefaultClientForTest(t)
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envToken, "")
+	savedDefault := defaultDiagLogger
+	t.Cleanup(func() {
+		disabledWarnOnce = sync.Once{}
+		defaultDiagLogger = savedDefault
+	})
+	disabledWarnOnce = sync.Once{}
+	rs := newRecordingServer()
+	t.Cleanup(rs.srv.Close)
+	logger := &lineLogger{}
+	defaultDiagLogger = logger
+	Options.Endpoint = rs.srv.URL
+	Options.Token = "test-token"
+
+	Report(errors.New("before"), nil)
+	c := DefaultClient()
+	if c == nil {
+		t.Fatal("DefaultClient = nil with a valid endpoint")
+	}
+	t.Cleanup(c.Close)
+
+	Options.Endpoint = ""
+	if DefaultClient() != nil {
+		t.Error("DefaultClient != nil after the endpoint was cleared")
+	}
+	Report(errors.New("cleared"), nil)
+	escaped := recoveredFrom(func() {
+		defer ReportAndRecoverPanic(nil)
+		panic("not swallowed")
+	})
+	if escaped != "not swallowed" {
+		t.Errorf("ReportAndRecoverPanic swallowed the panic with no endpoint: %v", escaped)
+	}
+
+	Options.Endpoint = "not a url ::"
+	Report(errors.New("invalid"), nil)
+	Report(errors.New("invalid again"), nil)
+
+	Options.Endpoint = rs.srv.URL
+	Report(errors.New("restored"), nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := rs.messages(); !slices.Equal(got, []string{"before", "restored"}) {
+		t.Errorf("delivered %q, want before and restored", got)
+	}
+	if s := c.Stats(); s.Accepted != 2 || s.Delivered != 2 || s.Network != 0 || s.Serialization != 0 {
+		t.Errorf("stats = %+v, want 2 accepted and delivered", s)
+	}
+	if lines := logger.all(); len(lines) != 1 || !strings.HasPrefix(lines[0], "reporting disabled: bt: invalid Config.Endpoint") {
+		t.Errorf("logged %q, want one reporting-disabled warning", lines)
+	}
+}
+
+type reportingLogger struct{ calls atomic.Int32 }
+
+func (l *reportingLogger) Printf(string, ...any) {
+	if l.calls.Add(1) < 100 {
+		Report("from the logger", nil)
+	}
+}
+
+func TestReportingDisabledDiagnosticDoesNotRecurse(t *testing.T) {
+	resetDefaultClientForTest(t)
+	t.Setenv(envEndpoint, "")
+	reentrant := &reportingLogger{}
+	Options.Endpoint = ""
+	Options.DebugBacktrace = true
+	Options.Logger = reentrant
+
+	Report("reentrant", nil)
+	if n := reentrant.calls.Load(); n != 1 {
+		t.Errorf("re-entrant Logger called %d times, want 1", n)
+	}
+}
+
+func TestLegacyMaxBreadcrumbsFixedAtCreation(t *testing.T) {
+	resetDefaultClientForTest(t)
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envToken, "")
+	rs := newRecordingServer()
+	t.Cleanup(rs.srv.Close)
+	Options = OptionsStruct{Endpoint: rs.srv.URL, MaxBreadcrumbs: -1}
+	c := DefaultClient()
+	if c == nil {
+		t.Fatal("DefaultClient = nil with a valid endpoint")
+	}
+	t.Cleanup(c.Close)
+
+	Options.MaxBreadcrumbs = 0
+	ctx := WithScope(context.Background())
+	ScopeFromContext(ctx).AddBreadcrumb(Breadcrumb{Message: "scope"})
+	c.ReportContext(ctx, "x", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if _, ok := rs.lastAttachments()["attachment_bt-breadcrumbs-0"]; ok {
+		t.Error("breadcrumbs sent after MaxBreadcrumbs = -1 at creation")
 	}
 }

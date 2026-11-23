@@ -3,6 +3,7 @@ package bt
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -220,6 +221,40 @@ func TestTruncateUTF8(t *testing.T) {
 	}
 }
 
+func TestErrorClassifier(t *testing.T) {
+	custom := &testWrapErr{msg: "custom"}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"plain", errors.New("x"), "*errors.errorString"},
+		{"wrapped sentinel", fmt.Errorf("ctx: %w", errors.New("x")), "*errors.errorString"},
+		{"multi-wrapped sentinels", fmt.Errorf("%w; %w", errors.New("a"), errors.New("b")), "*errors.errorString"},
+		{"joined sentinel", errors.Join(errors.New("a")), "*errors.errorString"},
+		{"wrapped custom", fmt.Errorf("ctx: %w", custom), "*bt.testWrapErr"},
+		{"custom over sentinel", &testWrapErr{msg: "outer", inner: errors.New("root")}, "*bt.testWrapErr"},
+		{"join takes first branch", fmt.Errorf("ctx: %w", errors.Join(testValueError{}, custom)), "bt.testValueError"},
+		{"innermost wins", &testWrapErr{msg: "outer", inner: testValueError{}}, "bt.testValueError"},
+	}
+	for _, c := range cases {
+		if got := errorClassifier(c.err); got != c.want {
+			t.Errorf("%s: errorClassifier = %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	cyclic := &testWrapErr{msg: "cycle"}
+	cyclic.inner = cyclic
+	if got := errorClassifier(cyclic); got != "*bt.testWrapErr" {
+		t.Errorf("cyclic chain classifier = %q", got)
+	}
+
+	var typedNil *testPanicMethodError
+	if got := errorClassifier(typedNil); got != "*bt.testPanicMethodError" {
+		t.Errorf("typed-nil classifier = %q", got)
+	}
+}
+
 func TestPrepareBreadcrumbLimits(t *testing.T) {
 	long, ok := prepareBreadcrumb(Breadcrumb{Message: strings.Repeat("é", 1000)})
 	if !ok || len(long.Message) > maxBreadcrumbMessageBytes || !utf8.ValidString(long.Message) {
@@ -282,6 +317,20 @@ func TestPrepareBreadcrumbLimits(t *testing.T) {
 
 	if _, ok := prepareBreadcrumb(Breadcrumb{Type: strings.Repeat("t", 5000)}); ok {
 		t.Error("breadcrumb that cannot fit was kept")
+	}
+}
+
+func TestBreadcrumbIDsSeededFromClock(t *testing.T) {
+	jan2026 := uint64(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	if breadcrumbIDSeed < jan2026 || breadcrumbIDSeed > uint64(time.Now().UnixMilli()) {
+		t.Fatalf("seed = %d, want the package start time in Unix ms", breadcrumbIDSeed)
+	}
+	r := newBreadcrumbRing(4)
+	r.add(Breadcrumb{Message: "a"})
+	r.add(Breadcrumb{Message: "b"})
+	crumbs := r.snapshot()
+	if len(crumbs) != 2 || crumbs[0].ID < breadcrumbIDSeed || crumbs[1].ID <= crumbs[0].ID {
+		t.Errorf("ids = %v; want at or above the seed %d and increasing", crumbs, breadcrumbIDSeed)
 	}
 }
 

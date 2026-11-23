@@ -4,10 +4,14 @@
 //	handler := bthttp.New(bthttp.Options{})
 //	http.ListenAndServe(":8080", handler.Handle(mux))
 //
-// Reports are sent through the client configured via bt.Options, or through
-// Options.Client when set. By default only non-identifying request metadata
+// Reports are sent through bt.DefaultClient(), or through Options.Client
+// when set. By default only non-identifying request metadata
 // (method, protocol, registered route pattern) is attached; raw URL, host,
 // remote address, and user agent are gated behind Options.SendDefaultPII.
+//
+// Each request runs under its own bt.Scope. Attributes and breadcrumbs that
+// a handler adds with bt.ScopeFromContext(r.Context()) go on the
+// middleware's reports and on reports made with r.Context().
 //
 // # The response writer
 //
@@ -34,10 +38,12 @@ package bthttp
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	bt "github.com/backtrace-labs/backtrace-go"
@@ -71,7 +77,8 @@ type Options struct {
 	FlushTimeout time.Duration
 
 	// Client sends reports through a specific bt.Client instead of the
-	// global reporter.
+	// global reporter. When nil, bt.DefaultClient() is looked up at each
+	// report.
 	Client *bt.Client
 
 	// SendDefaultPII includes the raw request path, host, remote address,
@@ -99,32 +106,52 @@ func New(opts Options) *Handler {
 	return &Handler{opts: opts}
 }
 
-// Handle wraps next with panic reporting.
+// Handle wraps next with panic reporting. Each request gets a new bt.Scope,
+// a child of any scope its context already carries. Outer middleware still
+// sees the Pattern and path values that an http.ServeMux inside next
+// matched.
 func (h *Handler) Handle(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tw := &trackingWriter{ResponseWriter: w}
-		wrapped := wrapWriter(tw)
-		defer h.recoverAndReport(tw, r)
-		next.ServeHTTP(wrapped, r)
+		h.serve(w, r, next)
 	})
 }
 
-// HandleFunc wraps next with panic reporting.
+// HandleFunc wraps next with panic reporting, as Handle does.
 func (h *Handler) HandleFunc(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tw := &trackingWriter{ResponseWriter: w}
-		wrapped := wrapWriter(tw)
-		defer h.recoverAndReport(tw, r)
-		next(wrapped, r)
+		h.serve(w, r, next)
 	}
 }
 
-func (h *Handler) recoverAndReport(w *trackingWriter, r *http.Request) {
+func (h *Handler) recoverAndReport(w *trackingWriter, r *http.Request, st *requestState) {
 	v := recover()
 	if v == nil {
 		return
 	}
 
+	attrs := h.requestAttributes(r, st)
+	if c := h.client(); c != nil {
+		if h.opts.WaitForDelivery {
+			flushCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.opts.FlushTimeout)
+			c.ReportPanicValueAndFlush(flushCtx, v, attrs)
+			cancel()
+		} else {
+			c.ReportPanicValueContext(r.Context(), v, attrs)
+		}
+	}
+
+	if h.opts.Repanic {
+		panic(v)
+	}
+	// Swallowing the panic means net/http's default handling never runs;
+	// an uncommitted response would otherwise become an empty 200 OK.
+	// Never write after a hijack — the connection no longer belongs to us.
+	if !w.wroteHeader && !w.hijacked {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	}
+}
+
+func (h *Handler) requestAttributes(r *http.Request, st *requestState) map[string]any {
 	attrs := map[string]interface{}{
 		"request.method": r.Method,
 		"request.proto":  r.Proto,
@@ -141,28 +168,51 @@ func (h *Handler) recoverAndReport(w *trackingWriter, r *http.Request) {
 	for k, value := range h.safeRequestAttributes(r) {
 		attrs[k] = value
 	}
+	return attrs
+}
 
-	if h.opts.Client != nil {
-		if h.opts.WaitForDelivery {
-			h.opts.Client.ReportPanicValueAndFlush(v, attrs, h.opts.FlushTimeout)
-		} else {
-			h.opts.Client.ReportPanicValue(v, attrs)
+type requestStateKey struct{}
+
+type requestState struct {
+}
+
+func (h *Handler) serve(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	st := &requestState{}
+	inner := r.WithContext(context.WithValue(bt.WithScope(r.Context()), requestStateKey{}, st))
+	defer copyRouteMatch(r, inner)
+	tw := &trackingWriter{ResponseWriter: w}
+	defer h.recoverAndReport(tw, inner, st)
+	next.ServeHTTP(wrapWriter(tw), inner)
+}
+
+func copyRouteMatch(dst, src *http.Request) {
+	if src.Pattern == "" || src.Pattern == dst.Pattern {
+		return
+	}
+	dst.Pattern = src.Pattern
+	rest := src.Pattern
+	for {
+		open := strings.IndexByte(rest, '{')
+		if open < 0 {
+			return
 		}
-	} else if h.opts.WaitForDelivery {
-		bt.ReportPanicValueAndFlush(v, attrs, h.opts.FlushTimeout)
-	} else {
-		bt.ReportPanicValue(v, attrs)
+		rest = rest[open+1:]
+		end := strings.IndexByte(rest, '}')
+		if end < 0 {
+			return
+		}
+		if name := strings.TrimSuffix(rest[:end], "..."); name != "$" {
+			dst.SetPathValue(name, src.PathValue(name))
+		}
+		rest = rest[end+1:]
 	}
+}
 
-	if h.opts.Repanic {
-		panic(v)
+func (h *Handler) client() *bt.Client {
+	if h.opts.Client != nil {
+		return h.opts.Client
 	}
-	// Swallowing the panic means net/http's default handling never runs;
-	// an uncommitted response would otherwise become an empty 200 OK.
-	// Never write after a hijack — the connection no longer belongs to us.
-	if !w.wroteHeader && !w.hijacked {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-	}
+	return bt.DefaultClient()
 }
 
 // safeRequestAttributes runs the user callback behind panic containment.

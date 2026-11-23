@@ -29,6 +29,9 @@ type StackFrame struct {
 	Library      string `json:"library"`
 	SourceCodeID string `json:"sourceCode,omitempty"`
 	Line         string `json:"line"`
+
+	// Faulted marks the frame that called panic in a panic report.
+	Faulted bool `json:"faulted,omitempty"`
 }
 
 // SourceCode is a source snippet referenced by stack frames.

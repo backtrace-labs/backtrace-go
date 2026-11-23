@@ -1,9 +1,12 @@
 package bt
 
 import (
+	"cmp"
 	"encoding/json"
 	"math"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,17 +36,18 @@ const (
 )
 
 // Breadcrumb is a lightweight trail entry recorded before an error occurs.
+// Reports carry the breadcrumbs in ReportData.Breadcrumbs.
 //
 // Each breadcrumb is limited to 4 KiB of JSON. The message is cut to fit,
 // and the attributes are dropped when they do not fit even without a
 // message. A breadcrumb that still does not fit is discarded.
-// Breadcrumbs are attached to every report as the "breadcrumbs" annotation.
 type Breadcrumb struct {
 	// Timestamp in Unix milliseconds. Filled automatically by AddBreadcrumb
 	// when zero.
 	Timestamp int64 `json:"timestamp"`
 
-	// ID is a monotonically increasing sequence number.
+	// ID is a monotonically increasing sequence number. All clients and
+	// scopes share the sequence.
 	ID uint64 `json:"id"`
 
 	// Level is one of the Breadcrumb level constants; defaults to "info".
@@ -62,13 +66,17 @@ type Breadcrumb struct {
 	Attributes map[string]interface{} `json:"attributes,omitempty"`
 }
 
+var (
+	breadcrumbIDSeed = uint64(time.Now().UnixMilli())
+	breadcrumbIDs    atomic.Uint64
+)
+
 // breadcrumbRing is a fixed-capacity, concurrency-safe ring buffer.
 type breadcrumbRing struct {
 	mu   sync.Mutex
 	buf  []Breadcrumb
-	next uint64 // sequence counter
-	head int    // index of oldest element
-	size int    // number of stored elements
+	head int // index of oldest element
+	size int // number of stored elements
 }
 
 func newBreadcrumbRing(capacity int) *breadcrumbRing {
@@ -163,8 +171,7 @@ func (r *breadcrumbRing) add(b Breadcrumb) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	b.ID = r.next
-	r.next++
+	b.ID = breadcrumbIDSeed + breadcrumbIDs.Add(1) - 1
 	if r.size < len(r.buf) {
 		r.buf[(r.head+r.size)%len(r.buf)] = b
 		r.size++
@@ -195,4 +202,29 @@ func (r *breadcrumbRing) snapshot() []Breadcrumb {
 		out[i] = crumb
 	}
 	return out
+}
+
+func mergeBreadcrumbs(client []Breadcrumb, scopes []*Scope, limit int) []Breadcrumb {
+	if limit <= 0 {
+		return nil
+	}
+	merged := client
+	for _, s := range scopes {
+		merged = append(merged, s.breadcrumbs()...)
+	}
+	slices.SortFunc(merged, func(a, b Breadcrumb) int {
+		return cmp.Or(cmp.Compare(a.Timestamp, b.Timestamp), cmp.Compare(a.ID, b.ID))
+	})
+	if len(merged) > limit {
+		merged = merged[len(merged)-limit:]
+	}
+	return merged
+}
+
+func maxBreadcrumbID(crumbs []Breadcrumb) uint64 {
+	var id uint64
+	for _, b := range crumbs {
+		id = max(id, b.ID)
+	}
+	return id
 }

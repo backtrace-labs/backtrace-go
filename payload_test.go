@@ -1,6 +1,7 @@
 package bt
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -112,6 +113,57 @@ func TestNilAttributeSuppressesDefaults(t *testing.T) {
 	}
 }
 
+func TestBeforeSendOutputIsNormalized(t *testing.T) {
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			r.Attributes["late.nan"] = math.NaN()
+			r.Attributes["late.map"] = map[string]int{"k": 1}
+			r.Attributes["late.nil"] = nil
+			r.Annotations["bad"] = make(chan int)
+			r.Annotations["broken"] = json.RawMessage(`{`)
+			r.Classifiers = []string{"", "custom", ""}
+			r.Breadcrumbs = append(r.Breadcrumbs, Breadcrumb{
+				Message:    "added by hook",
+				Attributes: map[string]any{"inf": math.Inf(-1)},
+			})
+			return r
+		}
+	})
+	c.ReportMessage("hooked", nil)
+	payload := flushOne(t, c, rs)
+
+	attrs := attrsOf(t, payload)
+	if attrs["late.nan"] != "[bt: non-finite float NaN]" {
+		t.Errorf("late.nan = %#v", attrs["late.nan"])
+	}
+	if _, ok := attrs["late.nil"]; ok {
+		t.Error("nil attribute from BeforeSend was sent")
+	}
+	annotations := annotationsOf(t, payload)
+	if m, _ := annotations["late.map"].(map[string]any); m["k"] != float64(1) {
+		t.Errorf("late.map annotation = %#v", annotations["late.map"])
+	}
+	for _, k := range []string{"bad", "broken"} {
+		if s, _ := annotations[k].(string); !strings.Contains(s, "not JSON-encodable") {
+			t.Errorf("annotation %s = %#v, want placeholder", k, annotations[k])
+		}
+	}
+	if classifiers, _ := payload["classifiers"].([]any); len(classifiers) != 1 || classifiers[0] != "custom" {
+		t.Errorf("classifiers = %v, want [custom]", classifiers)
+	}
+
+	var crumbs []map[string]any
+	if err := json.Unmarshal([]byte(rs.lastAttachments()["attachment_bt-breadcrumbs-0"]), &crumbs); err != nil {
+		t.Fatalf("breadcrumb part: %v", err)
+	}
+	if len(crumbs) != 1 || crumbs[0]["message"] != "added by hook" {
+		t.Fatalf("breadcrumbs = %v", crumbs)
+	}
+	if a, _ := crumbs[0]["attributes"].(map[string]any); a["inf"] != "[bt: non-finite float -Inf]" {
+		t.Errorf("hook breadcrumb attributes = %v", crumbs[0]["attributes"])
+	}
+}
+
 func TestEmptyClassifiersAreRestored(t *testing.T) {
 	c, rs := newTestClient(t, func(cfg *Config) {
 		cfg.BeforeSend = func(r *ReportData) *ReportData {
@@ -123,6 +175,39 @@ func TestEmptyClassifiersAreRestored(t *testing.T) {
 	got, _ := flushOne(t, c, rs)["classifiers"].([]any)
 	if len(got) != 1 || got[0] != "message" {
 		t.Errorf("classifiers = %v, want the captured [message]", got)
+	}
+}
+
+func TestBreadcrumbsInBeforeSend(t *testing.T) {
+	var seen []Breadcrumb
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.BeforeSend = func(r *ReportData) *ReportData {
+			seen = append([]Breadcrumb(nil), r.Breadcrumbs...)
+			if r.Attributes["clear"] == true {
+				r.Breadcrumbs = nil
+			}
+			return r
+		}
+	})
+	c.AddBreadcrumb(Breadcrumb{Message: "step", Type: BreadcrumbTypeNavigation, Level: BreadcrumbFatal})
+
+	c.ReportMessage("keep", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if len(seen) != 1 || seen[0].Message != "step" || seen[0].Type != "navigation" || seen[0].Level != "fatal" {
+		t.Errorf("BeforeSend breadcrumbs = %+v", seen)
+	}
+	if _, ok := rs.lastAttachments()["attachment_bt-breadcrumbs-0"]; !ok {
+		t.Error("breadcrumb part missing")
+	}
+
+	c.ReportMessage("clear", map[string]any{"clear": true})
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if _, ok := rs.lastAttachments()["attachment_bt-breadcrumbs-0"]; ok {
+		t.Error("breadcrumb part sent after BeforeSend cleared it")
 	}
 }
 
@@ -141,6 +226,40 @@ func TestUnencodableBreadcrumbDoesNotPoisonReports(t *testing.T) {
 	}
 	if part := rs.lastAttachments()["attachment_bt-breadcrumbs-0"]; len(part) > 2*maxBreadcrumbBytes {
 		t.Errorf("breadcrumb part = %d bytes", len(part))
+	}
+}
+
+func TestErrorTypeAndClassifiers(t *testing.T) {
+	c, rs := newTestClient(t, nil)
+	custom := &testWrapErr{msg: "custom"}
+
+	cases := []struct {
+		name           string
+		report         func()
+		errorType      string
+		classifier     string
+		reportTypeAttr string
+	}{
+		{"error", func() { c.ReportError(fmt.Errorf("ctx: %w", custom), nil) }, "Exception", "*bt.testWrapErr", "error"},
+		{"message", func() { c.ReportMessage("m", nil) }, "Message", "message", "error"},
+		{"panic value", func() { c.ReportPanicValue("boom", nil) }, "Unhandled exception", "panic", "panic"},
+		{"panic error", func() { c.ReportPanicValue(custom, nil) }, "Unhandled exception", "*bt.testWrapErr", "panic"},
+		{"caller error.type", func() { c.ReportMessage("m", map[string]any{"error.type": "Hang"}) }, "Hang", "message", "error"},
+	}
+	for _, tc := range cases {
+		rs.reset()
+		tc.report()
+		payload := flushOne(t, c, rs)
+		attrs := attrsOf(t, payload)
+		if attrs["error.type"] != tc.errorType {
+			t.Errorf("%s: error.type = %v, want %s", tc.name, attrs["error.type"], tc.errorType)
+		}
+		if attrs["report_type"] != tc.reportTypeAttr {
+			t.Errorf("%s: report_type = %v, want %s", tc.name, attrs["report_type"], tc.reportTypeAttr)
+		}
+		if classifiers, _ := payload["classifiers"].([]any); len(classifiers) != 1 || classifiers[0] != tc.classifier {
+			t.Errorf("%s: classifiers = %v, want [%s]", tc.name, classifiers, tc.classifier)
+		}
 	}
 }
 

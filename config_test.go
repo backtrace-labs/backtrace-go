@@ -36,6 +36,9 @@ func TestConfigNormalizeDefaults(t *testing.T) {
 	if cfg.MaxBreadcrumbs != DefaultMaxBreadcrumbs {
 		t.Errorf("MaxBreadcrumbs = %d", cfg.MaxBreadcrumbs)
 	}
+	if cfg.MaxRetries != DefaultMaxRetries || DefaultMaxRetries != 2 {
+		t.Errorf("MaxRetries = %d, want 2", cfg.MaxRetries)
+	}
 }
 
 func TestConfigNormalizePreservesExplicit(t *testing.T) {
@@ -47,6 +50,7 @@ func TestConfigNormalizePreservesExplicit(t *testing.T) {
 		Timeout:          time.Second,
 		MaxErrorDepth:    -1,
 		MaxBreadcrumbs:   -1,
+		MaxRetries:       -1,
 	}.normalize()
 
 	if cfg.ContextLineCount != 3 || cfg.SampleRate != 0.5 || cfg.QueueSize != 7 ||
@@ -58,6 +62,9 @@ func TestConfigNormalizePreservesExplicit(t *testing.T) {
 	}
 	if cfg.MaxBreadcrumbs != -1 {
 		t.Errorf("MaxBreadcrumbs -1 (disabled) not preserved: %d", cfg.MaxBreadcrumbs)
+	}
+	if cfg.MaxRetries != -1 {
+		t.Errorf("MaxRetries -1 (disabled) not preserved: %d", cfg.MaxRetries)
 	}
 }
 
@@ -243,6 +250,10 @@ func TestValidateNeverLeaksToken(t *testing.T) {
 		"https://uni.sp.backtrace.io/post?token=SUPERSECRETTOKEN\x00",
 		"ht tp://x/post?token=SUPERSECRETTOKEN",
 		"https://host:SUPERSECRETTOKEN/post", // token-like text in port position
+		"submit.backtrace.io/universe/SUPERSECRETTOKEN/json",
+		"https//submit.backtrace.io/universe/SUPERSECRETTOKEN/json",
+		"https:submit.backtrace.io/universe/SUPERSECRETTOKEN/json",
+		"bt.corp/universe/SUPERSECRETTOKEN",
 	}
 	for _, endpoint := range cases {
 		_, err := NewClient(Config{Endpoint: endpoint})
@@ -253,6 +264,21 @@ func TestValidateNeverLeaksToken(t *testing.T) {
 		if strings.Contains(err.Error(), "SUPERSECRETTOKEN") {
 			t.Errorf("token leaked through NewClient error: %v", err)
 		}
+	}
+	_, err := NewClient(Config{Endpoint: "https://errors.example.com/post?token=SUPERSECRETTOKEN", Token: "SUPERSECRETTOKEN"})
+	if err == nil || strings.Contains(err.Error(), "SUPERSECRETTOKEN") {
+		t.Errorf("query endpoint with Token: err = %v, want a rejection without the token", err)
+	}
+}
+
+func TestValidateRejectsEmptyFragmentAndQueryMarkers(t *testing.T) {
+	for _, endpoint := range []string{"https://errors.example.com/#", "https://errors.example.com#", "https://errors.example.com/x?", "https://errors.example.com?"} {
+		if _, err := NewClient(Config{Endpoint: endpoint, Token: "project-token"}); err == nil {
+			t.Errorf("endpoint %q with Token accepted; the token would not reach /post", endpoint)
+		}
+	}
+	if _, err := NewClient(Config{Endpoint: "https://errors.example.com/json?"}); err != nil {
+		t.Errorf("tokenless endpoint with an empty query rejected: %v", err)
 	}
 }
 

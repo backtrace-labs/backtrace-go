@@ -195,9 +195,7 @@ func buildPutURL(endpoint, token string) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		// Do not wrap err: *url.Error quotes the raw URL, and net/url
-		// inner errors can embed quoted input fragments too. The
-		// endpoint should not carry credentials (the token is a
-		// separate argument), but redact defensively anyway.
+		// inner errors can embed quoted input fragments too.
 		msg := "unparsable URL"
 		var ue *url.Error
 		if errors.As(err, &ue) && ue.Err != nil {
@@ -205,7 +203,7 @@ func buildPutURL(endpoint, token string) (string, error) {
 				msg = inner
 			}
 		}
-		return "", fmt.Errorf("invalid endpoint (%s): %s", msg, redactURL(endpoint))
+		return "", fmt.Errorf("invalid endpoint (%s)", msg)
 	}
 
 	// Endpoints without the scheme prefix (or at the very least a '//`
@@ -300,9 +298,9 @@ func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) erro
 	t.put = uploader{endpoint: putURL, options: options}
 	t.putMu.Unlock()
 
-	// Diagnostics carry the redacted URL only: the query embeds the token.
+	// Diagnostics carry the origin only: the query embeds the token.
 	t.Logf(LogDebug, "Put enabled (endpoint: %s, unlink: %v)\n",
-		redactURL(putURL), options.Unlink)
+		urlOrigin(putURL), options.Unlink)
 
 	return nil
 }
@@ -411,7 +409,7 @@ func (t *BTTracer) putSnapshotFile(path string) (err error) {
 		io.LimitReader(body, info.Size()))
 	if err != nil {
 		return fmt.Errorf("building upload request for %s: %s",
-			redactURL(u.endpoint), sanitizeHTTPError(err, u.endpoint))
+			urlOrigin(u.endpoint), sanitizeHTTPError(err, u.endpoint))
 	}
 	req.ContentLength = info.Size()
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -420,7 +418,7 @@ func (t *BTTracer) putSnapshotFile(path string) (err error) {
 	if err != nil {
 		// Never surface an error retaining the credential-bearing URL.
 		return fmt.Errorf("upload to %s failed: %s",
-			redactURL(u.endpoint), sanitizeHTTPError(err, u.endpoint))
+			urlOrigin(u.endpoint), sanitizeHTTPError(err, u.endpoint))
 	}
 	defer func() {
 		// Drain (bounded) so the keep-alive connection can be reused
@@ -430,7 +428,7 @@ func (t *BTTracer) putSnapshotFile(path string) (err error) {
 	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("upload to %s failed: %s", redactURL(u.endpoint), resp.Status)
+		return fmt.Errorf("upload to %s failed: %s", urlOrigin(u.endpoint), resp.Status)
 	}
 
 	if u.options.Unlink {

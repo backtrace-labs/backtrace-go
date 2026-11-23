@@ -1,6 +1,7 @@
 package bt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptrace"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -55,57 +57,60 @@ func TestRetryAfterParsing(t *testing.T) {
 
 func TestTransportPause(t *testing.T) {
 	tr := newHTTPTransport(nil, time.Second)
-	if tr.rateLimited() {
-		t.Error("fresh transport is rate limited")
+	if _, err := tr.pauseState(); err != nil {
+		t.Error("fresh transport is paused")
 	}
-	tr.pause(time.Minute)
-	if !tr.rateLimited() {
-		t.Error("pause not applied")
+	tr.pause(time.Minute, dropRateLimit, errRateLimited)
+	if reason, err := tr.pauseState(); err != errRateLimited || reason != dropRateLimit {
+		t.Errorf("pauseState = (%v, %v), want (dropRateLimit, errRateLimited)", reason, err)
 	}
-	reason, err := tr.send(context.Background(), "http://127.0.0.1:1/unused",
-		[]byte("{}"), nil, nil, multipartLimits{}, diag{})
-	if err != errRateLimited || reason != dropRateLimit {
-		t.Errorf("send while paused = (%v, %v), want (dropRateLimit, errRateLimited)", reason, err)
+	res := tr.send(context.Background(), "http://127.0.0.1:1/unused",
+		payload{body: []byte("{}")}, 2, func(time.Duration) bool { return true }, diag{})
+	if res.err != errRateLimited || res.reason != dropRateLimit {
+		t.Errorf("send while paused = (%v, %v), want (dropRateLimit, errRateLimited)", res.reason, res.err)
 	}
 }
 
-func TestRedactURL(t *testing.T) {
-	in := "https://example.com/post?format=json&token=supersecret"
-	out := redactURL(in)
-	if out == in {
-		t.Error("token not redacted")
+func TestURLOrigin(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://example.com/post?format=json&token=supersecret", "https://example.com"},
+		{"https://submit.backtrace.io/universe/secret-token/json", "https://submit.backtrace.io"},
+		{"https://user:secretpw@host:6098/x", "https://host:6098"},
+		{"https://[::1]:6098/post?token=t", "https://[::1]:6098"},
+		{"submit.backtrace.io/universe/secret-token/json", "[invalid URL]"},
+		{"https:submit.backtrace.io/universe/secret-token/json", "[invalid URL]"},
+		{"http://%zz\x7f", "[invalid URL]"},
 	}
-	if want := "token=REDACTED"; !strings.Contains(out, want) {
-		t.Errorf("redacted URL %q missing %q", out, want)
+	for _, c := range cases {
+		if got := urlOrigin(c.in); got != c.want {
+			t.Errorf("urlOrigin(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
-	// submit.backtrace.io embeds the token as the second path segment.
-	if got := redactURL("https://submit.backtrace.io/universe/secret-token/json"); got != "https://submit.backtrace.io/universe/REDACTED/json" {
-		t.Errorf("submit path token not redacted: %q", got)
-	}
-	// Two-segment form (no trailing /json) still carries the token.
-	if got := redactURL("https://submit.backtrace.io/universe/secret-token"); got != "https://submit.backtrace.io/universe/REDACTED" {
-		t.Errorf("2-segment submit path token not redacted: %q", got)
-	}
-	// Self-hosted/aliased gateways with the submit path shape: format suffix.
-	if got := redactURL("https://errors.mycorp.com/universe/sometoken/json"); got != "https://errors.mycorp.com/universe/REDACTED/json" {
-		t.Errorf("aliased submit path (format suffix) not redacted: %q", got)
-	}
-	// ... or a hex-shaped token.
+}
+
+func TestSubmissionSecrets(t *testing.T) {
 	hexTok := "51cc8e69c5b62fa8c72dc963e730f1e8"
-	if got := redactURL("https://errors.mycorp.com/universe/" + hexTok); got != "https://errors.mycorp.com/universe/REDACTED" {
-		t.Errorf("aliased submit path (hex token) not redacted: %q", got)
+	cases := []struct {
+		url, token string
+		want       []string
+	}{
+		{"https://submit.backtrace.io/universe/secret-token/json", "", []string{"secret-token"}},
+		{"https://submit.backtrace.io/universe/secret-token", "", []string{"secret-token"}},
+		{"https://submit.backtrace.io/universe/secret-token/json/extra", "", []string{"secret-token"}},
+		{"https://errors.mycorp.com/universe/sometoken/json", "", []string{"sometoken"}},
+		{"https://proxy.corp/backtrace/universe/sometoken/json", "", []string{"sometoken"}},
+		{"https://errors.mycorp.com/universe/" + hexTok, "", []string{hexTok}},
+		{"https://uni.sp.backtrace.io/post?format=json&token=a%26b", "", []string{"a%26b", "a&b"}},
+		{"https://uni.sp.backtrace.io:6098", "cfg-token", []string{"cfg-token"}},
+		{"https://uni.sp.backtrace.io/post?token=cfg-token", "cfg-token", []string{"cfg-token"}},
+		{"https://submit.backtrace.io/uni/abcdefgh12345678/json", "abcdefgh", []string{"abcdefgh12345678", "abcdefgh"}},
+		{"https://uni.sp.backtrace.io/api/post", "", nil},
+		{"http://%zz", "cfg-token", []string{"cfg-token"}},
 	}
-	// Plain API paths never match the token shape.
-	if got := redactURL("https://uni.sp.backtrace.io/api/post"); got != "https://uni.sp.backtrace.io/api/post" {
-		t.Errorf("tokenless URL modified: %q", got)
-	}
-	// URL userinfo is redacted.
-	if got := redactURL("https://user:secretpw@host/x"); strings.Contains(got, "secretpw") {
-		t.Errorf("userinfo not redacted: %q", got)
-	}
-	// Unparsable input degrades to a fixed placeholder, never the raw string.
-	if got := redactURL("http://%zz\x7f"); got != "[REDACTED URL]" {
-		t.Errorf("unparsable URL leaked: %q", got)
+	for _, c := range cases {
+		if got := submissionSecrets(c.url, c.token); !slices.Equal(got, c.want) {
+			t.Errorf("submissionSecrets(%q, %q) = %q, want %q", c.url, c.token, got, c.want)
+		}
 	}
 }
 
@@ -124,6 +129,20 @@ func TestSanitizeHTTPError(t *testing.T) {
 	pathErr := errors.New(`Post "` + pathRaw + `": connection refused`)
 	if out := sanitizeHTTPError(pathErr, pathRaw); strings.Contains(out, "secrettoken123") {
 		t.Errorf("path token leaked through sanitized error: %q", out)
+	}
+
+	prefixed := "https://proxy.corp/backtrace/universe/prefixedtoken42/json"
+	if out := sanitizeHTTPError(errors.New(`Post "`+prefixed+`": connection refused`), prefixed); out != `Post "https://proxy.corp": connection refused` {
+		t.Errorf("sanitized error = %q, want only the scheme and host of the URL", out)
+	}
+	partial := errors.New("POST /backtrace/universe/prefixedtoken42/json: refused")
+	if out := sanitizeHTTPError(partial, prefixed); out != "POST /backtrace/universe/REDACTED/json: refused" {
+		t.Errorf("sanitized partial path = %q, want the token replaced", out)
+	}
+	spaced := "https://proxy.corp/back trace/universe/prefixedtoken42/json"
+	reencoded := errors.New(`Post "https://proxy.corp/back%20trace/universe/prefixedtoken42/json": refused`)
+	if out := sanitizeHTTPError(reencoded, spaced); out != `Post "https://proxy.corp": refused` {
+		t.Errorf("sanitized re-encoded URL = %q, want only the scheme and host", out)
 	}
 }
 
@@ -168,7 +187,7 @@ func TestNoCrossOriginRedirect(t *testing.T) {
 
 	// The transport error says what happened, without naming the target.
 	tr := newHTTPTransport(nil, time.Second)
-	_, err = tr.send(context.Background(), serverA.URL, []byte("{}"), nil, nil, multipartLimits{}, diag{})
+	err = sendOnce(tr, serverA.URL)
 	if err == nil || !strings.Contains(err.Error(), "redirects are never followed") {
 		t.Errorf("a refused redirect is reported as %v", err)
 	}
@@ -243,7 +262,7 @@ func TestOwnedClientHasItsOwnConnections(t *testing.T) {
 	}
 
 	owned := newHTTPTransport(nil, time.Second)
-	if _, err := owned.send(context.Background(), srv.URL, []byte("{}"), nil, nil, multipartLimits{}, diag{}); err != nil {
+	if err := sendOnce(owned, srv.URL); err != nil {
 		t.Fatalf("send through the SDK's own client: %v", err)
 	}
 	if owned.client.Transport == nil || owned.client.Transport == http.DefaultTransport {
@@ -272,7 +291,7 @@ func TestReplacedDefaultTransportIsNotOwned(t *testing.T) {
 	if tr.ownsClient {
 		t.Error("a transport shared with the process is reported as owned")
 	}
-	if _, err := tr.send(context.Background(), srv.URL, []byte("{}"), nil, nil, multipartLimits{}, diag{}); err != nil {
+	if err := sendOnce(tr, srv.URL); err != nil {
 		t.Fatalf("send through the replaced default transport: %v", err)
 	}
 	if counting.trips.Load() != 1 {
@@ -297,11 +316,16 @@ func (c *countingRoundTripper) RoundTrip(r *http.Request) (*http.Response, error
 
 func (c *countingRoundTripper) CloseIdleConnections() { c.closed.Add(1) }
 
+func sendOnce(tr *httpTransport, url string) error {
+	p := payload{body: []byte("{}"), contentType: "application/json"}
+	return tr.send(context.Background(), url, p, 0, func(time.Duration) bool { return true }, diag{}).err
+}
+
 // multipartParts builds a submission and returns its attachment parts in
 // the order they appear, as name -> content.
 func multipartParts(t *testing.T, files []string, inline []inlinePart, limits multipartLimits) (names []string, content map[string]string) {
 	t.Helper()
-	body, contentType, err := buildMultipart([]byte(`{}`), files, inline, limits, diag{})
+	body, contentType, err := buildMultipart([]byte(`{}`), files, inline, limits, new(atomic.Bool), diag{})
 	if err != nil {
 		t.Fatalf("buildMultipart: %v", err)
 	}
@@ -310,7 +334,7 @@ func multipartParts(t *testing.T, files []string, inline []inlinePart, limits mu
 		t.Fatalf("content type %q: %v", contentType, err)
 	}
 	content = map[string]string{}
-	reader := multipart.NewReader(body, params["boundary"])
+	reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
 	for {
 		part, err := reader.NextPart()
 		if err == io.EOF {
@@ -386,6 +410,127 @@ func TestInlinePartKeepsItsName(t *testing.T) {
 	}
 	if content["attachment_bt-breadcrumbs-0_1"] != "a file, not breadcrumbs" {
 		t.Errorf("the clashing file was not kept under a new name: %v", content)
+	}
+}
+
+func breadcrumbPartLines(logs *lineLogger) []string {
+	var out []string
+	for _, line := range logs.all() {
+		if strings.Contains(line, "bt-breadcrumbs-0") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func reportWithBreadcrumb(t *testing.T, c *Client) {
+	t.Helper()
+	c.AddBreadcrumb(Breadcrumb{Message: "checkout started"})
+	c.Report(errors.New("checkout failed"), nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("report not delivered")
+	}
+}
+
+func writeAttachment(t *testing.T, dir, name string, size int) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestInlinePartBudgetSkipWarnsOnce(t *testing.T) {
+	dir := t.TempDir()
+	small := writeAttachment(t, dir, "app.log", 10)
+	large := writeAttachment(t, dir, "dump.bin", 1000)
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"files fill MaxAttachments", func(cfg *Config) {
+			cfg.MaxAttachments = 1
+			cfg.AttachmentPaths = []string{small}
+		}},
+		{"part alone exceeds MaxAttachmentBytes", func(cfg *Config) {
+			cfg.MaxAttachmentBytes = 16
+		}},
+		{"files use up MaxTotalAttachmentBytes", func(cfg *Config) {
+			cfg.MaxAttachmentBytes = 1024
+			cfg.MaxTotalAttachmentBytes = 1024
+			cfg.AttachmentPaths = []string{large}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &lineLogger{}
+			c, rs := newTestClient(t, func(cfg *Config) {
+				cfg.Logger = logs
+				tc.mutate(cfg)
+			})
+
+			reportWithBreadcrumb(t, c)
+			lines := breadcrumbPartLines(logs)
+			if len(lines) != 1 || !strings.HasSuffix(lines[0], "Later skips are logged only with Debug.") {
+				t.Fatalf("warnings after the first report = %q, want one", lines)
+			}
+
+			reportWithBreadcrumb(t, c)
+			if lines := breadcrumbPartLines(logs); len(lines) != 1 {
+				t.Errorf("warnings after the second report = %q, want the first one only", lines)
+			}
+			if _, ok := rs.lastAttachments()["attachment_bt-breadcrumbs-0"]; ok {
+				t.Error("the breadcrumb part was sent despite the budget")
+			}
+		})
+	}
+}
+
+func TestInlinePartSkipStaysQuiet(t *testing.T) {
+	path := writeAttachment(t, t.TempDir(), "app.log", 10)
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		sent   bool
+	}{
+		{"attachments disabled", func(cfg *Config) { cfg.MaxAttachments = -1 }, false},
+		{"room for everything", func(*Config) {}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &lineLogger{}
+			c, rs := newTestClient(t, func(cfg *Config) {
+				cfg.Logger = logs
+				cfg.AttachmentPaths = []string{path}
+				tc.mutate(cfg)
+			})
+			reportWithBreadcrumb(t, c)
+			if lines := breadcrumbPartLines(logs); len(lines) != 0 {
+				t.Errorf("logged without Debug: %q", lines)
+			}
+			if _, ok := rs.lastAttachments()["attachment_bt-breadcrumbs-0"]; ok != tc.sent {
+				t.Errorf("breadcrumb part sent = %t, want %t", ok, tc.sent)
+			}
+		})
+	}
+}
+
+func TestInlinePartLaterSkipsLogWithDebug(t *testing.T) {
+	logs := &lineLogger{}
+	d := diag{logger: logs, debug: true}
+	warned := new(atomic.Bool)
+	crumbs := []inlinePart{{name: "bt-breadcrumbs-0", data: []byte(`[{"id":0}]`)}}
+	limits := multipartLimits{maxAttachments: 16, maxAttachmentBytes: 4, maxTotalBytes: 1 << 20}
+	for range 2 {
+		if _, _, err := buildMultipart([]byte(`{}`), nil, crumbs, limits, warned, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lines := logs.all()
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], "Later skips are logged only with Debug.") ||
+		lines[1] != `inline attachment "bt-breadcrumbs-0" skipped: attachment budget exhausted` {
+		t.Errorf("lines = %q, want the one-time warning then a plain Debug line", lines)
 	}
 }
 

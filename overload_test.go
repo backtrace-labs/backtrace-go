@@ -6,9 +6,49 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type countingError struct {
+	msg   string
+	calls atomic.Int32
+}
+
+func (e *countingError) Error() string {
+	e.calls.Add(1)
+	return e.msg
+}
+
+type countingStringer struct{ calls atomic.Int32 }
+
+func (s *countingStringer) String() string {
+	s.calls.Add(1)
+	return "stringer"
+}
+
+func TestClosedClientDropsBeforeCapture(t *testing.T) {
+	c, _ := newTestClient(t, nil)
+	c.Close()
+
+	err := &countingError{msg: "after close"}
+	attr := &countingStringer{}
+	c.ReportError(err, map[string]any{"lazy": attr})
+	start := time.Now()
+	if c.ReportPanicValueAndFlush(timeoutCtx(t, 5*time.Second), err, nil) {
+		t.Error("ReportPanicValueAndFlush = true on a closed client")
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Errorf("ReportPanicValueAndFlush on a closed client waited %v", waited)
+	}
+	if n := err.calls.Load() + attr.calls.Load(); n != 0 {
+		t.Errorf("reports on a closed client ran %d Error/String calls, want none", n)
+	}
+	if s := c.Stats(); s.Closed != 2 {
+		t.Errorf("stats = %+v, want Closed 2", s)
+	}
+}
 
 var errSentinel = errors.New("sentinel")
 

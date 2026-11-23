@@ -15,10 +15,10 @@ type Logger interface {
 // defaultDiagLogger writes SDK diagnostics to stderr with a stable prefix.
 var defaultDiagLogger Logger = log.New(os.Stderr, "[backtrace] ", log.LstdFlags)
 
-// diag is an internal logging helper. Diagnostics are emitted only when
-// debug mode is enabled; the reporting API never panics and never writes to
-// stdout/stderr unless debugging was requested. (The bcd tracing
-// integration has its own logging and panic semantics; see GlobalConfig.)
+// diag is an internal logging helper. logf lines are emitted only when debug
+// mode is enabled. warnf lines are always emitted. The reporting API never
+// panics. (The bcd tracing integration has its own logging and panic
+// semantics; see GlobalConfig.)
 type diag struct {
 	logger Logger
 	debug  bool
@@ -53,4 +53,9 @@ func (d diag) logf(format string, v ...interface{}) {
 	// this panic.
 	defer func() { _ = recover() }()
 	l.Printf(format, v...)
+}
+
+func (d diag) warnf(format string, v ...interface{}) {
+	d.debug = true
+	d.logf(format, v...)
 }

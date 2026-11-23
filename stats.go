@@ -24,6 +24,7 @@ const (
 type internalStats struct {
 	accepted  atomic.Uint64
 	delivered atomic.Uint64
+	retries   atomic.Uint64
 	drops     [dropReasonCount]atomic.Uint64
 }
 
@@ -43,9 +44,11 @@ func (s *internalStats) droppedTotal() uint64 {
 // broken down by outcome. Accepted counts reports admitted to the queue;
 // Delivered counts successful submissions; the remaining fields count
 // discarded reports by reason.
+// Retries counts extra delivery attempts and is not a drop.
 type ClientStats struct {
 	Accepted      uint64
 	Delivered     uint64
+	Retries       uint64
 	Sampled       uint64
 	QueueFull     uint64
 	Closed        uint64
@@ -65,6 +68,7 @@ func (s *internalStats) snapshot() ClientStats {
 	return ClientStats{
 		Accepted:      s.accepted.Load(),
 		Delivered:     s.delivered.Load(),
+		Retries:       s.retries.Load(),
 		Sampled:       s.drops[dropSampled].Load(),
 		QueueFull:     s.drops[dropQueueFull].Load(),
 		Closed:        s.drops[dropClosed].Load(),

@@ -4,12 +4,14 @@ package bt
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -309,6 +311,51 @@ func TestDirectPutContainsPanickingClient(t *testing.T) {
 		}
 		if !errors.Is(err, ErrTracerCallback) {
 			t.Errorf("%s = %v, want an error wrapping ErrTracerCallback", name, err)
+		}
+	}
+}
+
+type putLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *putLog) Logf(_ LogPriority, format string, v ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+}
+
+func (l *putLog) SetLogLevel(LogPriority) {}
+
+func TestPutKeepsTokenOutOfLogsAndNetworkErrors(t *testing.T) {
+	const token = "s3cr3t-upload-credential"
+	snapshot := filepath.Join(t.TempDir(), "snap.btt")
+	if err := os.WriteFile(snapshot, []byte("snapshot-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	closed := httptest.NewServer(http.NotFoundHandler())
+	endpoint := closed.URL
+	closed.Close()
+
+	logs := &putLog{}
+	tr := New(NewOptions{})
+	tr.SetLogger(logs)
+	if err := tr.ConfigurePut(endpoint, token, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	err := tr.Put([]byte(snapshot))
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Errorf("Put to a closed endpoint = %v, want a network error without the token", err)
+	}
+	logs.mu.Lock()
+	defer logs.mu.Unlock()
+	if !slices.ContainsFunc(logs.lines, func(line string) bool { return strings.Contains(line, "Put enabled") }) {
+		t.Fatalf("log lines = %q, want the Put enabled line", logs.lines)
+	}
+	for _, line := range logs.lines {
+		if strings.Contains(line, token) {
+			t.Errorf("token in tracer log line %q", line)
 		}
 	}
 }

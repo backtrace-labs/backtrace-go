@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -58,9 +59,9 @@ type ReportData struct {
 	Timestamp int64
 
 	// Classifiers group the report in the Backtrace UI; the SDK sets
-	// exactly one of "error", "panic", or "message". Error-graph type
-	// names are reported via the "error.type" attribute and the
-	// "Error Chain" annotation, not as classifiers.
+	// exactly one: the error's Go type, such as "*json.SyntaxError",
+	// "message" for messages or "panic" for other panic values. Crash
+	// reports use the classifiers listed under MonitorCrashes.
 	Classifiers []string
 
 	// Attributes are indexed key/value pairs used for search and
@@ -70,22 +71,31 @@ type ReportData struct {
 	Attributes map[string]interface{}
 
 	// Annotations carry larger, non-indexed structured data
-	// (environment variables, error chains, dependencies, breadcrumbs).
+	// (environment variables, error chains, dependencies).
 	Annotations map[string]interface{}
 
-	// Threads maps thread IDs to captured goroutine stacks.
+	// Threads maps thread IDs to captured goroutine stacks. An error that
+	// recorded where it was created, as github.com/pkg/errors errors do,
+	// adds that stack under "origin".
 	Threads map[string]Thread
 
 	// SourceCode maps source snippet IDs referenced by stack frames.
 	SourceCode map[string]SourceCode
 
-	// MainThread is the key in Threads of the faulting goroutine.
+	// MainThread is the key in Threads of the faulting goroutine, or
+	// "origin" when the error carries its own stack.
 	MainThread string
 
 	// Attachments lists file paths uploaded with the report as
 	// "attachment_<basename>" multipart parts. Seeded from
-	// Config.AttachmentPaths; BeforeSend may add or remove entries.
+	// Config.AttachmentPaths and the report's scopes; BeforeSend may add
+	// or remove entries.
 	Attachments []string
+
+	// Breadcrumbs are the client's and the scopes' breadcrumbs at capture
+	// time, oldest first. They are uploaded as an attachment and count
+	// against the attachment limits. BeforeSend may edit or clear them.
+	Breadcrumbs []Breadcrumb
 
 	// Error is the reported error, or nil for messages, other panic values
 	// and crash reports. It is not a copy and it is not sent. BeforeSend can
@@ -255,36 +265,38 @@ type errorChainLink struct {
 	Message  string `json:"message"`
 }
 
-// unwrapErrorChain walks err's unwrap graph — both Unwrap() error and
+type errorNode struct {
+	err    error
+	depth  int
+	parent *int
+	source string
+}
+
+// walkErrorGraph walks err's unwrap graph — both Unwrap() error and
 // Unwrap() []error (errors.Join) forms — bounded by depth and total node
 // count, with cycle detection. All application-defined methods are invoked
 // behind panic containment. A maxDepth < 0 disables capture.
-func unwrapErrorChain(err error, maxDepth, maxNodes int) []errorChainLink {
+func walkErrorGraph(err error, maxDepth, maxNodes int) []errorNode {
 	if err == nil || maxDepth < 0 || maxNodes < 1 {
 		return nil
 	}
-	links := make([]errorChainLink, 0, 8)
+	nodes := make([]errorNode, 0, 8)
 	seen := make(map[string]struct{})
 
 	var visit func(current error, depth int, parent *int, source string)
 	visit = func(current error, depth int, parent *int, source string) {
-		if current == nil || depth > maxDepth || len(links) >= maxNodes {
+		if current == nil || depth > maxDepth || len(nodes) >= maxNodes {
 			return
 		}
-		key := errorVisitKey(current)
-		if _, exists := seen[key]; exists {
-			return
+		if key, ok := errorVisitKey(current); ok {
+			if _, exists := seen[key]; exists {
+				return
+			}
+			seen[key] = struct{}{}
 		}
-		seen[key] = struct{}{}
 
-		id := len(links)
-		links = append(links, errorChainLink{
-			ID:       id,
-			ParentID: parent,
-			Source:   source,
-			Type:     fmt.Sprintf("%T", current),
-			Message:  safeErrorString(current),
-		})
+		id := len(nodes)
+		nodes = append(nodes, errorNode{err: current, depth: depth, parent: parent, source: source})
 		parentID := id
 
 		if many := safeUnwrapMany(current); many != nil {
@@ -297,17 +309,77 @@ func unwrapErrorChain(err error, maxDepth, maxNodes int) []errorChainLink {
 	}
 
 	visit(err, 0, nil, "")
-	return links
+	return nodes
 }
 
 // errorVisitKey identifies an error for cycle detection: pointer identity
-// where available, type+message otherwise.
-func errorVisitKey(err error) string {
+// where available. Other errors have no key and are never skipped.
+func errorVisitKey(err error) (string, bool) {
 	rv := reflect.ValueOf(err)
-	if rv.IsValid() && rv.Kind() == reflect.Pointer && !rv.IsNil() {
-		return fmt.Sprintf("%T@%x", err, rv.Pointer())
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		return fmt.Sprintf("%T@%x", err, rv.Pointer()), true
 	}
-	return fmt.Sprintf("%T:%s", err, safeErrorString(err))
+	return "", false
+}
+
+func errorChainLinks(nodes []errorNode) []errorChainLink {
+	if len(nodes) == 0 {
+		return nil
+	}
+	links := make([]errorChainLink, len(nodes))
+	for i, n := range nodes {
+		links[i] = errorChainLink{
+			ID:       i,
+			ParentID: n.parent,
+			Source:   n.source,
+			Type:     fmt.Sprintf("%T", n.err),
+			Message:  truncateUTF8(safeErrorString(n.err), maxErrorMessageBytes),
+		}
+	}
+	return links
+}
+
+func errorOriginPCs(nodes []errorNode) []uintptr {
+	var (
+		origin []uintptr
+		depth  = -1
+	)
+	for _, n := range nodes {
+		if n.depth <= depth {
+			continue
+		}
+		if pcs := errorStackPCs(n.err); len(pcs) > 0 {
+			origin, depth = pcs, n.depth
+		}
+	}
+	return origin
+}
+
+func errorStackPCs(err error) (pcs []uintptr) {
+	defer func() {
+		if recover() != nil {
+			pcs = nil
+		}
+	}()
+	if c, ok := err.(interface{ Callers() []uintptr }); ok {
+		callers := c.Callers()
+		return slices.Clone(callers[:min(len(callers), maxCallerFrames)])
+	}
+	method := reflect.ValueOf(err).MethodByName("StackTrace")
+	if !method.IsValid() {
+		return nil
+	}
+	if t := method.Type(); t.NumIn() != 0 || t.NumOut() != 1 ||
+		t.Out(0).Kind() != reflect.Slice || t.Out(0).Elem().Kind() != reflect.Uintptr {
+		return nil
+	}
+	trace := method.Call(nil)[0]
+	pcs = make([]uintptr, min(trace.Len(), maxCallerFrames))
+	for i := range pcs {
+		pcs[i] = uintptr(trace.Index(i).Uint())
+	}
+	return pcs
 }
 
 func safeUnwrapOne(err error) (out error) {
@@ -324,4 +396,33 @@ func safeUnwrapMany(err error) (out []error) {
 		return append([]error(nil), u.Unwrap()...)
 	}
 	return nil
+}
+
+var genericErrorTypes = map[string]bool{
+	"errors.errorString":                true,
+	"fmt.wrapError":                     true,
+	"fmt.wrapErrors":                    true,
+	"errors.joinError":                  true,
+	"github.com/pkg/errors.fundamental": true,
+	"github.com/pkg/errors.withStack":   true,
+	"github.com/pkg/errors.withMessage": true,
+}
+
+func errorClassifier(err error) string {
+	var path []reflect.Type
+	for current := err; current != nil && len(path) <= DefaultMaxErrorDepth; {
+		path = append(path, reflect.TypeOf(current))
+		if many := safeUnwrapMany(current); len(many) > 0 {
+			current = many[0]
+		} else {
+			current = safeUnwrapOne(current)
+		}
+	}
+	for i := len(path) - 1; i >= 0; i-- {
+		t := path[i]
+		if t.Kind() != reflect.Pointer || !genericErrorTypes[t.Elem().PkgPath()+"."+t.Elem().Name()] {
+			return t.String()
+		}
+	}
+	return path[len(path)-1].String()
 }

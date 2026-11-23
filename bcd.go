@@ -789,7 +789,7 @@ type panicError struct {
 }
 
 func (p *panicError) Error() string {
-	return safeSprint(p.v)
+	return printValue(p.v)
 }
 
 // Establishes a panic handler that will execute the specified Tracer in

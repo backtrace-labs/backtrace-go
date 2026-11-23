@@ -24,9 +24,20 @@
 //
 // Configure Options before the first report. For runtime attribute changes
 // use SetAttribute (safe for concurrent use) instead of mutating
-// Options.Attributes.
+// Options.Attributes. SetDefaultClient makes these functions use a Client
+// of your own.
 //
-// # Scope
+// # Request scopes
+//
+// Client attributes and breadcrumbs apply to every report. For data that
+// belongs to one request, attach a Scope to the request's context and report
+// with that context:
+//
+//	ctx = bt.WithScope(ctx)
+//	bt.ScopeFromContext(ctx).SetAttribute("user.id", id)
+//	client.ReportContext(ctx, err, nil)
+//
+// # What is reported
 //
 // This SDK reports errors, messages, and recovered panics from within the
 // process. It cannot capture crashes that bypass Go panics (native/cgo
@@ -35,8 +46,11 @@
 package bt
 
 import (
+	"context"
 	"net/http"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -84,9 +98,13 @@ type OptionsStruct struct {
 	// Config.SendMachineID. Default false.
 	SendMachineID bool
 	// Logger receives diagnostics when DebugBacktrace is on.
+	// It also receives the one-time warnings described on Config.Logger.
 	Logger Logger
 	// HTTPClient overrides the submission HTTP client.
 	HTTPClient *http.Client
+	// DisableCompression sends request bodies uncompressed; see
+	// Config.DisableCompression.
+	DisableCompression bool
 	// Timeout is the per-request submission deadline (default 30s).
 	// Applied when the default client is created (first report).
 	Timeout time.Duration
@@ -147,6 +165,7 @@ func optionsToConfig() Config {
 		SendMachineID:            Options.SendMachineID,
 		Logger:                   Options.Logger,
 		HTTPClient:               Options.HTTPClient,
+		DisableCompression:       Options.DisableCompression,
 		Timeout:                  Options.Timeout,
 		ShutdownTimeout:          Options.ShutdownTimeout,
 		QueueSize:                Options.QueueSize,
@@ -160,36 +179,47 @@ func optionsToConfig() Config {
 var (
 	defaultClientMu sync.Mutex
 	defaultClientV  *Client
+	explicitClient  *Client
 
 	// disabledWarnOnce rate-limits the unconditional misconfiguration
 	// warning to a single line per process.
 	disabledWarnOnce sync.Once
+	disabledDiagBusy atomic.Int32
 )
 
-// defaultClient lazily creates the client backing the legacy global API.
-// Returns nil while Options.Endpoint (and BACKTRACE_ENDPOINT) are unset or
-// invalid: the global API is then a safe no-op.
-func defaultClient() *Client {
+// SetDefaultClient makes the package-level functions report through c
+// instead of the client configured by Options. Options is not read while c
+// is set. SetDefaultClient(nil) returns to the Options-based client. The
+// caller still owns c and closes it.
+func SetDefaultClient(c *Client) {
 	defaultClientMu.Lock()
+	explicitClient = c
+	defaultClientMu.Unlock()
+}
+
+// DefaultClient returns the client the package-level functions report
+// through: the one passed to SetDefaultClient, otherwise a client created
+// from Options on first use. It returns nil when that client cannot be
+// created, for example while no endpoint is configured or an Options field
+// is invalid. The package-level functions are then no-ops.
+func DefaultClient() *Client {
+	defaultClientMu.Lock()
+	if c := explicitClient; c != nil {
+		defaultClientMu.Unlock()
+		return c
+	}
 	if defaultClientV != nil {
 		c := defaultClientV
 		defaultClientMu.Unlock()
+		if legacyEndpoint() == "" {
+			return nil
+		}
 		return c
 	}
 	cfg := optionsToConfig()
 	if err := cfg.validate(); err != nil {
 		defaultClientMu.Unlock()
-		// Log outside the lock: the logger is application code.
-		diag{logger: cfg.Logger, debug: cfg.Debug}.logf("reporting disabled: %v", err)
-		// An endpoint was configured but rejected: the application
-		// clearly intended reporting, so surface the misconfiguration
-		// once even without debug mode (an empty endpoint stays
-		// silent — that is the documented no-op mode).
-		if cfg.Endpoint != "" {
-			disabledWarnOnce.Do(func() {
-				defaultDiagLogger.Printf("reporting disabled: %v", err)
-			})
-		}
+		logReportingDisabled(cfg, err)
 		return nil
 	}
 	// The legacy client re-reads Options on every report so historical
@@ -202,12 +232,26 @@ func defaultClient() *Client {
 	return c
 }
 
-// Report sends an error report through the legacy global reporter. object
-// may be an error or any value convertible to a string; nil is ignored.
-// extraAttributes are added to this report only. Safe no-op while the SDK
-// is unconfigured. Never blocks on network I/O.
+// Call without defaultClientMu held. The Logger is application code.
+func logReportingDisabled(cfg Config, err error) {
+	diag{logger: cfg.Logger, debug: cfg.Debug, busy: &disabledDiagBusy}.logf("reporting disabled: %v", err)
+	// An endpoint was configured but rejected: the application
+	// clearly intended reporting, so surface the misconfiguration
+	// once even without debug mode (an empty endpoint stays
+	// silent — that is the documented no-op mode).
+	if cfg.Endpoint != "" {
+		disabledWarnOnce.Do(func() {
+			defaultDiagLogger.Printf("reporting disabled: %v", err)
+		})
+	}
+}
+
+// Report sends an error report through the default client (see
+// DefaultClient). object may be an error or any value convertible to a
+// string; nil is ignored. extraAttributes are added to this report only.
+// Safe no-op while the SDK is unconfigured. Never blocks on network I/O.
 func Report(object interface{}, extraAttributes map[string]interface{}) {
-	if c := defaultClient(); c != nil {
+	if c := DefaultClient(); c != nil {
 		c.Report(object, extraAttributes)
 	}
 }
@@ -216,10 +260,20 @@ func Report(object interface{}, extraAttributes map[string]interface{}) {
 // WITHOUT instantiating the default client — the helpers run on every
 // deferred return, and client startup belongs on the (rare) panic path.
 func reportingConfigured() bool {
-	if currentDefaultClient() != nil {
+	if explicitDefaultClient() != nil {
 		return true
 	}
+	if currentDefaultClient() != nil {
+		return legacyEndpoint() != ""
+	}
 	return optionsToConfig().validate() == nil
+}
+
+func legacyEndpoint() string {
+	if Options.Endpoint != "" {
+		return Options.Endpoint
+	}
+	return os.Getenv(envEndpoint)
 }
 
 // ReportPanic reports a panic and re-panics with the original value, after
@@ -240,8 +294,10 @@ func ReportPanic(extraAttributes map[string]interface{}) {
 	if v == nil {
 		return
 	}
-	if c := defaultClient(); c != nil {
-		_ = c.ReportPanicValueAndFlush(v, extraAttributes, DefaultFlushTimeout)
+	if c := DefaultClient(); c != nil {
+		if _, delivered := c.reportPanicAndWait(context.Background(), v, extraAttributes); delivered {
+			markDeliveredPanic(v)
+		}
 	}
 	panic(v)
 }
@@ -257,7 +313,7 @@ func ReportAndRecoverPanic(extraAttributes map[string]interface{}) {
 	if v == nil {
 		return
 	}
-	if c := defaultClient(); c != nil {
+	if c := DefaultClient(); c != nil {
 		c.ReportPanicValue(v, extraAttributes)
 		return
 	}
@@ -267,30 +323,38 @@ func ReportAndRecoverPanic(extraAttributes map[string]interface{}) {
 }
 
 // ReportPanicValue reports an already-recovered panic value through the
-// legacy global reporter without re-panicking or blocking. Intended for
+// default client without re-panicking or blocking. Intended for
 // middleware and custom recover() handlers.
 func ReportPanicValue(value interface{}, extraAttributes map[string]interface{}) {
-	if c := defaultClient(); c != nil {
+	if c := DefaultClient(); c != nil {
 		c.ReportPanicValue(value, extraAttributes)
 	}
 }
 
 // ReportPanicValueAndFlush reports an already-recovered panic value and
-// waits for its delivery under one deadline. Returns false when the SDK is
+// waits for its delivery under one deadline, as
+// Client.ReportPanicValueAndFlush does. Returns false when the SDK is
 // unconfigured or delivery did not complete in time.
-func ReportPanicValueAndFlush(value interface{}, extraAttributes map[string]interface{}, timeout time.Duration) bool {
-	if c := defaultClient(); c != nil {
-		return c.ReportPanicValueAndFlush(value, extraAttributes, timeout)
+func ReportPanicValueAndFlush(ctx context.Context, value any, extraAttributes map[string]any) bool {
+	if c := DefaultClient(); c != nil {
+		return c.ReportPanicValueAndFlush(ctx, value, extraAttributes)
 	}
 	return false
 }
 
 // SetAttribute sets a global attribute included in every subsequent report.
 // Safe for concurrent use; prefer this over mutating Options.Attributes.
+// A nil value removes the attribute from reports, including SDK defaults
+// such as "hostname". While a client is set with SetDefaultClient, the
+// attribute is set on that client.
 //
 // The value is normalised and copied before it is stored, so changing a map
 // or slice after the call returns does not change later reports.
 func SetAttribute(key string, value interface{}) {
+	if c := explicitDefaultClient(); c != nil {
+		c.SetAttribute(key, value)
+		return
+	}
 	// Normalise before taking the lock: it may run the value's own
 	// MarshalJSON / MarshalText / Error methods, which are application code.
 	frozen := freezeValue(value, legacyValueLimits())
@@ -303,8 +367,13 @@ func SetAttribute(key string, value interface{}) {
 }
 
 // SetAttributes sets multiple global attributes atomically.
-// Values are normalised and copied before they are stored.
+// Values are normalised and copied before they are stored. While a client is
+// set with SetDefaultClient, they are set on that client.
 func SetAttributes(attrs map[string]interface{}) {
+	if c := explicitDefaultClient(); c != nil {
+		c.SetAttributes(attrs)
+		return
+	}
 	frozen := freezeAttributes(attrs, legacyValueLimits())
 	legacyAttrMu.Lock()
 	if Options.Attributes == nil {
@@ -318,14 +387,15 @@ func SetAttributes(attrs map[string]interface{}) {
 
 // legacyValueLimits is the normalisation budget for values stored through
 // the package-level SetAttribute(s). It deliberately does not read
-// bt.Options: those fields are not synchronised.
+// bt.Options: those fields are not synchronised. Scopes use it too.
 func legacyValueLimits() valueLimits {
 	return valueLimits{maxTotalBytes: DefaultMaxReportBytes}
 }
 
-// AddBreadcrumb records a breadcrumb on the legacy global reporter.
+// AddBreadcrumb records a breadcrumb on the default client (see
+// DefaultClient).
 func AddBreadcrumb(b Breadcrumb) {
-	if c := defaultClient(); c != nil {
+	if c := DefaultClient(); c != nil {
 		c.AddBreadcrumb(b)
 	}
 }
@@ -333,13 +403,27 @@ func AddBreadcrumb(b Breadcrumb) {
 // Flush blocks until reports queued at the time of the call are processed
 // or timeout elapses, reporting whether the drain completed. The reporter
 // stays fully usable afterwards. Flushing proves local processing and send
-// completion, not backend acceptance.
+// completion, not backend acceptance. While a client is set with
+// SetDefaultClient, Flush also waits for the Options-based client, under the
+// same timeout.
 func Flush(timeout time.Duration) bool {
-	c := currentDefaultClient()
-	if c == nil {
-		return true
+	var clients []*Client
+	for _, c := range []*Client{explicitDefaultClient(), currentDefaultClient()} {
+		if c != nil {
+			clients = append(clients, c)
+		}
 	}
-	return c.Flush(timeout)
+	targets := make([][laneCount]uint64, len(clients))
+	for i, c := range clients {
+		targets[i] = c.acceptedTargets()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	drained := true
+	for i, c := range clients {
+		drained = c.flushTargetContext(ctx, targets[i]) && drained
+	}
+	return drained
 }
 
 // FinishSendingReports blocks until queued reports are sent (bounded by the
@@ -351,9 +435,15 @@ func FinishSendingReports() {
 	Flush(DefaultTimeout)
 }
 
-// currentDefaultClient returns the default client without creating one.
+// currentDefaultClient returns the Options-based client without creating one.
 func currentDefaultClient() *Client {
 	defaultClientMu.Lock()
 	defer defaultClientMu.Unlock()
 	return defaultClientV
+}
+
+func explicitDefaultClient() *Client {
+	defaultClientMu.Lock()
+	defer defaultClientMu.Unlock()
+	return explicitClient
 }

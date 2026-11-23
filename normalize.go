@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"unicode/utf8"
 )
@@ -11,6 +12,8 @@ import (
 const (
 	maxErrorMessageBytes = 1024
 	maxExactFloatInt     = 1 << 53
+	maxPrintDepth        = 32
+	maxPrintNodes        = 10000
 	messageAnnotation    = "Message"
 )
 
@@ -90,6 +93,78 @@ func normalizeAttributes(attrs, annotations map[string]any) {
 func encodeComposite(v any) json.RawMessage {
 	data, _ := json.Marshal(freezeValue(v, valueLimits{}))
 	return data
+}
+
+func printValue(v any) string {
+	// fmt has no cycle detection: a self-referencing map would overflow the stack.
+	budget := maxPrintNodes
+	if !boundedValue(reflect.ValueOf(v), 0, &budget) {
+		return fmt.Sprintf("<%T: cyclic or too large to print>", v)
+	}
+	return safeSprint(v)
+}
+
+// Follows fmt: values with Format, Error or String methods and pointers below the top level are not walked.
+func boundedValue(rv reflect.Value, depth int, budget *int) bool {
+	*budget--
+	if *budget < 0 || depth > maxPrintDepth {
+		return false
+	}
+	if rv.IsValid() && rv.CanInterface() {
+		switch rv.Interface().(type) {
+		case fmt.Formatter, error, fmt.Stringer:
+			return true
+		}
+	}
+	switch rv.Kind() {
+	case reflect.Pointer:
+		if depth > 0 || rv.IsNil() {
+			return true
+		}
+		switch rv.Elem().Kind() {
+		case reflect.Array, reflect.Slice, reflect.Struct, reflect.Map:
+			return boundedValue(rv.Elem(), depth+1, budget)
+		}
+	case reflect.Interface:
+		if rv.IsNil() {
+			return true
+		}
+		return boundedValue(rv.Elem(), depth+1, budget)
+	case reflect.Map:
+		if flatKind(rv.Type().Key().Kind()) && flatKind(rv.Type().Elem().Kind()) {
+			return true
+		}
+		iter := rv.MapRange()
+		for iter.Next() {
+			if !boundedValue(iter.Key(), depth+1, budget) || !boundedValue(iter.Value(), depth+1, budget) {
+				return false
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		if flatKind(rv.Type().Elem().Kind()) {
+			return true
+		}
+		for i := 0; i < rv.Len(); i++ {
+			if !boundedValue(rv.Index(i), depth+1, budget) {
+				return false
+			}
+		}
+	case reflect.Struct:
+		for i := 0; i < rv.NumField(); i++ {
+			if !boundedValue(rv.Field(i), depth+1, budget) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func flatKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+		return false
+	}
+	return true
 }
 
 func encodeAnnotations(annotations map[string]any) map[string]json.RawMessage {

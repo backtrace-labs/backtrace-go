@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,9 +35,12 @@ func newTestClient(t *testing.T, mutate func(*Config)) (*Client, *recordingServe
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
+	c.transport.backoff = noBackoff
 	t.Cleanup(c.Close)
 	return c, rs
 }
+
+func noBackoff(int) time.Duration { return 0 }
 
 // Test binaries built by Go 1.26 and older carry no dependency list.
 func standInModules(t *testing.T, modules ...moduleDependency) {
@@ -45,6 +49,12 @@ func standInModules(t *testing.T, modules ...moduleDependency) {
 	saved := buildInfoModules
 	buildInfoModules = modules
 	t.Cleanup(func() { buildInfoModules = saved })
+}
+
+func timeoutCtx(t *testing.T, d time.Duration) context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	t.Cleanup(cancel)
+	return ctx
 }
 
 func TestNewClientValidation(t *testing.T) {
@@ -295,7 +305,7 @@ func TestErrorChainCapture(t *testing.T) {
 	c.Flush(5 * time.Second)
 
 	attrs := attrsOf(t, rs.last())
-	if attrs["error.type"] != "*fmt.wrapError" {
+	if attrs["error.type"] != "Exception" {
 		t.Errorf("error.type = %v", attrs["error.type"])
 	}
 	annotations, _ := rs.last()["annotations"].(map[string]interface{})
@@ -320,19 +330,11 @@ func TestBreadcrumbsRingAndAnnotation(t *testing.T) {
 	c.Flush(5 * time.Second)
 
 	annotations, _ := rs.last()["annotations"].(map[string]interface{})
-	crumbs, _ := annotations["breadcrumbs"].([]interface{})
-	if len(crumbs) != 8 {
-		t.Fatalf("breadcrumb count = %d, want 8 (ring capacity)", len(crumbs))
-	}
-	first, _ := crumbs[0].(map[string]interface{})
-	if first["message"] != "crumb 4" {
-		t.Errorf("oldest breadcrumb = %v, want crumb 4 (eviction order)", first["message"])
-	}
-	if first["level"] != "info" || first["type"] != "manual" {
-		t.Errorf("breadcrumb defaults not applied: %v", first)
+	if _, dup := annotations["breadcrumbs"]; dup {
+		t.Error("breadcrumbs duplicated into the JSON annotations")
 	}
 
-	// Breadcrumbs also ship as the bt-breadcrumbs-0 attachment the
+	// Breadcrumbs ship as the bt-breadcrumbs-0 attachment the
 	// Backtrace UI reads (same schema as the other Backtrace SDKs).
 	atts := rs.lastAttachments()
 	raw, ok := atts["attachment_bt-breadcrumbs-0"]
@@ -343,9 +345,20 @@ func TestBreadcrumbsRingAndAnnotation(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &fileCrumbs); err != nil {
 		t.Fatalf("breadcrumb attachment is not a JSON array: %v", err)
 	}
-	if len(fileCrumbs) != 8 || fileCrumbs[0]["message"] != "crumb 4" {
-		t.Errorf("breadcrumb attachment content wrong: %d entries, first %v",
-			len(fileCrumbs), fileCrumbs[0])
+	if len(fileCrumbs) != 8 {
+		t.Fatalf("breadcrumb count = %d, want 8 (ring capacity)", len(fileCrumbs))
+	}
+	first := fileCrumbs[0]
+	if first["message"] != "crumb 4" {
+		t.Errorf("oldest breadcrumb = %v, want crumb 4 (eviction order)", first["message"])
+	}
+	if first["level"] != "info" || first["type"] != "manual" {
+		t.Errorf("breadcrumb defaults not applied: %v", first)
+	}
+
+	lastID := fileCrumbs[7]["id"]
+	if got := attrsOf(t, rs.last())["breadcrumbs.lastId"]; got != lastID {
+		t.Errorf("breadcrumbs.lastId = %v, want newest id %v", got, lastID)
 	}
 }
 
@@ -381,9 +394,16 @@ func TestPanicAndFlushRetriesFullQueue(t *testing.T) {
 		t.Errorf("non-blocking panic with full queue: QueueFull = %d, want %d", got, before+1)
 	}
 
+	// Fills the one-slot priority queue. The report stays queued after the
+	// call gives up.
+	if c.ReportPanicValueAndFlush(timeoutCtx(t, 50*time.Millisecond), "fills the priority queue", nil) {
+		t.Fatal("ReportPanicValueAndFlush = true while the worker is stuck")
+	}
+
 	done := make(chan bool, 1)
+	ctx := timeoutCtx(t, 10*time.Second)
 	go func() {
-		done <- c.ReportPanicValueAndFlush("panic while queue full", nil, 10*time.Second)
+		done <- c.ReportPanicValueAndFlush(ctx, "panic while queue full", nil)
 	}()
 
 	select {
@@ -405,8 +425,8 @@ func TestPanicAndFlushRetriesFullQueue(t *testing.T) {
 	if !c.Flush(5 * time.Second) {
 		t.Fatal("Flush timed out")
 	}
-	if rs.count() != 3 {
-		t.Errorf("reports delivered = %d, want 3 (panic report lost?)", rs.count())
+	if rs.count() != 4 {
+		t.Errorf("reports delivered = %d, want 4 (panic report lost?)", rs.count())
 	}
 }
 
@@ -536,6 +556,9 @@ func TestAttachmentsMultipartSubmission(t *testing.T) {
 	got := make(chan received, 1)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := gunzipRequest(r); err != nil {
+			t.Errorf("gzip body: %v", err)
+		}
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
 			t.Errorf("expected multipart submission: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
@@ -641,9 +664,56 @@ func TestPublicReportingContainsApplicationPanics(t *testing.T) {
 	mustNotPanic(t, "Report", func() { c.Report(testPanicStringer{}, nil) })
 	mustNotPanic(t, "ReportPanicValue", func() { c.ReportPanicValue(testPanicStringer{}, nil) })
 	mustNotPanic(t, "ReportPanicValueAndFlush", func() {
-		c.ReportPanicValueAndFlush(testPanicStringer{}, nil, 100*time.Millisecond)
+		c.ReportPanicValueAndFlush(timeoutCtx(t, 100*time.Millisecond), testPanicStringer{}, nil)
 	})
+	ctx := WithScope(context.Background())
+	ScopeFromContext(ctx).SetAttribute("stringer", testPanicStringer{})
+	ScopeFromContext(ctx).AddBreadcrumb(Breadcrumb{Attributes: map[string]any{"stringer": testPanicStringer{}}})
+	mustNotPanic(t, "ReportContext", func() { c.ReportContext(ctx, err, nil) })
+	mustNotPanic(t, "ReportPanicValueContext", func() { c.ReportPanicValueContext(ctx, testPanicStringer{}, nil) })
 	mustNotPanic(t, "Flush", func() { _ = c.Flush(time.Second) })
+}
+
+type selfNode struct{ Next *selfNode }
+
+type namedTree struct {
+	name  string
+	nodes map[string]any
+}
+
+func (t namedTree) String() string { return "tree " + t.name }
+
+func TestReportedValuesWithCyclesAreBounded(t *testing.T) {
+	c, rs := newTestClient(t, func(cfg *Config) { cfg.MaxRetries = -1 })
+	cyclicMap := map[string]any{}
+	cyclicMap["self"] = cyclicMap
+	cyclicSlice := []any{nil}
+	cyclicSlice[0] = cyclicSlice
+	node := &selfNode{}
+	node.Next = node
+	tree := namedTree{name: "root", nodes: map[string]any{}}
+	tree.nodes["self"] = tree.nodes
+
+	c.Report(cyclicMap, nil)
+	c.ReportPanicValue(cyclicSlice, nil)
+	c.Report(node, nil)
+	c.Report(tree, nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	got := rs.messages()
+	want := []string{
+		"<map[string]interface {}: cyclic or too large to print>",
+		"<[]interface {}: cyclic or too large to print>",
+		fmt.Sprint(node),
+		"tree root",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("messages = %q, want %q", got, want)
+	}
+	if msg := (&panicError{cyclicMap}).Error(); msg != want[0] {
+		t.Errorf("panicError text = %q, want %q", msg, want[0])
+	}
 }
 
 // reentrantLogger forwards every diagnostic line back into the SDK — the
@@ -886,6 +956,8 @@ func TestNilClientIsSafe(t *testing.T) {
 	c.ReportError(errors.New("ignored"), nil)
 	c.ReportMessage("ignored", nil)
 	c.ReportPanicValue("ignored", nil)
+	c.ReportContext(WithScope(context.Background()), "ignored", nil)
+	c.ReportPanicValueContext(context.Background(), "ignored", nil)
 	c.SetAttribute("k", "v")
 	c.SetAttributes(map[string]interface{}{"k": "v"})
 	c.AddBreadcrumb(Breadcrumb{Message: "ignored"})
@@ -901,7 +973,7 @@ func TestNilClientIsSafe(t *testing.T) {
 	if !c.FlushContext(context.Background()) {
 		t.Error("FlushContext on nil client should trivially succeed")
 	}
-	if !c.ReportPanicValueAndFlush("v", nil, time.Millisecond) {
+	if !c.ReportPanicValueAndFlush(timeoutCtx(t, time.Millisecond), "v", nil) {
 		t.Error("ReportPanicValueAndFlush on nil client should trivially succeed")
 	}
 	if !c.CloseContext(context.Background()) {
@@ -1146,8 +1218,8 @@ func TestBeforeSendEditsStayInOneReport(t *testing.T) {
 			}
 			r.Attributes["cfg"].(map[string]interface{})["first-only"] = true
 			r.Attributes["client"].(map[string]interface{})["first-only"] = true
-			if crumbs, ok := r.Annotations["breadcrumbs"].([]Breadcrumb); ok && len(crumbs) > 0 {
-				crumbs[0].Attributes["first-only"] = true
+			if len(r.Breadcrumbs) > 0 {
+				r.Breadcrumbs[0].Attributes["first-only"] = true
 			}
 			if deps, ok := r.Annotations["Dependencies"].(map[string]map[string]string); ok {
 				if dep, ok := deps["example.com/dep"]; ok {
@@ -1335,13 +1407,11 @@ func TestBreadcrumbAttributesFrozen(t *testing.T) {
 	if !c.Flush(5 * time.Second) {
 		t.Fatal("Flush timed out")
 	}
-	annotations, _ := rs.last()["annotations"].(map[string]interface{})
-	crumbs, _ := annotations["breadcrumbs"].([]interface{})
+	crumbs := breadcrumbsOf(t, rs.lastAttachments())
 	if len(crumbs) == 0 {
 		t.Fatal("no breadcrumbs in payload")
 	}
-	first, _ := crumbs[0].(map[string]interface{})
-	crumbAttrs, _ := first["attributes"].(map[string]interface{})
+	crumbAttrs, _ := crumbs[0]["attributes"].(map[string]any)
 	if crumbAttrs["v"] != "before" {
 		t.Errorf("breadcrumb attribute not detached: %v", crumbAttrs["v"])
 	}
@@ -1502,10 +1572,10 @@ func (l *lineLogger) Printf(format string, v ...interface{}) {
 	l.lines = append(l.lines, fmt.Sprintf(format, v...))
 }
 
-func (l *lineLogger) all() string {
+func (l *lineLogger) all() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return strings.Join(l.lines, "\n")
+	return slices.Clone(l.lines)
 }
 
 // TestDiagnosticsNameTheReportNotItsContent pins the two halves of the
@@ -1525,7 +1595,7 @@ func TestDiagnosticsNameTheReportNotItsContent(t *testing.T) {
 	}
 
 	id, _ := rs.last()["uuid"].(string)
-	logged := logger.all()
+	logged := strings.Join(logger.all(), "\n")
 	if id == "" || !strings.Contains(logged, id) {
 		t.Errorf("no diagnostic line names report %q:\n%s", id, logged)
 	}

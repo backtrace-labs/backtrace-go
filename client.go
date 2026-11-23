@@ -22,7 +22,7 @@ import (
 // reports are queued to a background worker, and a full queue drops the
 // newest report and counts it (see Stats). Bounded synchronous waiting
 // exists only where explicitly documented: Flush/FlushContext,
-// Close/CloseContext, and ReportPanicValueAndFlush.
+// Close/CloseContext, ReportPanicValueAndFlush, and ReportPanic.
 type Client struct {
 	// cfgFn returns the normalized configuration. For clients created by
 	// NewClient it returns a fixed config; the legacy global client
@@ -48,14 +48,12 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	queue     chan clientJob
+	lanes     [laneCount]lane
 	enqueueMu sync.Mutex // guards closed, accepted, and queue admission
 	closed    bool
 	// closedFast mirrors closed for the lock-free rejection at the top of
 	// capture; admission still re-checks closed under enqueueMu.
 	closedFast atomic.Bool
-	accepted   uint64
-	processed  atomic.Uint64
 
 	// progress is a broadcast channel: replaced (and the old one closed)
 	// each time the worker finishes a job or the client closes, waking
@@ -71,12 +69,15 @@ type Client struct {
 	amu        sync.Mutex // guards attributes
 	attributes map[string]interface{}
 
-	crumbs *breadcrumbRing
+	crumbs         *breadcrumbRing
+	maxBreadcrumbs int
 
 	stats internalStats
 
 	// logBusy backs the diag re-entrancy guard for this client.
 	logBusy atomic.Int32
+
+	warnedInlineSkip atomic.Bool
 }
 
 // clientJob is a queued report with its admission sequence number.
@@ -85,19 +86,57 @@ type clientJob struct {
 	data *queuedReport
 }
 
+type laneID int
+
+const (
+	laneRegular laneID = iota
+	lanePriority
+	laneCount
+)
+
+// Jobs in a lane must be processed in order. Flush targets compare sequence
+// numbers.
+type lane struct {
+	queue     chan clientJob
+	accepted  uint64
+	processed atomic.Uint64
+}
+
 // queuedReport carries everything captured on the caller's goroutine,
 // including the delivery/scrubbing configuration in effect at capture time;
 // parsing and I/O happen on the worker.
 type queuedReport struct {
 	cfg         Config
 	stack       []byte
+	pcs         []uintptr
+	threadName  string
+	creator     []byte
+	originPCs   []uintptr
 	attributes  map[string]interface{}
 	annotations map[string]interface{}
 	classifiers []string
-	reportType  string // SDK-known type for diagnostics (never user data)
+	breadcrumbs []Breadcrumb
+	attachments []string
+	kind        reportKind
 	timestamp   int64
 	err         error
+	outcome     *reportOutcome
 }
+
+type reportOutcome struct {
+	delivered atomic.Bool
+}
+
+type reportKind string
+
+const (
+	kindError   reportKind = "error"
+	kindMessage reportKind = "message"
+	kindPanic   reportKind = "panic"
+	kindCrash   reportKind = "crash"
+)
+
+var flushFallbackTimeout = DefaultFlushTimeout
 
 // nonBlocking is a pre-canceled context: queue admission under it makes one
 // attempt and drops immediately, never waiting.
@@ -129,12 +168,15 @@ func startClient(cfgFn func() Config, stable bool) *Client {
 		transport:       newHTTPTransport(cfg.HTTPClient, cfg.Timeout),
 		ctx:             ctx,
 		cancel:          cancel,
-		queue:           make(chan clientJob, cfg.QueueSize),
 		progress:        make(chan struct{}),
 		workerDone:      make(chan struct{}),
 		shutdownTimeout: cfg.ShutdownTimeout,
 		attributes:      map[string]interface{}{},
 		crumbs:          newBreadcrumbRing(cfg.MaxBreadcrumbs),
+		maxBreadcrumbs:  cfg.MaxBreadcrumbs,
+	}
+	for i := range c.lanes {
+		c.lanes[i].queue = make(chan clientJob, cfg.QueueSize)
 	}
 	// The re-entrancy guard needs the client's address, so wire the
 	// diagnostics after construction.
@@ -148,6 +190,14 @@ func startClient(cfgFn func() Config, stable bool) *Client {
 // (reported as a message). A nil object is ignored. extraAttributes are
 // added to this report only; the map is copied, never retained or mutated.
 func (c *Client) Report(object interface{}, extraAttributes map[string]interface{}) {
+	c.ReportContext(context.Background(), object, extraAttributes)
+}
+
+// ReportContext is Report with the attributes, breadcrumbs and attachments
+// of the Scope in ctx and of its parent scopes (see WithScope). The
+// cancellation and deadline of ctx do not affect the report. A nil ctx
+// carries no scope.
+func (c *Client) ReportContext(ctx context.Context, object any, extraAttributes map[string]any) {
 	if c == nil {
 		return
 	}
@@ -155,36 +205,36 @@ func (c *Client) Report(object interface{}, extraAttributes map[string]interface
 	case nil:
 		return
 	case error:
-		c.ReportError(v, extraAttributes)
+		c.capture(nonBlocking, captureInput{ctx: ctx, value: v, err: v, kind: kindError, extra: extraAttributes})
 	default:
-		c.ReportMessage(safeSprint(v), extraAttributes)
+		c.capture(nonBlocking, captureInput{ctx: ctx, value: v, kind: kindMessage, extra: extraAttributes})
 	}
 }
 
 // ReportError sends a report for err, capturing its type and unwrap graph.
+// Its error.type attribute is "Exception" unless an attribute sets it.
 func (c *Client) ReportError(err error, extraAttributes map[string]interface{}) {
 	if c == nil || err == nil {
 		return
 	}
 	c.capture(nonBlocking, captureInput{
-		message:    safeErrorString(err),
-		err:        err,
-		classifier: "error",
-		reportType: "error",
-		extra:      extraAttributes,
+		value: err,
+		err:   err,
+		kind:  kindError,
+		extra: extraAttributes,
 	})
 }
 
 // ReportMessage sends a plain message report.
+// Its error.type attribute is "Message" unless an attribute sets it.
 func (c *Client) ReportMessage(msg string, extraAttributes map[string]interface{}) {
 	if c == nil {
 		return
 	}
 	c.capture(nonBlocking, captureInput{
-		message:    msg,
-		classifier: "message",
-		reportType: "message",
-		extra:      extraAttributes,
+		value: msg,
+		kind:  kindMessage,
+		extra: extraAttributes,
 	})
 }
 
@@ -192,37 +242,121 @@ func (c *Client) ReportMessage(msg string, extraAttributes map[string]interface{
 // blocking: a full queue drops the report (counted in Stats). Use
 // ReportPanicValueAndFlush when the goroutine or process is about to die
 // and delivery must be awaited.
+// Its error.type attribute is "Unhandled exception" unless an attribute sets
+// it. Panic reports are never sampled out.
 func (c *Client) ReportPanicValue(value interface{}, extraAttributes map[string]interface{}) {
+	c.ReportPanicValueContext(context.Background(), value, extraAttributes)
+}
+
+// ReportPanicValueContext is ReportPanicValue with the Scope data of ctx, as
+// described on ReportContext.
+func (c *Client) ReportPanicValueContext(ctx context.Context, value any, extraAttributes map[string]any) {
 	if c == nil || value == nil {
 		return
 	}
-	c.capture(nonBlocking, panicCaptureInput(value, extraAttributes))
+	c.capture(nonBlocking, panicCaptureInput(ctx, value, extraAttributes))
 }
 
 // ReportPanicValueAndFlush captures a recovered panic value and waits for
 // its delivery under ONE deadline covering queue admission and flushing.
 // It reports whether the report was accepted and processed in time.
-func (c *Client) ReportPanicValueAndFlush(value interface{}, extraAttributes map[string]interface{}, timeout time.Duration) bool {
-	if c == nil || value == nil {
-		return true
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	seq, accepted := c.capture(ctx, panicCaptureInput(value, extraAttributes))
-	return accepted && c.flushTargetContext(ctx, seq)
+//
+// ctx sets the deadline. Without one, the call waits up to
+// DefaultFlushTimeout. The panic report goes ahead of reports waiting in
+// the queue. The call also waits for the reports queued before it, but
+// they do not change the result. The report carries the Scope data of
+// ctx, as described on ReportContext.
+func (c *Client) ReportPanicValueAndFlush(ctx context.Context, value any, extraAttributes map[string]any) bool {
+	processed, _ := c.reportPanicAndWait(ctx, value, extraAttributes)
+	return processed
 }
 
-func panicCaptureInput(value interface{}, extra map[string]interface{}) captureInput {
+func (c *Client) reportPanicAndWait(ctx context.Context, value any, extraAttributes map[string]any) (processed, delivered bool) {
+	if c == nil || value == nil {
+		return true, false
+	}
+	captured := false
+	defer func() {
+		// Caller-supplied context methods can panic outside capture.
+		if recover() != nil {
+			if !captured {
+				c.stats.drop(dropInternal)
+			}
+			processed, delivered = false, false
+		}
+	}()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, flushFallbackTimeout)
+		defer cancel()
+	}
+
+	targets := c.acceptedTargets()
+	in := panicCaptureInput(ctx, value, extraAttributes)
+	in.lane = lanePriority
+	in.outcome = new(reportOutcome)
+	captured = true
+	seq, accepted := c.capture(ctx, in)
+	if !accepted {
+		c.flushTargetContext(ctx, targets)
+		return false, false
+	}
+	targets[lanePriority] = seq
+	c.flushTargetContext(ctx, targets)
+	processed = c.lanes[lanePriority].processed.Load() >= seq
+	return processed, in.outcome.delivered.Load()
+}
+
+// ReportPanic reports a panic and re-panics with the original value, after
+// waiting up to DefaultFlushTimeout as ReportPanicValueAndFlush does. Defer
+// it directly:
+//
+//	defer client.ReportPanic(nil)
+//
+// When the report was delivered, MonitorCrashes does not report the
+// resulting crash again (see MonitorCrashes). On a nil *Client it does not
+// recover, and the panic proceeds unchanged.
+func (c *Client) ReportPanic(extraAttributes map[string]any) {
+	if c == nil {
+		return
+	}
+	v := recover()
+	if v == nil {
+		return
+	}
+	if _, delivered := c.reportPanicAndWait(context.Background(), v, extraAttributes); delivered {
+		markDeliveredPanic(v)
+	}
+	panic(v)
+}
+
+// ReportAndRecoverPanic reports a panic and swallows it, without waiting for
+// delivery. Defer it directly:
+//
+//	defer client.ReportAndRecoverPanic(nil)
+//
+// On a nil *Client it does not recover, and the panic proceeds unchanged.
+func (c *Client) ReportAndRecoverPanic(extraAttributes map[string]any) {
+	if c == nil {
+		return
+	}
+	if v := recover(); v != nil {
+		c.ReportPanicValue(v, extraAttributes)
+	}
+}
+
+func panicCaptureInput(ctx context.Context, value interface{}, extra map[string]interface{}) captureInput {
 	in := captureInput{
-		message:    safeSprint(value),
-		classifier: "panic",
-		reportType: "panic",
-		extra:      extra,
+		ctx:   ctx,
+		value: value,
+		kind:  kindPanic,
+		extra: extra,
 	}
 	if err, ok := value.(error); ok {
 		in.err = err
-		in.message = safeErrorString(err)
 	}
 	return in
 }
@@ -292,6 +426,8 @@ func (c *Client) DroppedReports() uint64 {
 // extend the wait (strict capture-time barrier). It returns true when the
 // pre-call backlog was processed. Flushing proves local processing and
 // send completion, not backend acceptance.
+// A panic report from ReportPanicValueAndFlush or ReportPanic made after the
+// call is sent first and can lengthen the wait.
 func (c *Client) FlushContext(ctx context.Context) bool {
 	if c == nil {
 		return true
@@ -299,10 +435,17 @@ func (c *Client) FlushContext(ctx context.Context) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	return c.flushTargetContext(ctx, c.acceptedTargets())
+}
+
+func (c *Client) acceptedTargets() [laneCount]uint64 {
+	var targets [laneCount]uint64
 	c.enqueueMu.Lock()
-	target := c.accepted
+	for i := range c.lanes {
+		targets[i] = c.lanes[i].accepted
+	}
 	c.enqueueMu.Unlock()
-	return c.flushTargetContext(ctx, target)
+	return targets
 }
 
 // Flush is FlushContext with a timeout. The client stays fully usable
@@ -316,13 +459,13 @@ func (c *Client) Flush(timeout time.Duration) bool {
 	return c.FlushContext(ctx)
 }
 
-// flushTargetContext waits until the worker has processed the report with
-// sequence number target. The broadcast channel is grabbed before each
+// flushTargetContext waits until the worker has processed every lane up to
+// its sequence number target. The broadcast channel is grabbed before each
 // re-check so an advance signaled in between cannot be lost.
-func (c *Client) flushTargetContext(ctx context.Context, target uint64) bool {
+func (c *Client) flushTargetContext(ctx context.Context, targets [laneCount]uint64) bool {
 	for {
 		wait := c.progressCh()
-		if c.processed.Load() >= target {
+		if c.reached(targets) {
 			return true
 		}
 		select {
@@ -330,9 +473,18 @@ func (c *Client) flushTargetContext(ctx context.Context, target uint64) bool {
 			return false
 		case <-wait:
 		case <-c.workerDone:
-			return c.processed.Load() >= target
+			return c.reached(targets)
 		}
 	}
+}
+
+func (c *Client) reached(targets [laneCount]uint64) bool {
+	for i := range c.lanes {
+		if c.lanes[i].processed.Load() < targets[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // progressCh returns the current broadcast generation channel.
@@ -398,7 +550,9 @@ func (c *Client) beginClose() {
 		c.enqueueMu.Lock()
 		c.closed = true
 		c.closedFast.Store(true)
-		close(c.queue)
+		for i := range c.lanes {
+			close(c.lanes[i].queue)
+		}
 		c.enqueueMu.Unlock()
 		c.signalProgress()
 	})
@@ -406,11 +560,13 @@ func (c *Client) beginClose() {
 
 // captureInput bundles the per-call capture parameters.
 type captureInput struct {
-	message    string
-	err        error
-	classifier string
-	reportType string
-	extra      map[string]interface{}
+	ctx     context.Context
+	value   any
+	err     error
+	kind    reportKind
+	extra   map[string]interface{}
+	lane    laneID
+	outcome *reportOutcome
 }
 
 // capture assembles everything that must be observed on the caller's
@@ -426,6 +582,9 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 			seq, accepted = 0, false
 		}
 	}()
+	if ctx == nil {
+		ctx = nonBlocking
+	}
 
 	// Cheap rejections first: a closed client and sampled-out reports must
 	// not pay for normalising attributes, /proc, runtime, error-graph and
@@ -435,10 +594,22 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 		c.internalDiag.logf("report dropped: client closed")
 		return 0, false
 	}
+	if q := c.lanes[in.lane].queue; ctx.Err() != nil && len(q) == cap(q) {
+		c.stats.drop(dropQueueFull)
+		c.internalDiag.logf("report dropped: queue full (capacity %d)", cap(q))
+		return 0, false
+	}
 
 	cfg := c.cfgFn()
 
-	if cfg.SampleRate < 1 && rand.Float64() >= cfg.SampleRate {
+	if !c.stableConfig {
+		if err := cfg.validate(); err != nil {
+			logReportingDisabled(cfg, err)
+			return 0, false
+		}
+	}
+
+	if in.kind != kindPanic && cfg.SampleRate < 1 && rand.Float64() >= cfg.SampleRate {
 		c.stats.drop(dropSampled)
 		c.internalDiag.logf("report sampled out (SampleRate=%v)", cfg.SampleRate)
 		return 0, false
@@ -470,19 +641,42 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 		attributes[k] = v
 	}
 	c.amu.Unlock()
+	scopes := scopeChain(in.ctx)
+	for _, s := range scopes {
+		s.copyAttributes(attributes)
+	}
 
-	attributes["error.message"] = in.message
-	attributes["report_type"] = in.reportType
+	message, isString := in.value.(string)
+	if in.err != nil {
+		message = safeErrorString(in.err)
+	} else if !isString {
+		message = printValue(in.value)
+	}
+	attributes["error.message"] = message
+	attributes["report_type"] = "error"
+	if in.kind == kindPanic {
+		attributes["report_type"] = "panic"
+	}
 
-	classifiers := []string{in.classifier}
+	crumbs := mergeBreadcrumbs(c.crumbs.snapshot(), scopes, c.maxBreadcrumbs)
+	if len(crumbs) > 0 {
+		attributes["breadcrumbs.lastId"] = maxBreadcrumbID(crumbs)
+	}
+
+	classifier := "panic"
+	if in.kind == kindMessage {
+		classifier = "message"
+	}
 	annotations := map[string]interface{}{}
 
+	var originPCs []uintptr
 	if in.err != nil {
-		chain := unwrapErrorChain(in.err, cfg.MaxErrorDepth, cfg.MaxErrorNodes)
-		if len(chain) > 0 {
-			attributes["error.type"] = chain[0].Type
+		classifier = errorClassifier(in.err)
+		nodes := walkErrorGraph(in.err, cfg.MaxErrorDepth, cfg.MaxErrorNodes)
+		if chain := errorChainLinks(nodes); len(chain) > 0 {
 			annotations["Error Chain"] = chain
 		}
+		originPCs = errorOriginPCs(nodes)
 	}
 
 	// Per-call attributes win over everything. They are normalised here, on
@@ -491,6 +685,9 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 	// would race the worker's json.Marshal).
 	for k, v := range freezeAttributes(in.extra, limits) {
 		attributes[k] = v
+	}
+	if _, set := attributes["error.type"]; !set {
+		attributes["error.type"] = defaultErrorTypes[in.kind]
 	}
 
 	if len(cfg.EnvVars) > 0 || cfg.SendEnvVars {
@@ -501,30 +698,44 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 			maxBytes:      cfg.MaxEnvBytes,
 		})
 	}
-	if crumbs := c.crumbs.snapshot(); len(crumbs) > 0 {
-		annotations["breadcrumbs"] = crumbs
-	}
 
-	return c.enqueueContext(ctx, clientJob{data: &queuedReport{
+	qr := &queuedReport{
 		cfg:         cfg,
-		stack:       captureStack(cfg.CaptureAllGoroutines, cfg.MaxStackBytes),
+		originPCs:   originPCs,
 		attributes:  attributes,
 		annotations: annotations,
-		classifiers: classifiers,
-		reportType:  in.reportType,
+		classifiers: []string{classifier},
+		breadcrumbs: crumbs,
+		attachments: scopeAttachments(scopes),
+		kind:        in.kind,
 		timestamp:   time.Now().Unix(),
 		err:         in.err,
-	}})
+		outcome:     in.outcome,
+	}
+	if cfg.CaptureAllGoroutines {
+		qr.stack = captureStack(true, cfg.MaxStackBytes)
+	} else {
+		qr.pcs = callerPCs()
+		qr.threadName, qr.creator = callerGoroutine()
+	}
+	return c.enqueueContext(ctx, in.lane, clientJob{data: qr})
+}
+
+var defaultErrorTypes = map[reportKind]string{
+	kindError:   "Exception",
+	kindMessage: "Message",
+	kindPanic:   "Unhandled exception",
 }
 
 // enqueueContext admits a job to the queue under the enqueue lock, assigning
 // its sequence number. A full queue is retried on worker progress until ctx
 // is done (the nonBlocking sentinel makes exactly one attempt). The lock is
 // never held across a blocking operation.
-func (c *Client) enqueueContext(ctx context.Context, j clientJob) (uint64, bool) {
+func (c *Client) enqueueContext(ctx context.Context, id laneID, j clientJob) (uint64, bool) {
 	if ctx == nil {
 		ctx = nonBlocking
 	}
+	l := &c.lanes[id]
 	for {
 		// Grab the broadcast channel BEFORE the admission attempt: any
 		// queue space freed after the attempt comes from a completion
@@ -539,11 +750,11 @@ func (c *Client) enqueueContext(ctx context.Context, j clientJob) (uint64, bool)
 			c.internalDiag.logf("report dropped: client closed")
 			return 0, false
 		}
-		next := c.accepted + 1
+		next := l.accepted + 1
 		j.seq = next
 		select {
-		case c.queue <- j:
-			c.accepted = next
+		case l.queue <- j:
+			l.accepted = next
 			c.enqueueMu.Unlock()
 			c.stats.accepted.Add(1)
 			return next, true
@@ -554,7 +765,7 @@ func (c *Client) enqueueContext(ctx context.Context, j clientJob) (uint64, bool)
 		select {
 		case <-ctx.Done():
 			c.stats.drop(dropQueueFull)
-			c.internalDiag.logf("report dropped: queue full (capacity %d)", cap(c.queue))
+			c.internalDiag.logf("report dropped: queue full (capacity %d)", cap(l.queue))
 			return 0, false
 		case <-wait:
 		case <-c.workerDone:
@@ -564,16 +775,92 @@ func (c *Client) enqueueContext(ctx context.Context, j clientJob) (uint64, bool)
 	}
 }
 
-// worker is the single consumer of the queue. It exits when Close closes the
-// queue, after draining remaining jobs. Every processed job broadcasts
-// progress to flushers and blocked panic enqueuers.
+const priorityBurst = 8
+
+// worker is the single consumer of the queues. It exits when Close closes the
+// queues, after draining remaining jobs. Every processed job broadcasts
+// progress to flushers and blocked panic enqueuers. Priority jobs go first,
+// with one waiting regular job after every priorityBurst priority jobs.
 func (c *Client) worker() {
 	defer close(c.workerDone)
 	defer c.signalProgress()
-	for j := range c.queue {
-		c.processAndSend(j.data)
-		c.processed.Store(j.seq)
-		c.signalProgress()
+	var queues [laneCount]chan clientJob
+	for i := range c.lanes {
+		queues[i] = c.lanes[i].queue
+	}
+	streak := 0
+	for queues[laneRegular] != nil || queues[lanePriority] != nil {
+		first := lanePriority
+		if streak >= priorityBurst {
+			first = laneRegular
+		}
+		var (
+			id laneID
+			j  clientJob
+			ok bool
+		)
+		select {
+		case j, ok = <-queues[first]:
+			id = first
+		default:
+			select {
+			case j, ok = <-queues[lanePriority]:
+				id = lanePriority
+			case j, ok = <-queues[laneRegular]:
+				id = laneRegular
+			}
+		}
+		if !ok {
+			queues[id] = nil
+			continue
+		}
+		c.run(id, j)
+		if id == lanePriority {
+			streak++
+		} else {
+			streak = 0
+		}
+	}
+}
+
+func (c *Client) run(id laneID, j clientJob) {
+	c.processAndSend(j.data, id)
+	c.lanes[id].processed.Store(j.seq)
+	c.signalProgress()
+}
+
+// Only a regular report's retry wait may run priority jobs. Running them
+// anywhere else breaks lane order.
+func (c *Client) retryWait(id laneID) func(time.Duration) bool {
+	return func(d time.Duration) bool {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		var urgent chan clientJob
+		if id == laneRegular {
+			urgent = c.lanes[lanePriority].queue
+		}
+		for {
+			// A fired timer wins over waiting priority jobs.
+			select {
+			case <-timer.C:
+				return true
+			case <-c.ctx.Done():
+				return false
+			default:
+			}
+			select {
+			case <-timer.C:
+				return true
+			case <-c.ctx.Done():
+				return false
+			case j, ok := <-urgent:
+				if !ok {
+					urgent = nil
+					continue
+				}
+				c.run(lanePriority, j)
+			}
+		}
 	}
 }
 
@@ -581,7 +868,7 @@ func (c *Client) worker() {
 // it, using the configuration snapshot taken at capture time. Runs on the
 // worker goroutine; all failure modes degrade to a debug log plus a stats
 // counter.
-func (c *Client) processAndSend(qr *queuedReport) {
+func (c *Client) processAndSend(qr *queuedReport, id laneID) {
 	defer c.recoverInternal("processAndSend")
 
 	// Forced shutdown: the deadline expired and the root context was
@@ -626,7 +913,7 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		}
 	}
 
-	threads, sourceCode, mainThread := buildThreads(qr.stack, sourceOptions{
+	threads, sourceCode, mainThread := reportThreads(qr, sourceOptions{
 		mode:         cfg.SourceCode,
 		contextLines: cfg.ContextLineCount,
 		tabWidth:     cfg.TabWidth,
@@ -649,6 +936,7 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		Threads:     threads,
 		SourceCode:  sourceCode,
 		MainThread:  mainThread,
+		Breadcrumbs: qr.breadcrumbs,
 		Error:       qr.err,
 	}
 	ensureMainThread(report)
@@ -657,11 +945,16 @@ func (c *Client) processAndSend(qr *queuedReport) {
 	// don't even open the files.
 	if cfg.MaxAttachments >= 0 {
 		report.Attachments = append([]string(nil), cfg.AttachmentPaths...)
+		for _, p := range qr.attachments {
+			if !slices.Contains(report.Attachments, p) {
+				report.Attachments = append(report.Attachments, p)
+			}
+		}
 	}
 
 	if cfg.BeforeSend != nil {
-		// Values that came from Config.Attributes or SetAttribute, and the
-		// dependency list, are shared between reports. Give the hook its
+		// Values that came from Config.Attributes, SetAttribute or a scope
+		// are shared between reports. Give the hook its
 		// own copy, so "mutating maps and slices in place is safe" holds
 		// for this report only. The copy also widens the SDK's own plain
 		// numbers, so the hook sees value-model types throughout.
@@ -686,6 +979,13 @@ func (c *Client) processAndSend(qr *queuedReport) {
 	}
 
 	normalizeAttributes(report.Attributes, report.Annotations)
+	crumbs := report.Breadcrumbs[:0:0]
+	for _, b := range report.Breadcrumbs {
+		if b, ok := prepareBreadcrumb(b); ok {
+			crumbs = append(crumbs, b)
+		}
+	}
+	report.Breadcrumbs = crumbs
 	body, err := json.Marshal(report.toWire())
 	if err == nil && len(body) > cfg.MaxReportBytes {
 		size := len(body)
@@ -704,40 +1004,82 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		d.logf("report %s dropped: serialization failed (%T)", eventID, err)
 		return
 	}
-	if len(body) > cfg.MaxReportBytes {
-		c.stats.drop(dropOversize)
-		d.logf("report %s dropped: %d bytes exceeds the %d-byte report limit",
-			eventID, len(body), cfg.MaxReportBytes)
-		return
-	}
 
-	// Breadcrumbs also travel as the bt-breadcrumbs-0 attachment, the file
+	// Breadcrumbs travel as the bt-breadcrumbs-0 attachment, the file
 	// the Backtrace UI's breadcrumb view reads (same format as the other
-	// Backtrace SDKs). Sourced from the annotation so a BeforeSend hook
+	// Backtrace SDKs). Sourced from report.Breadcrumbs so a BeforeSend hook
 	// that scrubbed or removed breadcrumbs is respected.
 	var inline []inlinePart
-	if crumbs, ok := report.Annotations["breadcrumbs"].([]Breadcrumb); ok && len(crumbs) > 0 {
-		if data, err := json.Marshal(crumbs); err == nil {
+	if len(report.Breadcrumbs) > 0 {
+		if data, err := json.Marshal(report.Breadcrumbs); err == nil {
 			inline = append(inline, inlinePart{name: "bt-breadcrumbs-0", data: data})
 		}
+	}
+
+	p, err := buildPayload(body, report.Attachments, inline, cfg.attachmentLimits(), !cfg.DisableCompression,
+		&c.warnedInlineSkip, d)
+	if err != nil {
+		c.stats.drop(dropSerialization)
+		d.logf("report %s dropped: %v", eventID, err)
+		return
 	}
 
 	// Diagnostics are payload-free by design: report contents are never
 	// logged (debug logging is often enabled during incidents, exactly
 	// when secrets are most likely to be present).
 	d.logf("sending report %s (type=%s, json_bytes=%d, attachments=%d, destination=%s)",
-		eventID, qr.reportType, len(body),
-		len(report.Attachments)+len(inline), redactURL(cfg.submissionURL()))
+		eventID, qr.kind, len(body),
+		len(report.Attachments)+len(inline), urlOrigin(cfg.submissionURL()))
 
-	reason, err := c.transport.send(c.ctx, cfg.submissionURL(), body,
-		report.Attachments, inline, cfg.attachmentLimits(), d)
-	if err != nil {
-		c.stats.drop(reason)
-		d.logf("report %s dropped: %v", eventID, err)
+	res := c.transport.send(c.ctx, cfg.submissionURL(), p, cfg.MaxRetries, c.retryWait(id), d)
+	c.stats.retries.Add(uint64(res.retries))
+	if res.err != nil {
+		c.stats.drop(res.reason)
+		d.logf("report %s dropped: %v", eventID, res.err)
 		return
 	}
 	c.stats.delivered.Add(1)
+	if qr.outcome != nil {
+		qr.outcome.delivered.Store(true)
+	}
 	d.logf("report %s delivered", eventID)
+}
+
+const originThread = "origin"
+
+func reportThreads(qr *queuedReport, opts sourceOptions) (map[string]Thread, map[string]SourceCode, string) {
+	sources := newSourceBuilder(opts)
+	defer sources.close()
+	var (
+		threads    map[string]Thread
+		mainThread string
+	)
+	if qr.cfg.CaptureAllGoroutines || qr.kind == kindCrash {
+		threads, mainThread = parseStackText(qr.stack, sources)
+	} else {
+		mainThread = "0"
+		frames := framesFromPCs(qr.pcs, sources)
+		creator, key := parseStackText(qr.creator, sources)
+		threads = map[string]Thread{mainThread: {
+			Name:   qr.threadName,
+			Fault:  true,
+			Stacks: append(frames, creator[key].Stacks...),
+		}}
+	}
+	if qr.kind == kindPanic || qr.kind == kindCrash {
+		markPanicFrame(threads[mainThread].Stacks)
+	}
+	if len(qr.originPCs) > 0 {
+		if frames := framesFromPCs(qr.originPCs, sources); len(frames) > 0 {
+			if t, ok := threads[mainThread]; ok {
+				t.Fault = false
+				threads[mainThread] = t
+			}
+			threads[originThread] = Thread{Name: "error origin", Fault: true, Stacks: frames}
+			mainThread = originThread
+		}
+	}
+	return threads, sources.result(), mainThread
 }
 
 // enforceReportInvariants turns whatever a BeforeSend hook returned into a

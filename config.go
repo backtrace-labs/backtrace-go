@@ -41,6 +41,10 @@ const (
 	// is supplied.
 	DefaultTimeout = 30 * time.Second
 
+	// DefaultMaxRetries is the number of extra submission attempts after
+	// a transient failure.
+	DefaultMaxRetries = 2
+
 	// DefaultShutdownTimeout bounds Close.
 	DefaultShutdownTimeout = 5 * time.Second
 
@@ -66,10 +70,10 @@ const (
 	// DefaultTabWidth is reported to the Backtrace UI for source rendering.
 	DefaultTabWidth = 8
 
-	// DefaultFlushTimeout bounds how long ReportPanic (and the package-
-	// level ReportPanicValueAndFlush) waits for capture plus delivery
-	// before re-panicking or returning. ReportAndRecoverPanic does not
-	// wait for delivery.
+	// DefaultFlushTimeout bounds how long ReportPanic waits for capture plus
+	// delivery before re-panicking. ReportPanicValueAndFlush uses it when
+	// its context has no deadline. ReportAndRecoverPanic does not wait for
+	// delivery.
 	DefaultFlushTimeout = 5 * time.Second
 
 	// DefaultMaxStackBytes caps the raw goroutine dump size.
@@ -218,6 +222,7 @@ type Config struct {
 	// The zero value means 1.0 (send everything), so an uninitialized
 	// Config never silently drops reports. Explicit values outside
 	// [0, 1], NaN, and infinities are rejected by NewClient.
+	// Panic reports are never sampled out.
 	SampleRate float64
 
 	// BeforeSend, when set, runs just before a report is serialized.
@@ -233,7 +238,7 @@ type Config struct {
 	BeforeSend func(report *ReportData) *ReportData
 
 	// MaxErrorDepth caps error-graph unwrapping depth. Default: 32.
-	// Negative disables chain capture.
+	// Negative disables chain capture and the error origin thread.
 	MaxErrorDepth int
 
 	// MaxErrorNodes caps the total number of errors captured from one
@@ -242,15 +247,27 @@ type Config struct {
 
 	// MaxBreadcrumbs caps the breadcrumb ring buffer. Default: 64.
 	// Negative disables breadcrumbs.
+	// It also caps the client and Scope breadcrumbs merged into one report.
 	MaxBreadcrumbs int
 
 	// QueueSize is the report queue capacity. Default: 128.
+	// Panic reports that wait for delivery have a second queue of this size.
 	QueueSize int
 
 	// Timeout is the per-request submission deadline, enforced with an
 	// SDK-owned request context (it applies to custom HTTPClients too).
 	// Default: 30s.
 	Timeout time.Duration
+
+	// MaxRetries is the number of extra attempts for a report after a
+	// network error before the request body was sent, or after a 408, 500,
+	// 502, 503 or 504 response. Default: 2. Negative disables retries. The
+	// waits between attempts add up to at most 60s per report.
+	MaxRetries int
+
+	// DisableCompression sends request bodies uncompressed. By default they
+	// are gzip-compressed.
+	DisableCompression bool
 
 	// ShutdownTimeout bounds Close. Default: 5s.
 	ShutdownTimeout time.Duration
@@ -282,6 +299,8 @@ type Config struct {
 	Debug bool
 
 	// Logger receives diagnostic output when Debug is on.
+	// Without Debug it still receives one-time warnings, for example when
+	// the server rejects reports with a status that retrying cannot fix.
 	// Default: log.New(os.Stderr, "[backtrace] ", log.LstdFlags).
 	// A panicking Logger is contained and cannot crash the application.
 	// A Logger that calls back into the SDK (a logging-adapter pattern)
@@ -343,6 +362,9 @@ func (c Config) normalize() Config {
 	}
 	if c.Timeout == 0 {
 		c.Timeout = DefaultTimeout
+	}
+	if c.MaxRetries == 0 {
+		c.MaxRetries = DefaultMaxRetries
 	}
 	if c.ShutdownTimeout == 0 {
 		c.ShutdownTimeout = DefaultShutdownTimeout
@@ -435,10 +457,9 @@ func (c Config) validate() error {
 	if err != nil {
 		// Do not wrap err: *url.Error quotes the complete raw URL,
 		// which may embed a token, and NewClient errors flow into
-		// user logs. Surface only the inner reason plus the redacted
-		// endpoint — and only when the inner reason itself carries no
-		// quoted input fragment (net/url embeds offending substrings,
-		// e.g. invalid ports, inside double quotes).
+		// user logs. Surface only the inner reason, and only when it
+		// carries no quoted input fragment (net/url embeds offending
+		// substrings, e.g. invalid ports, inside double quotes).
 		msg := "unparsable URL"
 		var ue *url.Error
 		if errors.As(err, &ue) && ue.Err != nil {
@@ -446,25 +467,23 @@ func (c Config) validate() error {
 				msg = inner
 			}
 		}
-		return fmt.Errorf("bt: invalid Config.Endpoint (%s), got %q", msg, redactURL(c.Endpoint))
+		return fmt.Errorf("bt: invalid Config.Endpoint (%s)", msg)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		// Redact the endpoint in errors: it may embed a token, and
-		// NewClient errors flow into user logs.
-		return fmt.Errorf("bt: Config.Endpoint must be an http(s) URL, got %q", redactURL(c.Endpoint))
+		return errors.New("bt: Config.Endpoint must be an http(s) URL")
 	}
 	if u.Host == "" || u.Opaque != "" {
-		return fmt.Errorf("bt: Config.Endpoint must be an absolute URL with a host, got %q", redactURL(c.Endpoint))
+		return errors.New("bt: Config.Endpoint must be an absolute URL with a host")
 	}
 	if u.User != nil {
 		return errors.New("bt: Config.Endpoint must not contain URL userinfo")
 	}
-	if u.Fragment != "" {
+	if strings.Contains(c.Endpoint, "#") {
 		return errors.New("bt: Config.Endpoint must not contain a fragment")
 	}
-	if c.Token != "" && u.RawQuery != "" &&
+	if c.Token != "" && (u.RawQuery != "" || u.ForceQuery) &&
 		!strings.EqualFold(u.Hostname(), "submit.backtrace.io") {
-		return fmt.Errorf("bt: Config.Endpoint must not carry a query string when Token is set, got %q", redactURL(c.Endpoint))
+		return errors.New("bt: Config.Endpoint must not carry a query string when Token is set")
 	}
 
 	// Structural validation of the documented hosted forms, so a common
