@@ -132,10 +132,11 @@ func parseStackText(stackTrace []byte, sources *sourceBuilder) (map[string]Threa
 			}
 			pending, skipLoc, sdkOnly = nil, false, false
 
-		case !indented && strings.HasPrefix(line, "[originating from goroutine "):
+		case !indented && (line == "runtime stack:" || strings.HasPrefix(line, "[originating from goroutine ")):
 			// GODEBUG=tracebackancestors section: these frames
 			// describe the creating goroutine's history, not a
 			// live thread. Ignore until the next goroutine header.
+			// The "runtime stack:" section of crash output is skipped the same way.
 			flushCur()
 			current = nil
 			pending, skipLoc = nil, false

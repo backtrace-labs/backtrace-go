@@ -269,6 +269,10 @@ func (c *Client) ReportPanicValueContext(ctx context.Context, value any, extraAt
 // the queue. The call also waits for the reports queued before it, but
 // they do not change the result. The report carries the Scope data of
 // ctx, as described on ReportContext.
+//
+// With MonitorCrashes running, a panic that then ends the process is also
+// reported as a crash. ReportPanic avoids the second report when its own
+// report was delivered.
 func (c *Client) ReportPanicValueAndFlush(ctx context.Context, value any, extraAttributes map[string]any) bool {
 	processed, _ := c.reportPanicAndWait(ctx, value, extraAttributes)
 	return processed
@@ -742,6 +746,7 @@ var defaultErrorTypes = map[reportKind]string{
 	kindError:   "Exception",
 	kindMessage: "Message",
 	kindPanic:   "Unhandled exception",
+	kindCrash:   "Crash",
 }
 
 // enqueueContext admits a job to the queue under the enqueue lock, assigning

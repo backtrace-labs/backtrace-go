@@ -1608,3 +1608,30 @@ func TestDiagnosticsNameTheReportNotItsContent(t *testing.T) {
 		}
 	}
 }
+
+func TestCrashWithoutGoroutinesKeepsMainThread(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envToken, "")
+	hooks := map[string]func(*ReportData) *ReportData{
+		"no hook":         nil,
+		"threads removed": func(r *ReportData) *ReportData { r.Threads = nil; return r },
+	}
+	for name, hook := range hooks {
+		t.Run(name, func(t *testing.T) {
+			rs := newRecordingServer()
+			t.Cleanup(rs.srv.Close)
+			cfg := crashConfig()
+			cfg.BeforeSend = hook
+			superviseCrashes(cfg, strings.NewReader("panic: boom\n"), strings.NewReader(helloFor(t, rs, time.Now())))
+			if rs.count() != 1 {
+				t.Fatalf("reports = %d, want 1", rs.count())
+			}
+			p := rs.last()
+			threads, _ := p["threads"].(map[string]any)
+			main, _ := p["mainThread"].(string)
+			if _, ok := threads[main]; !ok {
+				t.Errorf("mainThread %q is not among threads %v", main, threads)
+			}
+		})
+	}
+}

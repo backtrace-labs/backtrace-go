@@ -182,9 +182,11 @@ type Config struct {
 	// This is the recommended, predictable way to capture environment:
 	// only the listed names are read. Name/shape scrubbing (see
 	// SendEnvVars) still applies as defense in depth.
+	// Crash reports from MonitorCrashes carry no environment.
 	EnvVars []string
 
-	// SendEnvVars attaches the ENTIRE process environment to every report.
+	// SendEnvVars attaches the ENTIRE process environment to every report,
+	// except crash reports from MonitorCrashes.
 	// Best-effort only: values are redacted when the variable name
 	// contains any of TOKEN, SECRET, PASS, KEY, CREDENTIAL, AUTH, DSN,
 	// COOKIE, SESSION, SIGNATURE, BEARER, CONN (case-insensitive) or when

@@ -40,9 +40,10 @@
 // # What is reported
 //
 // This SDK reports errors, messages, and recovered panics from within the
-// process. It cannot capture crashes that bypass Go panics (native/cgo
-// faults, runtime aborts); for those, use the bcd out-of-process tracer
-// integration in this package or the Backtrace Coresnap workflow.
+// process. MonitorCrashes adds unrecovered panics, runtime fatal errors and
+// fatal signals, reported from a monitor process. Core dumps need the
+// Backtrace Coresnap workflow. The bcd tracer integration (BTTracer, Trace)
+// works on Linux and FreeBSD only.
 package bt
 
 import (
@@ -288,6 +289,8 @@ func legacyEndpoint() string {
 //
 // While the SDK is unconfigured this function does NOT recover: the
 // original panic proceeds exactly as if the handler were absent.
+// When the report was delivered, MonitorCrashes does not report the
+// resulting crash again (see MonitorCrashes).
 func ReportPanic(extraAttributes map[string]interface{}) {
 	if !reportingConfigured() {
 		// Crucial: do not call recover. The original panic continues
