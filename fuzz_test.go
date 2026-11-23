@@ -23,6 +23,7 @@ func FuzzBuildThreads(f *testing.F) {
 	f.Add(stackFixture)
 	f.Add("goroutine 1 [running]:\nmain.main()\n\tC:/x/y.go:42 +0x1f\n")
 	f.Add("...additional frames elided...\n\n[originating from goroutine 3]:\n")
+	f.Add("goroutine 1 [running]:\nmain.f()\n\t/a +0x1/b.go:7 +0x1f fp=0x1 sp=0x2 pc=0x3\n...204 frames elided...\nmain.main()\n\tx.c:12 pc=0x7f\n")
 	f.Add("goroutine running on other thread; stack unavailable\n")
 	f.Add("panic({0x1?, 0x2?})\n\tx:1\n")
 	f.Fuzz(func(t *testing.T, stack string) {

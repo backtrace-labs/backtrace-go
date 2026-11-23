@@ -84,7 +84,8 @@ const (
 	// DefaultMaxEnvVars caps environment variables captured under SendEnvVars.
 	DefaultMaxEnvVars = 1024
 
-	// DefaultMaxEnvBytes caps the total bytes of captured environment values.
+	// DefaultMaxEnvBytes caps the total bytes of captured environment
+	// variable names and values.
 	DefaultMaxEnvBytes = 256 << 10
 
 	// Upper ceilings on explicitly-set resource limits. These exist so an
@@ -184,7 +185,7 @@ type Config struct {
 	// contains any of TOKEN, SECRET, PASS, KEY, CREDENTIAL, AUTH, DSN,
 	// COOKIE, SESSION, SIGNATURE, BEARER, CONN (case-insensitive) or when
 	// the value embeds URL credentials — but this cannot catch every
-	// secret (generically named vars, JWTs, ?password= query params).
+	// secret (generically named vars, JWTs).
 	// Prefer EnvVars, or scrub with BeforeSend. Ignored when EnvVars is
 	// set.
 	SendEnvVars bool
@@ -197,8 +198,8 @@ type Config struct {
 	// SendEnvVars. Default: 1024. Ignored for the EnvVars allowlist.
 	MaxEnvVars int
 
-	// MaxEnvBytes caps the total bytes of captured environment values.
-	// Default: 256 KiB.
+	// MaxEnvBytes caps the total bytes of captured environment variable
+	// names and values. Default: 256 KiB.
 	MaxEnvBytes int
 
 	// SendMachineID includes a stable machine identifier (the "guid"

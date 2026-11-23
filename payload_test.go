@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -198,5 +199,56 @@ func TestOversizeReportDroppedAfterTrimming(t *testing.T) {
 	}
 	if rs.count() != 0 || c.Stats().Oversize != 1 {
 		t.Errorf("reports = %d, stats = %+v; want one Oversize drop", rs.count(), c.Stats())
+	}
+}
+
+func TestDependencyAnnotationPerReport(t *testing.T) {
+	standInModules(t, moduleDependency{path: "example.com/dep", installed: "v1.0.0"})
+	scrub := func(r *ReportData) *ReportData {
+		if deps, ok := r.Annotations["Dependencies"].(map[string]map[string]string); ok {
+			for _, entry := range deps {
+				entry["installedVersion"] = "SCRUBBED:" + entry["installedVersion"]
+			}
+		}
+		return r
+	}
+	c1, rs1 := newTestClient(t, func(cfg *Config) { cfg.BeforeSend = scrub })
+	c2, rs2 := newTestClient(t, func(cfg *Config) { cfg.BeforeSend = scrub })
+	for i := 0; i < 3; i++ {
+		c1.ReportMessage("one", nil)
+		c2.ReportMessage("two", nil)
+	}
+	if !c1.Flush(5*time.Second) || !c2.Flush(5*time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	for _, rs := range []*recordingServer{rs1, rs2} {
+		deps, ok := annotationsOf(t, rs.last())["Dependencies"].(map[string]any)
+		if !ok || len(deps) == 0 {
+			t.Fatalf("Dependencies annotation = %#v, want a non-empty object", annotationsOf(t, rs.last())["Dependencies"])
+		}
+		for path, v := range deps {
+			if version, _ := v.(map[string]any)["installedVersion"].(string); version != "SCRUBBED:v1.0.0" {
+				t.Errorf("%s installedVersion = %q, want SCRUBBED:v1.0.0", path, version)
+			}
+		}
+	}
+}
+
+func TestModuleDependencyReplace(t *testing.T) {
+	deps := moduleDependencies([]*debug.Module{
+		{Path: "example.com/a", Version: "v1.0.0"},
+		{Path: "example.com/b", Version: "v1.0.0", Replace: &debug.Module{Path: "example.com/b", Version: "v1.0.1"}},
+		{Path: "example.com/c", Version: "v1.0.0", Replace: &debug.Module{Path: "../c"}},
+		{Path: "example.com/d", Version: "v1.0.0", Replace: &debug.Module{Path: "example.com/fork", Version: "v2.0.0"}},
+	})
+	got := dependencyAnnotation(deps)
+	want := map[string]map[string]string{
+		"example.com/a": {"installedVersion": "v1.0.0"},
+		"example.com/b": {"installedVersion": "v1.0.1", "requestedVersion": "v1.0.0"},
+		"example.com/c": {"installedVersion": "../c", "requestedVersion": "v1.0.0"},
+		"example.com/d": {"installedVersion": "example.com/fork@v2.0.0", "requestedVersion": "v1.0.0"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("dependencies = %v, want %v", got, want)
 	}
 }

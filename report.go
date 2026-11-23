@@ -39,9 +39,9 @@ import (
 //		delete(h, "Authorization")
 //	}
 //
-// Annotations are assembled by the SDK and keep its types: "breadcrumbs" is
-// a []Breadcrumb, "Environment Variables" a map[string]string and
-// "Dependencies" a []string.
+// Annotations are assembled by the SDK and keep its types: "Environment
+// Variables" is a map[string]string and "Dependencies" a
+// map[string]map[string]string keyed by module path.
 //
 // # What a hook may change
 //

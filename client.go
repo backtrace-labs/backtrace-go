@@ -622,7 +622,7 @@ func (c *Client) processAndSend(qr *queuedReport) {
 	}
 	if len(modules) > 0 {
 		if _, exists := qr.annotations["Dependencies"]; !exists {
-			qr.annotations["Dependencies"] = modules
+			qr.annotations["Dependencies"] = dependencyAnnotation(modules)
 		}
 	}
 
@@ -669,9 +669,6 @@ func (c *Client) processAndSend(qr *queuedReport) {
 		report.Classifiers = slices.Clone(report.Classifiers)
 		// A hook may clear r.Threads in place. threads must keep the originals.
 		report.Threads = maps.Clone(report.Threads)
-		if deps, ok := report.Annotations["Dependencies"].([]string); ok {
-			report.Annotations["Dependencies"] = append([]string(nil), deps...)
-		}
 
 		modified := c.runBeforeSend(cfg.BeforeSend, report, d)
 		if modified == nil {

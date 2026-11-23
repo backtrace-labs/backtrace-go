@@ -296,7 +296,7 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 			perFile = remaining
 		}
 
-		file, err := os.Open(path)
+		file, info, err := openRegularFile(hostFiles{}, path)
 		if err != nil {
 			// The *PathError text repeats the full path: log its cause.
 			var pathErr *os.PathError
@@ -304,14 +304,6 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 				err = pathErr.Err
 			}
 			d.logf("attachment %q skipped: %v", label, err)
-			continue
-		}
-		// Stat the opened handle (not the path) so a file swapped
-		// between stat and open cannot bypass the checks.
-		info, err := file.Stat()
-		if err != nil || !info.Mode().IsRegular() {
-			file.Close()
-			d.logf("attachment %q skipped: not a readable regular file", label)
 			continue
 		}
 		if info.Size() > perFile {

@@ -74,9 +74,14 @@ func ParseThreadsFromStack(stackTrace []byte) (map[string]Thread, map[string]Sou
 // (odd/even line) parsing it survives elided-frame markers, "created by"
 // lines, frames without locations, and Windows paths.
 func buildThreads(stackTrace []byte, opts sourceOptions) (map[string]Thread, map[string]SourceCode, string) {
-	threads := map[string]Thread{}
 	sources := newSourceBuilder(opts)
 	defer sources.close()
+	threads, mainKey := parseStackText(stackTrace, sources)
+	return threads, sources.result(), mainKey
+}
+
+func parseStackText(stackTrace []byte, sources *sourceBuilder) (map[string]Thread, string) {
+	threads := map[string]Thread{}
 
 	var (
 		current   *Thread
@@ -135,7 +140,7 @@ func buildThreads(stackTrace []byte, opts sourceOptions) (map[string]Thread, map
 		case !indented:
 			// Function line (or a special marker).
 			pending, skipLoc = nil, false
-			if current == nil || line == elidedFramesMarker {
+			if current == nil || isElidedMarker(line) {
 				continue
 			}
 			qualified := trimCreatedBy(line)
@@ -170,20 +175,50 @@ func buildThreads(stackTrace []byte, opts sourceOptions) (map[string]Thread, map
 	}
 	flushCur()
 
-	return threads, sources.result(), mainKey
+	return threads, mainKey
+}
+
+func isElidedMarker(line string) bool {
+	if line == elidedFramesMarker {
+		return true
+	}
+	count, ok := strings.CutPrefix(line, "...")
+	if !ok {
+		return false
+	}
+	count, ok = strings.CutSuffix(count, " frames elided...")
+	return ok && allDigits(count)
 }
 
 // splitLocation parses "\t/path/file.go:42 +0x1f" into path and line. The
 // split uses the last colon so Windows drive letters ("C:/app/main.go:42")
 // survive.
 func splitLocation(line string) (path, lineNo string) {
-	line, _, _ = strings.Cut(line, " +")
 	line = strings.TrimSpace(line)
+	for _, marker := range []string{" pc=", " sp=", " fp=", " +"} {
+		line = cutHexSuffix(line, marker)
+	}
 	idx := strings.LastIndex(line, ":")
-	if idx < 0 {
+	if idx < 0 || !allDigits(line[idx+1:]) {
 		return line, ""
 	}
 	return line[:idx], line[idx+1:]
+}
+
+func cutHexSuffix(s, marker string) string {
+	i := strings.LastIndex(s, marker)
+	if i < 0 {
+		return s
+	}
+	digits, ok := strings.CutPrefix(s[i+len(marker):], "0x")
+	if !ok || digits == "" || strings.Trim(digits, "0123456789abcdefABCDEF") != "" {
+		return s
+	}
+	return s[:i]
+}
+
+func allDigits(s string) bool {
+	return s != "" && strings.Trim(s, "0123456789") == ""
 }
 
 // splitQualifiedFunction splits a qualified name from a runtime.Stack
@@ -410,7 +445,8 @@ func (b *sourceBuilder) extract(path, lineNo string) SourceCode {
 // roots were required.
 func (b *sourceBuilder) openSource(path string) (*os.File, error) {
 	if !b.rootsRequired {
-		return os.Open(path)
+		file, _, err := openRegularFile(hostFiles{}, path)
+		return file, err
 	}
 	if len(b.roots) == 0 {
 		// Roots were configured but none could be opened: fail closed.
@@ -450,7 +486,7 @@ func (b *sourceBuilder) openInRoots(abs string) (file *os.File, matched bool, er
 			}
 			// root.Open resolves rel traversal-resistantly (symlinks and
 			// ".." that would escape the root are refused).
-			file, err = r.root.Open(rel)
+			file, _, err = openRegularFile(r.root, rel)
 			return file, true, err
 		}
 	}

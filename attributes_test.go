@@ -28,6 +28,23 @@ func TestGetEnvVarsSplitAndScrub(t *testing.T) {
 	}
 }
 
+func TestEnvEntrySkipsHiddenWindowsEntries(t *testing.T) {
+	type entry struct{ key, value string }
+	var got []entry
+	for _, line := range []string{
+		"=C:=C:\\work", "=ExitCode=00000001", "=::=::\\", "=", "=NOVALUE",
+		"PATH=C:\\Windows", "PLAIN=a=b=c", "EMPTY=", "NOEQUALS",
+	} {
+		if key, value, ok := envEntry(line); ok {
+			got = append(got, entry{key, value})
+		}
+	}
+	want := []entry{{"PATH", "C:\\Windows"}, {"PLAIN", "a=b=c"}, {"EMPTY", ""}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("entries = %q, want %q", got, want)
+	}
+}
+
 // TestGetEnvVarsScrubsCommonSecretShapes covers the broadened name patterns
 // and the value-shape detection of URL-embedded credentials.
 func TestGetEnvVarsScrubsCommonSecretShapes(t *testing.T) {
@@ -175,7 +192,7 @@ func TestBuildInfoAttributesDoesNotPanic(t *testing.T) {
 	// In `go test` binaries the x/sys dependency must appear.
 	found := false
 	for _, m := range modules {
-		if strings.HasPrefix(m, "golang.org/x/sys@") {
+		if m.path == "golang.org/x/sys" && m.installed != "" {
 			found = true
 		}
 	}
@@ -206,5 +223,75 @@ func TestBreadcrumbRingDisabled(t *testing.T) {
 	}
 	if newBreadcrumbRing(-1) != nil {
 		t.Error("negative capacity should produce nil ring")
+	}
+}
+
+func TestGetEnvVarsRedactsURLSecrets(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"redis://:s3cretpw@redis:6379/0", redactedValue},
+		{"https://ghp_TOKEN:x-oauth-basic@github.com/org/repo.git", redactedValue},
+		{"https://u:pw@goproxy.corp,https://ghp_SECOND@goproxy2.corp,direct", redactedValue},
+		{"amqp://user:p@ss@broker/vhost", redactedValue},
+		{"jdbc:mysql://root:hunter2@db/app", redactedValue},
+		{"postgres://user:pw@bad host/db", redactedValue},
+		{"-Ddb.url=postgres://u:p@h/db -Xmx1g", redactedValue},
+		{"https://proxy/?target=postgres://u:p@h/db", redactedValue},
+		{"smtp://alerts@example.com:hunter2@smtp.example.com:587", redactedValue},
+		{"https://proxy.golang.org,https://me@corp.com:TOK@goproxy.corp,direct", redactedValue},
+		{"postgres://user:pa?ss@db/app", redactedValue},
+		{"redis://:s3c#ret@redis:6379/0", redactedValue},
+		{"https://user:@example.com/path", "https://user:@example.com/path"},
+		{"smtps://smtp.example.com:465?to=oncall@example.com", "smtps://smtp.example.com:465?to=oncall@example.com"},
+		{"http://[::1]:8080?email=a@b.example.com", "http://[::1]:8080?email=a@b.example.com"},
+		{"ssh://git@github.com:22/org/repo.git", "ssh://git@github.com:22/org/repo.git"},
+		{"redis://:@redis:6379/0", "redis://:@redis:6379/0"},
+		{"smtps://alerts@smtp.example.com:465?to=oncall@example.com", "smtps://alerts@smtp.example.com:465?to=oncall@example.com"},
+		{"postgresql://db/app?user=app&password=s3cretpw", "postgresql://db/app?user=app&password=REDACTED"},
+		{"jdbc:mysql://db:3306/app?user=root&password=hunter2", "jdbc:mysql://db:3306/app?user=root&password=REDACTED"},
+		{"jdbc:postgresql://db/app?password=hunter2#frag", "jdbc:postgresql://db/app?password=REDACTED#frag"},
+		{"https://h/p?b=1&access_token=x&X-Amz-Signature=y&sig=z&api_key=k&pwd=p&Auth=a&a=2", "https://h/p?b=1&access_token=REDACTED&X-Amz-Signature=REDACTED&sig=REDACTED&api_key=REDACTED&pwd=REDACTED&Auth=REDACTED&a=2"},
+		{"mongodb://db1:27017/app?replicaSet=rs0&authSource=admin&authMechanism=SCRAM-SHA-256", "mongodb://db1:27017/app?replicaSet=rs0&authSource=admin&authMechanism=SCRAM-SHA-256"},
+		{"https://jira.example.com/issues/?assignee=bob&project=OPS", "https://jira.example.com/issues/?assignee=bob&project=OPS"},
+		{"https://h/p?token=", "https://h/p?token="},
+		{"https://submit.backtrace.io/universe/SECRETSUBMITTOKEN/json", "https://submit.backtrace.io/universe/REDACTED/json"},
+		{"https://user@example.com/path", "https://user@example.com/path"},
+		{"https://example.com:8443/path", "https://example.com:8443/path"},
+		{"plain value", "plain value"},
+	}
+	for _, c := range cases {
+		t.Setenv("BT_SHAPE_VALUE", c.in)
+		if got := getEnvVars(envCaptureOptions{allowlist: []string{"BT_SHAPE_VALUE"}})["BT_SHAPE_VALUE"]; got != c.want {
+			t.Errorf("%q captured as %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSecretQueryKey(t *testing.T) {
+	secret := []string{
+		"password", "sslpassword", "PassWord", "pass", "dbPass", "pwd", "passphrase", "myPassPhrase",
+		"passcode", "secret", "client_secret", "secretkey", "privatekey", "privateKey",
+		"token", "access_token", "Token", "_authToken", "X-Amz-Security-Token",
+		"auth", "basicAuth", "authorization", "Authorization",
+		"key", "api_key", "apiKey", "APIKey", "HMACKey", "accessKey", "apikey", "api key", "sentry_key",
+		"sig", "xSig", "signature", "X-Amz-Signature", "X-Goog-Signature",
+		"token2", "password1", "token_v2", "api_key_2", "apiKeyV2", "client_secret_2", "token[0]",
+	}
+	kept := []string{
+		"authSource", "authMechanism", "allowPublicKeyRetrieval", "allowNativePasswords",
+		"tlsCertificateKeyFile", "sslkey", "passfile", "X-Amz-SignedHeaders", "X-Amz-Credential",
+		"assignee", "design", "signal", "signup", "insights", "keyword", "keyspace", "monkey",
+		"sortkey", "key_id", "AWSAccessKeyId", "passive", "compass", "bypass_cache", "author",
+		"oauth_callback", "tokenizer", "max_tokens", "token_type", "secretary", "secret_name",
+		"v2", "2", "",
+	}
+	for _, name := range secret {
+		if !secretQueryKey(name) {
+			t.Errorf("secretQueryKey(%q) = false, want true", name)
+		}
+	}
+	for _, name := range kept {
+		if secretQueryKey(name) {
+			t.Errorf("secretQueryKey(%q) = true, want false", name)
+		}
 	}
 }

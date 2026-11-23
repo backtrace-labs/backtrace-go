@@ -7,9 +7,12 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // processSessionID identifies this process instance across its reports.
@@ -48,18 +51,41 @@ func computeStaticAttributes() map[string]interface{} {
 }
 
 // runtimeAttributes captures per-report runtime state. Kept cheap: no forced
-// GC, no stop-the-world beyond ReadMemStats' brief pause.
+// GC, no stop-the-world.
 func runtimeAttributes(attrs map[string]interface{}) {
 	attrs["runtime.goroutines"] = runtime.NumGoroutine()
 	attrs["runtime.gomaxprocs"] = runtime.GOMAXPROCS(0)
 	attrs["process.age"] = int64(time.Since(processStart).Seconds())
 
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	attrs["memory.heap.alloc"] = m.HeapAlloc
-	attrs["memory.heap.sys"] = m.HeapSys
-	attrs["memory.heap.objects"] = m.HeapObjects
-	attrs["gc.count"] = m.NumGC
+	samples := []metrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/memory/classes/heap/unused:bytes"},
+		{Name: "/memory/classes/heap/free:bytes"},
+		{Name: "/memory/classes/heap/released:bytes"},
+		{Name: "/gc/heap/objects:objects"},
+		{Name: "/gc/cycles/total:gc-cycles"},
+		{Name: "/gc/gogc:percent"},
+		{Name: "/gc/gomemlimit:bytes"},
+	}
+	metrics.Read(samples)
+	value := make([]uint64, len(samples))
+	for i, sample := range samples {
+		if sample.Value.Kind() != metrics.KindUint64 {
+			return
+		}
+		value[i] = sample.Value.Uint64()
+	}
+	attrs["memory.heap.alloc"] = value[0]
+	attrs["memory.heap.sys"] = value[0] + value[1] + value[2] + value[3]
+	attrs["memory.heap.objects"] = value[4]
+	attrs["gc.count"] = value[5]
+	// GOGC=off reads as the sign-extended -1.
+	if gogc := int64(value[6]); gogc >= 0 {
+		attrs["runtime.gogc"] = gogc
+	} else {
+		attrs["runtime.gogc"] = "off"
+	}
+	attrs["runtime.gomemlimit"] = value[7]
 }
 
 var (
@@ -96,16 +122,20 @@ func machineGUID(d diag) string {
 var (
 	buildInfoOnce    sync.Once
 	buildInfoAttrs   map[string]interface{}
-	buildInfoModules []string
+	buildInfoModules []moduleDependency
 )
 
 // maxDependencyModules caps the dependency annotation size.
 const maxDependencyModules = 512
 
+type moduleDependency struct {
+	path, installed, requested string
+}
+
 // buildInfoAttributes extracts release metadata embedded by the Go toolchain:
 // main module version, VCS revision/time/dirty flag, and the dependency list
 // (attached to reports as the "Dependencies" annotation, capped).
-func buildInfoAttributes() (map[string]interface{}, []string) {
+func buildInfoAttributes() (map[string]interface{}, []moduleDependency) {
 	buildInfoOnce.Do(func() {
 		attrs := map[string]interface{}{}
 		info, ok := debug.ReadBuildInfo()
@@ -126,22 +156,44 @@ func buildInfoAttributes() (map[string]interface{}, []string) {
 				attrs["vcs.modified"] = s.Value
 			}
 		}
-		deps := info.Deps
-		if len(deps) > maxDependencyModules {
-			deps = deps[:maxDependencyModules]
-		}
-		modules := make([]string, 0, len(deps))
-		for _, dep := range deps {
-			m := dep
-			if m.Replace != nil {
-				m = m.Replace
-			}
-			modules = append(modules, m.Path+"@"+m.Version)
-		}
 		buildInfoAttrs = attrs
-		buildInfoModules = modules
+		buildInfoModules = moduleDependencies(info.Deps)
 	})
 	return buildInfoAttrs, buildInfoModules
+}
+
+func moduleDependencies(deps []*debug.Module) []moduleDependency {
+	if len(deps) > maxDependencyModules {
+		deps = deps[:maxDependencyModules]
+	}
+	modules := make([]moduleDependency, 0, len(deps))
+	for _, dep := range deps {
+		m := moduleDependency{path: dep.Path, installed: dep.Version}
+		if r := dep.Replace; r != nil {
+			m.requested = dep.Version
+			m.installed = r.Version
+			if r.Path != dep.Path {
+				m.installed = r.Path
+				if r.Version != "" {
+					m.installed += "@" + r.Version
+				}
+			}
+		}
+		modules = append(modules, m)
+	}
+	return modules
+}
+
+func dependencyAnnotation(modules []moduleDependency) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(modules))
+	for _, m := range modules {
+		entry := map[string]string{"installedVersion": m.installed}
+		if m.requested != "" {
+			entry["requestedVersion"] = m.requested
+		}
+		out[m.path] = entry
+	}
+	return out
 }
 
 // defaultEnvScrubPatterns match environment variable names whose values are
@@ -155,10 +207,12 @@ var defaultEnvScrubPatterns = []string{
 	"DSN", "COOKIE", "SESSION", "SIGNATURE", "BEARER", "CONN",
 }
 
-// urlUserinfoPattern matches connection-string values with embedded
-// credentials (scheme://user:password@host), regardless of the variable
-// name (DATABASE_URL, REDIS_URL, MONGODB_URI, ...).
-var urlUserinfoPattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^/@\s]+:[^/@\s]+@`)
+var urlSchemePattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://`)
+
+var (
+	secretQueryWords    = []string{"key", "sig", "pass", "pwd", "auth", "passcode", "authorization"}
+	secretQuerySuffixes = []string{"password", "passwd", "passphrase", "secret", "token", "signature", "apikey", "secretkey", "privatekey"}
+)
 
 const redactedValue = "[REDACTED]"
 
@@ -188,7 +242,7 @@ func getEnvVars(opts envCaptureOptions) map[string]string {
 				return redactedValue
 			}
 		}
-		if urlUserinfoPattern.MatchString(value) {
+		if embedsURLPassword(value) {
 			return redactedValue
 		}
 		// Submission-URL shapes (the SDK's own BACKTRACE_ENDPOINT, or any
@@ -227,7 +281,7 @@ func getEnvVars(opts envCaptureOptions) map[string]string {
 		if opts.maxVars > 0 && len(result) >= opts.maxVars {
 			break
 		}
-		key, value, ok := strings.Cut(line, "=")
+		key, value, ok := envEntry(line)
 		if !ok {
 			continue
 		}
@@ -236,19 +290,133 @@ func getEnvVars(opts envCaptureOptions) map[string]string {
 	return result
 }
 
+func envEntry(line string) (key, value string, ok bool) {
+	key, value, ok = strings.Cut(line, "=")
+	// Windows keeps hidden entries such as "=C:=C:\dir" in the environment.
+	return key, value, ok && key != ""
+}
+
 // redactSubmissionValue redacts embedded Backtrace submission tokens
 // (?token= query or submit-style path) in URL-shaped env values.
+// Other secret-looking query values are redacted too.
 func redactSubmissionValue(value string) string {
-	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+	if !strings.Contains(value, "://") {
 		return value
 	}
 	u, err := neturl.Parse(value)
-	if err != nil {
+	if err != nil || u.Scheme == "" {
 		return value
 	}
-	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if u.Query().Get("token") != "" || pathEmbedsToken(u.Hostname(), segments) {
-		return redactURL(value)
+	changed := false
+	if query, ok := redactSecretQuery(u.RawQuery); ok {
+		u.RawQuery = query
+		changed = true
 	}
-	return value
+	if u.Scheme == "http" || u.Scheme == "https" {
+		segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if pathEmbedsToken(u.Hostname(), segments) {
+			segments[1] = "REDACTED"
+			u.Path = "/" + strings.Join(segments, "/")
+			changed = true
+		}
+	}
+	if !changed {
+		return value
+	}
+	return u.String()
+}
+
+func redactSecretQuery(raw string) (string, bool) {
+	pairs := strings.Split(raw, "&")
+	changed := false
+	for i, pair := range pairs {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok || value == "" {
+			continue
+		}
+		name, err := neturl.QueryUnescape(key)
+		if err != nil {
+			name = key
+		}
+		if secretQueryKey(name) {
+			pairs[i] = key + "=REDACTED"
+			changed = true
+		}
+	}
+	return strings.Join(pairs, "&"), changed
+}
+
+// A '?' or '#' before the '@' belongs to the password unless the text before
+// it is a host:port.
+func embedsURLPassword(value string) bool {
+	for _, loc := range urlSchemePattern.FindAllStringIndex(value, -1) {
+		rest := value[loc[1]:]
+		if end := strings.IndexFunc(rest, func(r rune) bool { return r == '/' || unicode.IsSpace(r) }); end >= 0 {
+			rest = rest[:end]
+		}
+		authority := rest
+		if end := strings.IndexAny(rest, "?#"); end >= 0 && (strings.Contains(rest[:end], "@") || isHostPort(rest[:end])) {
+			authority = rest[:end]
+		}
+		at := strings.LastIndex(authority, "@")
+		if at < 0 {
+			continue
+		}
+		if _, password, ok := strings.Cut(authority[:at], ":"); ok && password != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isHostPort(s string) bool {
+	i := strings.LastIndex(s, ":")
+	return i < 0 || strings.HasSuffix(s, "]") || strings.Trim(s[i+1:], "0123456789") == ""
+}
+
+func secretQueryKey(name string) bool {
+	words := keyWords(name)
+	for len(words) > 0 && isVersionWord(words[len(words)-1]) {
+		words = words[:len(words)-1]
+	}
+	if len(words) == 0 {
+		return false
+	}
+	last := len(words) - 1
+	words[last] = strings.TrimRight(words[last], "0123456789")
+	if slices.Contains(secretQueryWords, words[last]) {
+		return true
+	}
+	joined := strings.Join(words, "")
+	for _, suffix := range secretQuerySuffixes {
+		if strings.HasSuffix(joined, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// keyWords splits at punctuation and camelCase: "X-Amz-Signature" gives x,
+// amz, signature and "APIKeyV2" gives api, key, v2.
+func keyWords(name string) []string {
+	var words []string
+	fields := strings.FieldsFunc(name, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	for _, f := range fields {
+		start := 0
+		for i := 1; i < len(f); i++ {
+			if isUpperASCII(f[i:]) && (!isUpperASCII(f[i-1:]) || i+1 < len(f) && !isUpperASCII(f[i+1:])) {
+				words = append(words, strings.ToLower(f[start:i]))
+				start = i
+			}
+		}
+		words = append(words, strings.ToLower(f[start:]))
+	}
+	return words
+}
+
+func isVersionWord(word string) bool {
+	digits := strings.TrimPrefix(word, "v")
+	return digits != "" && strings.Trim(digits, "0123456789") == ""
 }

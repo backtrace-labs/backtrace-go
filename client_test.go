@@ -38,6 +38,15 @@ func newTestClient(t *testing.T, mutate func(*Config)) (*Client, *recordingServe
 	return c, rs
 }
 
+// Test binaries built by Go 1.26 and older carry no dependency list.
+func standInModules(t *testing.T, modules ...moduleDependency) {
+	t.Helper()
+	buildInfoAttributes()
+	saved := buildInfoModules
+	buildInfoModules = modules
+	t.Cleanup(func() { buildInfoModules = saved })
+}
+
 func TestNewClientValidation(t *testing.T) {
 	// Neutralize any BACKTRACE_* variables from the outer environment.
 	t.Setenv(envEndpoint, "")
@@ -1126,12 +1135,7 @@ func TestBeforeSendSeesNormalisedTypes(t *testing.T) {
 // values that came from Config.Attributes, SetAttribute or the breadcrumb
 // ring are shared between reports and must not carry one report's edits.
 func TestBeforeSendEditsStayInOneReport(t *testing.T) {
-	// The dependency list is one slice for the whole process. A test binary
-	// has none, so stand one in (after the real lookup has settled).
-	buildInfoAttributes()
-	realModules := buildInfoModules
-	buildInfoModules = []string{"example.com/dep@v1.0.0"}
-	t.Cleanup(func() { buildInfoModules = realModules })
+	standInModules(t, moduleDependency{path: "example.com/dep", installed: "v1.0.0"})
 
 	var calls atomic.Int32
 	c, rs := newTestClient(t, func(cfg *Config) {
@@ -1145,8 +1149,10 @@ func TestBeforeSendEditsStayInOneReport(t *testing.T) {
 			if crumbs, ok := r.Annotations["breadcrumbs"].([]Breadcrumb); ok && len(crumbs) > 0 {
 				crumbs[0].Attributes["first-only"] = true
 			}
-			if deps, ok := r.Annotations["Dependencies"].([]string); ok && len(deps) > 0 {
-				deps[0] = "first-only"
+			if deps, ok := r.Annotations["Dependencies"].(map[string]map[string]string); ok {
+				if dep, ok := deps["example.com/dep"]; ok {
+					dep["installedVersion"] = "first-only"
+				}
 			}
 			return r
 		}
@@ -1180,8 +1186,9 @@ func TestBeforeSendEditsStayInOneReport(t *testing.T) {
 	if _, leaked := crumbAttrs["first-only"]; leaked {
 		t.Error("an edit to a breadcrumb in the first report leaked into the second")
 	}
-	deps, _ := annotations["Dependencies"].([]interface{})
-	if len(deps) != 1 || deps[0] != "example.com/dep@v1.0.0" {
+	deps, _ := annotations["Dependencies"].(map[string]any)
+	dep, _ := deps["example.com/dep"].(map[string]any)
+	if dep["installedVersion"] != "v1.0.0" {
 		t.Errorf("an edit to the dependency list in the first report leaked into the second: %v", deps)
 	}
 }
