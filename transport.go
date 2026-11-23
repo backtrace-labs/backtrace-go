@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	neturl "net/url"
@@ -22,11 +23,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // errRateLimited is returned by httpTransport.send while submissions are
 // paused due to a server 429 response.
 var errRateLimited = errors.New("bt: rate limited by server, report dropped")
+
+var errCircuitOpen = errors.New("bt: submissions paused after consecutive network failures, report dropped")
 
 // rateLimitFallback is the pause applied after a 429 without a parsable
 // Retry-After header.
@@ -41,6 +45,11 @@ const (
 	retryBackoffBase = time.Second
 	retryBackoffCap  = 30 * time.Second
 	maxRetryWait     = 60 * time.Second
+
+	circuitThreshold = 5
+	circuitPause     = 30 * time.Second
+
+	expectContinueBytes = 256 << 10
 )
 
 // httpTransport delivers serialized reports over HTTP. It is safe for
@@ -48,7 +57,8 @@ const (
 // request context (independent of any custom http.Client), verifies
 // response status, honors 429 Retry-After, drains response bodies so
 // connections are reused, and never lets a credential-bearing URL escape
-// into an error or log line.
+// into an error or log line. It also retries transient failures and pauses
+// submissions after repeated network failures.
 type httpTransport struct {
 	client  *http.Client
 	timeout time.Duration
@@ -63,6 +73,7 @@ type httpTransport struct {
 	pauseUntil  time.Time
 	pauseReason dropReason
 	pauseErr    error
+	failures    int
 
 	warnedPermanent atomic.Bool
 }
@@ -86,19 +97,35 @@ func newHTTPTransport(client *http.Client, timeout time.Duration) *httpTransport
 	}
 
 	// The SDK's own client gets its own connection pool, configured like
-	// the process default (proxy, TLS, timeouts). A client with a nil
+	// the process default (proxy, TLS). A client with a nil
 	// Transport would share http.DefaultTransport with the application,
 	// and closing idle connections at shutdown would close the
 	// application's as well.
 	t.client = &http.Client{CheckRedirect: noRedirect}
 	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		t.client.Transport = base.Clone()
+		t.client.Transport = sdkTransport(base)
 		t.ownsClient = true
 	}
 	// A replaced http.DefaultTransport (instrumentation, a custom
 	// RoundTripper) cannot be copied: it is used as it is and, being
 	// shared, left alone at shutdown.
 	return t
+}
+
+func sdkTransport(base *http.Transport) *http.Transport {
+	tr := base.Clone()
+	dial := tr.DialContext
+	if dial == nil {
+		dial = (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext
+	}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return dial(ctx, network, addr)
+	}
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	tr.ResponseHeaderTimeout = 20 * time.Second
+	return tr
 }
 
 func (t *httpTransport) closeIdleConnections() {
@@ -124,6 +151,25 @@ func (t *httpTransport) pause(d time.Duration, reason dropReason, err error) {
 	t.pauseUntil = time.Now().Add(d)
 	t.pauseReason = reason
 	t.pauseErr = err
+}
+
+func (t *httpTransport) recordNetworkFailure() {
+	t.mu.Lock()
+	t.failures++
+	open := t.failures >= circuitThreshold
+	if open {
+		t.failures = 0
+	}
+	t.mu.Unlock()
+	if open {
+		t.pause(circuitPause, dropNetwork, errCircuitOpen)
+	}
+}
+
+func (t *httpTransport) recordResponse() {
+	t.mu.Lock()
+	t.failures = 0
+	t.mu.Unlock()
 }
 
 func fullJitter(retry int) time.Duration {
@@ -260,6 +306,9 @@ func (t *httpTransport) attempt(parent context.Context, url string, p payload) a
 	if p.gzipped {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
+	if len(p.body) >= expectContinueBytes {
+		req.Header.Set("Expect", "100-continue")
+	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
@@ -268,8 +317,10 @@ func (t *httpTransport) attempt(parent context.Context, url string, p payload) a
 		if parent.Err() != nil {
 			return attemptResult{reason: dropClosed, err: err}
 		}
+		t.recordNetworkFailure()
 		return attemptResult{reason: dropNetwork, err: err, retry: !wrote.Load()}
 	}
+	t.recordResponse()
 	defer func() {
 		// Drain (bounded) so the keep-alive connection can be reused.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
@@ -342,7 +393,7 @@ func sanitizeHTTPError(err error, rawURL string) string {
 }
 
 // maxMultipartNameLength bounds sanitized attachment part names.
-const maxMultipartNameLength = 255
+const maxMultipartNameLength = 220
 
 // safeMultipartName reduces an attachment path to a conservative printable
 // basename for use in multipart part names and filenames.
@@ -367,9 +418,31 @@ func safeMultipartName(path string) string {
 		return "attachment"
 	}
 	if len(name) > maxMultipartNameLength {
-		name = name[len(name)-maxMultipartNameLength:]
+		cut := len(name) - maxMultipartNameLength
+		for cut < len(name) && !utf8.RuneStart(name[cut]) {
+			cut++
+		}
+		name = name[cut:]
 	}
 	return name
+}
+
+func uniquePartName(name string, used map[string]bool) string {
+	if !used[name] {
+		return name
+	}
+	ext := filepath.Ext(name)
+	if len(ext) > 16 {
+		ext = ""
+	}
+	stem := strings.TrimSuffix(name, ext)
+	for i := 1; ; i++ {
+		suffix := "_" + strconv.Itoa(i) + ext
+		candidate := truncateUTF8(stem, maxMultipartNameLength-len(suffix)) + suffix
+		if !used[candidate] {
+			return candidate
+		}
+	}
 }
 
 // buildMultipart assembles the multipart body documented for Backtrace
@@ -447,18 +520,7 @@ func buildMultipart(body []byte, attachments []string, inline []inlinePart, limi
 
 		// Attachments from different directories may share a basename;
 		// uniquify so no part overwrites another.
-		name := label
-		if used[name] {
-			ext := filepath.Ext(name)
-			stem := strings.TrimSuffix(name, ext)
-			for i := 1; ; i++ {
-				candidate := fmt.Sprintf("%s_%d%s", stem, i, ext)
-				if !used[candidate] {
-					name = candidate
-					break
-				}
-			}
-		}
+		name := uniquePartName(label, used)
 		used[name] = true
 
 		// Remember the buffer position so a failed or over-limit read

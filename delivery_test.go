@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -183,6 +187,73 @@ func TestFullJitterBounds(t *testing.T) {
 	}
 }
 
+func TestFailureCircuitOpensAfterConsecutiveNetworkFailures(t *testing.T) {
+	tr, rt := newScriptedTransport(rtStep{err: errFakeNetwork})
+	for i := 0; i < circuitThreshold; i++ {
+		if res := tr.send(context.Background(), fakeURL, testPayload, 0, (&waitLog{}).wait, diag{}); res.reason != dropNetwork {
+			t.Fatalf("send %d reason = %v, want dropNetwork", i, res.reason)
+		}
+	}
+	reason, err := tr.pauseState()
+	if reason != dropNetwork || err != errCircuitOpen {
+		t.Fatalf("pauseState = (%v, %v), want open circuit", reason, err)
+	}
+	tr.mu.Lock()
+	remaining := time.Until(tr.pauseUntil)
+	tr.mu.Unlock()
+	if remaining <= circuitPause-5*time.Second || remaining > circuitPause {
+		t.Errorf("circuit pause = %v, want about %v", remaining, circuitPause)
+	}
+	res := tr.send(context.Background(), fakeURL, testPayload, 0, (&waitLog{}).wait, diag{})
+	if res.err != errCircuitOpen || rt.calls() != circuitThreshold {
+		t.Errorf("send while open = %v after %d calls, want errCircuitOpen and no request", res.err, rt.calls())
+	}
+}
+
+func TestFailureCircuitStopsRetries(t *testing.T) {
+	tr, rt := newScriptedTransport(rtStep{err: errFakeNetwork})
+	var w waitLog
+	res := tr.send(context.Background(), fakeURL, testPayload, 10, w.wait, diag{})
+	if rt.calls() != circuitThreshold || res.err != errCircuitOpen || res.reason != dropNetwork {
+		t.Errorf("attempts = %d, result = (%v, %v), want %d attempts then the open circuit",
+			rt.calls(), res.reason, res.err, circuitThreshold)
+	}
+	if res.retries != circuitThreshold-1 || len(w.waits) != circuitThreshold-1 {
+		t.Errorf("retries = %d, waits = %d, want %d each (no wait or retry after the circuit opened)",
+			res.retries, len(w.waits), circuitThreshold-1)
+	}
+}
+
+func TestPauseDuringRetryWaitIsNotARetry(t *testing.T) {
+	tr, rt := newScriptedTransport(rtStep{status: 503})
+	waits := 0
+	pauseWhileWaiting := func(time.Duration) bool {
+		waits++
+		tr.pause(time.Minute, dropRateLimit, errRateLimited)
+		return true
+	}
+	res := tr.send(context.Background(), fakeURL, testPayload, 2, pauseWhileWaiting, diag{})
+	if rt.calls() != 1 || waits != 1 || res.retries != 0 || res.reason != dropRateLimit || res.err != errRateLimited {
+		t.Errorf("attempts = %d, waits = %d, result = %+v, want one attempt, one wait, no retry and the rate-limit pause",
+			rt.calls(), waits, res)
+	}
+}
+
+func TestResponseResetsFailureCircuit(t *testing.T) {
+	fail := rtStep{err: errFakeNetwork}
+	tr, _ := newScriptedTransport(fail, fail, fail, fail, rtStep{status: 500}, fail, fail, fail, fail, fail)
+	for i := 0; i < 9; i++ {
+		tr.send(context.Background(), fakeURL, testPayload, 0, (&waitLog{}).wait, diag{})
+	}
+	if _, err := tr.pauseState(); err != nil {
+		t.Fatalf("paused after 4+4 failures split by a response: %v", err)
+	}
+	tr.send(context.Background(), fakeURL, testPayload, 0, (&waitLog{}).wait, diag{})
+	if _, err := tr.pauseState(); err != errCircuitOpen {
+		t.Errorf("pauseState after 5 consecutive failures = %v, want errCircuitOpen", err)
+	}
+}
+
 type blockingTransport struct {
 	wroteBody bool
 	entered   chan struct{}
@@ -215,6 +286,12 @@ func TestRootCancellationCountsAsClosed(t *testing.T) {
 	if res.reason != dropClosed || res.retries != 0 || rt.calls.Load() != 1 {
 		t.Errorf("send = %+v after %d calls, want one attempt dropped as Closed", res, rt.calls.Load())
 	}
+	tr.mu.Lock()
+	failures := tr.failures
+	tr.mu.Unlock()
+	if failures != 0 {
+		t.Errorf("cancellation counted as %d network failures", failures)
+	}
 
 	tr2, _ := newScriptedTransport(rtStep{status: 503})
 	stop := func(time.Duration) bool { return false }
@@ -237,6 +314,24 @@ func TestAttemptTimeoutRetriedOnlyBeforeBodySent(t *testing.T) {
 			t.Errorf("wroteBody=%v: attempts = %d, reason = %v, want %d attempts and dropNetwork",
 				wrote, rt.calls.Load(), res.reason, want)
 		}
+	}
+}
+
+func TestRequestHeaders(t *testing.T) {
+	tr, rt := newScriptedTransport(rtStep{status: 200})
+	wait := (&waitLog{}).wait
+	tr.send(context.Background(), fakeURL, payload{body: make([]byte, expectContinueBytes), contentType: "application/json", gzipped: true}, 0, wait, diag{})
+	tr.send(context.Background(), fakeURL, payload{body: make([]byte, expectContinueBytes-1), contentType: "application/json"}, 0, wait, diag{})
+
+	big, small := rt.headers[0], rt.headers[1]
+	if big.Get("Expect") != "100-continue" || big.Get("Content-Encoding") != "gzip" {
+		t.Errorf("256 KiB gzip body headers = %v, want Expect: 100-continue and Content-Encoding: gzip", big)
+	}
+	if small.Get("Expect") != "" || small.Get("Content-Encoding") != "" {
+		t.Errorf("small plain body headers = %v, want no Expect or Content-Encoding", small)
+	}
+	if small.Get("Content-Type") != "application/json" || !strings.HasPrefix(small.Get("User-Agent"), "backtrace-go/") {
+		t.Errorf("headers = %v", small)
 	}
 }
 
@@ -447,6 +542,42 @@ func TestRedirects(t *testing.T) {
 			t.Error("the supplied client was modified")
 		}
 	})
+}
+
+func TestSDKOwnedTransport(t *testing.T) {
+	errDialed := errors.New("dialed")
+	var deadline time.Time
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.TLSHandshakeTimeout = time.Minute
+	base.ResponseHeaderTimeout = 0
+	base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		deadline, _ = ctx.Deadline()
+		return nil, errDialed
+	}
+	orig := http.DefaultTransport
+	http.DefaultTransport = base
+	t.Cleanup(func() { http.DefaultTransport = orig })
+
+	tr := newHTTPTransport(nil, time.Second)
+	owned, _ := tr.client.Transport.(*http.Transport)
+	if !tr.ownsClient || owned == nil || owned == base || tr.client.CheckRedirect == nil {
+		t.Fatalf("SDK client does not use its own clone: %#v", tr.client)
+	}
+	if owned.TLSHandshakeTimeout != 10*time.Second || owned.ResponseHeaderTimeout != 20*time.Second || owned.Proxy == nil {
+		t.Errorf("TLS handshake %v, response header %v, proxy set %v; want 10s, 20s, true",
+			owned.TLSHandshakeTimeout, owned.ResponseHeaderTimeout, owned.Proxy != nil)
+	}
+	before := time.Now()
+	if _, err := owned.DialContext(context.Background(), "tcp", "127.0.0.1:1"); err != errDialed {
+		t.Fatalf("dial = %v, want the DefaultTransport dialer", err)
+	}
+	after := time.Now()
+	if deadline.Before(before.Add(10*time.Second)) || deadline.After(after.Add(10*time.Second)) {
+		t.Errorf("dial deadline in %v, want 10s", deadline.Sub(before))
+	}
+	if base.TLSHandshakeTimeout != time.Minute || base.ResponseHeaderTimeout != 0 {
+		t.Error("http.DefaultTransport was modified")
+	}
 }
 
 func getReusesConn(t *testing.T, client *http.Client, url string) (reused bool) {
@@ -699,6 +830,73 @@ func TestRetryWaitRunsPriorityReports(t *testing.T) {
 	}
 	if s := c.Stats(); s.Delivered != 1 || s.Closed != 1 || s.ServerReject != 0 || s.Retries != 0 {
 		t.Errorf("stats = %+v, want Delivered 1, Closed 1", s)
+	}
+}
+
+type countingConn struct {
+	net.Conn
+	written *atomic.Int64
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.written.Add(int64(n))
+	return n, err
+}
+
+func TestExpectContinueSkipsUploadOnRejection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "noise.bin")
+	noise := make([]byte, 1<<20)
+	if _, err := rand.Read(noise); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, noise, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(t *testing.T, handler http.HandlerFunc) (int64, ClientStats) {
+		srv := httptest.NewServer(handler)
+		t.Cleanup(srv.Close)
+		var written atomic.Int64
+		base := http.DefaultTransport.(*http.Transport).Clone()
+		base.ExpectContinueTimeout = 5 * time.Second
+		base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &countingConn{Conn: conn, written: &written}, nil
+		}
+		c, err := NewClient(Config{
+			Endpoint:        srv.URL,
+			Token:           "expect-token",
+			HTTPClient:      &http.Client{Transport: base},
+			AttachmentPaths: []string{path},
+			Logger:          &lineLogger{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(c.Close)
+		c.ReportMessage("large", nil)
+		if !c.Flush(10 * time.Second) {
+			t.Fatal("Flush timed out")
+		}
+		return written.Load(), c.Stats()
+	}
+
+	written, stats := run(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	if written >= expectContinueBytes || stats.ServerReject != 1 {
+		t.Errorf("rejected upload wrote %d bytes (stats %+v), want headers only", written, stats)
+	}
+
+	written, stats = run(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+	})
+	if written < 1<<20 || stats.Delivered != 1 {
+		t.Errorf("accepted upload wrote %d bytes (stats %+v), want the whole body", written, stats)
 	}
 }
 

@@ -371,3 +371,27 @@ func TestModuleDependencyReplace(t *testing.T) {
 		t.Errorf("dependencies = %v, want %v", got, want)
 	}
 }
+
+func TestLongAttachmentNamesFitBackendLimit(t *testing.T) {
+	const partNameCap = 220
+	long := strings.Repeat("é", 150) + "x.log"
+	name := safeMultipartName("/var/log/" + long)
+	if len(name) > partNameCap || !utf8.ValidString(name) || !strings.HasSuffix(name, ".log") {
+		t.Errorf("name = %d bytes (valid %v): %q", len(name), utf8.ValidString(name), name)
+	}
+
+	used := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		got := uniquePartName(name, used)
+		if used[got] || len(got) > partNameCap || !utf8.ValidString(got) {
+			t.Fatalf("uniquePartName = %q (%d bytes, reused %v)", got, len(got), used[got])
+		}
+		used[got] = true
+	}
+
+	longExt := "x." + strings.Repeat("e", 218)
+	used = map[string]bool{longExt: true}
+	if got := uniquePartName(longExt, used); got == longExt || len(got) > partNameCap {
+		t.Errorf("long-extension name not uniquified within the cap: %d bytes", len(got))
+	}
+}

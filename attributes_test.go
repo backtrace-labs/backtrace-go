@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGetEnvVarsSplitAndScrub(t *testing.T) {
@@ -92,6 +93,41 @@ func TestGetEnvVarsRedactsSubmissionURLs(t *testing.T) {
 	}
 	if strings.Contains(env["BT_SHAPE_LEGACY_ENDPOINT_URL"], "SECRETQUERYTOKEN") {
 		t.Errorf("query token leaked: %q", env["BT_SHAPE_LEGACY_ENDPOINT_URL"])
+	}
+}
+
+func TestGetEnvVarsHidesClientToken(t *testing.T) {
+	const token = "prefixed-submission-token"
+	t.Setenv("BACKTRACE_ENDPOINT", "https://proxy.corp/backtrace/universe/"+token+"/json")
+	t.Setenv("BT_SHAPE_QUOTED", `"https://proxy.corp/backtrace/universe/`+token+`/json"`)
+	t.Setenv("BT_SHAPE_SHORT", "ab-cd-ef")
+
+	env := getEnvVars(envCaptureOptions{secrets: submissionSecrets("https://proxy.corp/backtrace/universe/"+token+"/json", "ab-cd")})
+	for _, name := range []string{"BACKTRACE_ENDPOINT", "BT_SHAPE_QUOTED"} {
+		if strings.Contains(env[name], token) || !strings.Contains(env[name], "proxy.corp/backtrace/universe/REDACTED/json") {
+			t.Errorf("%s = %q, want the token hidden and the rest kept", name, env[name])
+		}
+	}
+	if env["BT_SHAPE_SHORT"] != "ab-cd-ef" {
+		t.Errorf("a secret shorter than %d bytes rewrote a value: %q", minEnvSecretLength, env["BT_SHAPE_SHORT"])
+	}
+}
+
+func TestReportEnvHidesClientEndpointToken(t *testing.T) {
+	const token = "prefixed-submission-token"
+	c, rs := newTestClient(t, func(cfg *Config) {
+		cfg.Endpoint += "/backtrace/universe/" + token + "/json"
+		cfg.Token = ""
+		cfg.EnvVars = []string{"BT_SHAPE_RELAY"}
+	})
+	t.Setenv("BT_SHAPE_RELAY", "relay at /backtrace/universe/"+token+"/json")
+
+	c.ReportMessage("env", nil)
+	if !c.Flush(5 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+	if got := envAnnotation(t, rs)["BT_SHAPE_RELAY"]; got != "relay at /backtrace/universe/REDACTED/json" {
+		t.Errorf("BT_SHAPE_RELAY = %q, want the endpoint token hidden", got)
 	}
 }
 

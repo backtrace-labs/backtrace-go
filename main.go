@@ -88,6 +88,9 @@ type OptionsStruct struct {
 	SourceRoots []string
 	// SampleRate is the fraction of reports sent; zero means 1.0.
 	SampleRate float64
+	// ReportsPerMinute caps reports per minute; see Config.ReportsPerMinute.
+	// Applied when the default client is created (first report).
+	ReportsPerMinute int
 	// BeforeSend runs before each report is serialized; see Config.BeforeSend.
 	BeforeSend func(report *ReportData) *ReportData
 	// ScrubEnvVars extends the built-in redaction patterns; see Config.ScrubEnvVars.
@@ -159,6 +162,7 @@ func optionsToConfig() Config {
 		SourceCode:               Options.SourceCode,
 		SourceRoots:              cloneStringSlice(Options.SourceRoots),
 		SampleRate:               Options.SampleRate,
+		ReportsPerMinute:         Options.ReportsPerMinute,
 		BeforeSend:               Options.BeforeSend,
 		ScrubEnvVars:             cloneStringSlice(Options.ScrubEnvVars),
 		EnvVars:                  cloneStringSlice(Options.EnvVars),

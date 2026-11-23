@@ -216,6 +216,8 @@ var (
 
 const redactedValue = "[REDACTED]"
 
+const minEnvSecretLength = 8
+
 // envCaptureOptions controls environment capture.
 type envCaptureOptions struct {
 	// allowlist, when non-empty, restricts capture to these exact names.
@@ -224,6 +226,8 @@ type envCaptureOptions struct {
 	extraPatterns []string
 	maxVars       int
 	maxBytes      int
+	// secrets are the client's own token strings, hidden in every value.
+	secrets []string
 }
 
 // getEnvVars returns the process environment (or an allowlisted subset) with
@@ -248,7 +252,13 @@ func getEnvVars(opts envCaptureOptions) map[string]string {
 		// Submission-URL shapes (the SDK's own BACKTRACE_ENDPOINT, or any
 		// variable holding a tokenized submit URL) get their token
 		// redacted while keeping the rest of the URL readable.
-		return redactSubmissionValue(value)
+		value = redactSubmissionValue(value)
+		for _, secret := range opts.secrets {
+			if len(secret) >= minEnvSecretLength {
+				value = strings.ReplaceAll(value, secret, "REDACTED")
+			}
+		}
+		return value
 	}
 
 	result := map[string]string{}

@@ -55,6 +55,8 @@ type Client struct {
 	// capture; admission still re-checks closed under enqueueMu.
 	closedFast atomic.Bool
 
+	limiter *reportLimiter
+
 	// progress is a broadcast channel: replaced (and the old one closed)
 	// each time the worker finishes a job or the client closes, waking
 	// every waiter.
@@ -174,6 +176,7 @@ func startClient(cfgFn func() Config, stable bool) *Client {
 		attributes:      map[string]interface{}{},
 		crumbs:          newBreadcrumbRing(cfg.MaxBreadcrumbs),
 		maxBreadcrumbs:  cfg.MaxBreadcrumbs,
+		limiter:         newReportLimiter(cfg.ReportsPerMinute),
 	}
 	for i := range c.lanes {
 		c.lanes[i].queue = make(chan clientJob, cfg.QueueSize)
@@ -574,12 +577,16 @@ type captureInput struct {
 // report. With a nil ctx it never blocks; with a ctx it retries queue
 // admission until the context is done. It never panics.
 func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, accepted bool) {
+	var slot time.Time
 	defer func() {
 		if r := recover(); r != nil {
 			// Type-only: the panic value may carry user data.
 			c.stats.drop(dropInternal)
 			c.internalDiag.logf("internal error while capturing report (please report to backtrace-labs/backtrace-go): %T", r)
 			seq, accepted = 0, false
+		}
+		if !accepted {
+			c.limiter.release(slot)
 		}
 	}()
 	if ctx == nil {
@@ -612,6 +619,15 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 	if in.kind != kindPanic && cfg.SampleRate < 1 && rand.Float64() >= cfg.SampleRate {
 		c.stats.drop(dropSampled)
 		c.internalDiag.logf("report sampled out (SampleRate=%v)", cfg.SampleRate)
+		return 0, false
+	}
+
+	slot, ok, first := c.limiter.allow()
+	if !ok {
+		c.stats.drop(dropClientRateLimit)
+		if first {
+			c.internalDiag.logf("reports dropped: client limit of %d reports per minute reached", c.limiter.limit)
+		}
 		return 0, false
 	}
 
@@ -694,6 +710,7 @@ func (c *Client) capture(ctx context.Context, in captureInput) (seq uint64, acce
 		annotations["Environment Variables"] = getEnvVars(envCaptureOptions{
 			allowlist:     cfg.EnvVars,
 			extraPatterns: cfg.ScrubEnvVars,
+			secrets:       submissionSecrets(cfg.Endpoint, cfg.Token),
 			maxVars:       cfg.MaxEnvVars,
 			maxBytes:      cfg.MaxEnvBytes,
 		})

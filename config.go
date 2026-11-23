@@ -190,6 +190,10 @@ type Config struct {
 	// COOKIE, SESSION, SIGNATURE, BEARER, CONN (case-insensitive) or when
 	// the value embeds URL credentials — but this cannot catch every
 	// secret (generically named vars, JWTs).
+	// The client's own Token and the token in its Endpoint, when at least
+	// 8 bytes long, become "REDACTED" in every value. In URL values, query
+	// values with secret-looking names, such as password, token, signature
+	// or api_key, become "REDACTED".
 	// Prefer EnvVars, or scrub with BeforeSend. Ignored when EnvVars is
 	// set.
 	SendEnvVars bool
@@ -224,6 +228,12 @@ type Config struct {
 	// [0, 1], NaN, and infinities are rejected by NewClient.
 	// Panic reports are never sampled out.
 	SampleRate float64
+
+	// ReportsPerMinute caps the reports the client accepts in any 60-second
+	// window. 0 means no limit. Negative values are rejected by NewClient.
+	// Panic reports count too. Dropped reports are counted in
+	// ClientStats.ClientRateLimited.
+	ReportsPerMinute int
 
 	// BeforeSend, when set, runs just before a report is serialized.
 	// Return the (optionally modified) report to send it, or nil to drop
@@ -263,6 +273,9 @@ type Config struct {
 	// network error before the request body was sent, or after a 408, 500,
 	// 502, 503 or 504 response. Default: 2. Negative disables retries. The
 	// waits between attempts add up to at most 60s per report.
+	//
+	// A 429 response, or 5 network failures in a row, pauses submissions.
+	// Reports are dropped during the pause.
 	MaxRetries int
 
 	// DisableCompression sends request bodies uncompressed. By default they
@@ -277,6 +290,9 @@ type Config struct {
 	// Cancellation is cooperative: a custom Transport/RoundTripper that
 	// ignores the request context cannot be forcefully terminated by the
 	// SDK and can hold the worker (and Close) past its deadline.
+	//
+	// When nil, the SDK's own client uses 10s dial and TLS handshake
+	// timeouts and a 20s response header timeout.
 	HTTPClient *http.Client
 
 	// Resource budgets; zero values use the documented defaults.
@@ -408,6 +424,9 @@ func (c Config) validate() error {
 	if math.IsNaN(c.SampleRate) || math.IsInf(c.SampleRate, 0) ||
 		c.SampleRate < 0 || c.SampleRate > 1 {
 		return fmt.Errorf("bt: Config.SampleRate must be finite and in [0,1], got %v", c.SampleRate)
+	}
+	if c.ReportsPerMinute < 0 {
+		return fmt.Errorf("bt: Config.ReportsPerMinute must be >= 0, got %d", c.ReportsPerMinute)
 	}
 	if c.QueueSize < 1 || c.QueueSize > maxQueueSize {
 		return fmt.Errorf("bt: Config.QueueSize must be in [1,%d], got %d", maxQueueSize, c.QueueSize)

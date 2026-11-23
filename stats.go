@@ -13,6 +13,7 @@ const (
 	dropSerialization
 	dropOversize
 	dropRateLimit
+	dropClientRateLimit
 	dropNetwork
 	dropServerReject
 	dropInternal
@@ -62,6 +63,8 @@ type ClientStats struct {
 	// Shutdown counts reports discarded because Close's deadline expired
 	// before they could be processed.
 	Shutdown uint64
+	// ClientRateLimited counts reports dropped by Config.ReportsPerMinute.
+	ClientRateLimited uint64
 }
 
 func (s *internalStats) snapshot() ClientStats {
@@ -80,5 +83,7 @@ func (s *internalStats) snapshot() ClientStats {
 		ServerReject:  s.drops[dropServerReject].Load(),
 		Internal:      s.drops[dropInternal].Load(),
 		Shutdown:      s.drops[dropShutdown].Load(),
+
+		ClientRateLimited: s.drops[dropClientRateLimit].Load(),
 	}
 }
