@@ -1,5 +1,4 @@
-//go:build darwin
-// +build darwin
+//go:build !linux && !freebsd
 
 package bt
 
@@ -85,7 +84,7 @@ type NewOptions struct {
 }
 
 // Returns a new object implementing the bt.Tracer and bt.TracerSig interfaces
-// using the Backtrace debugging platform. On macOS the tracer is a stub:
+// using the Backtrace debugging platform. On this platform the tracer is a stub:
 // methods are no-ops and Trace requests fail gracefully.
 func New(options NewOptions) *BTTracer {
 	return &BTTracer{
@@ -98,7 +97,7 @@ func New(options NewOptions) *BTTracer {
 	}
 }
 
-// ConfigurePut is unsupported on macOS; the error wraps
+// ConfigurePut is unsupported on this platform; the error wraps
 // ErrUnsupportedPlatform so callers never mistake the no-op for success.
 func (t *BTTracer) ConfigurePut(endpoint, token string, options PutOptions) error {
 	return fmt.Errorf("%w: snapshot upload", ErrUnsupportedPlatform)
@@ -109,12 +108,12 @@ func (t *BTTracer) PutOnTrace() bool {
 	return t.put.options.OnTrace
 }
 
-// Put is unsupported on macOS.
+// Put is unsupported on this platform.
 func (t *BTTracer) Put(snapshot []byte) error {
 	return fmt.Errorf("%w: snapshot upload", ErrUnsupportedPlatform)
 }
 
-// PutDir is unsupported on macOS.
+// PutDir is unsupported on this platform.
 func (t *BTTracer) PutDir(path string) error {
 	return fmt.Errorf("%w: snapshot directory upload", ErrUnsupportedPlatform)
 }
@@ -133,7 +132,7 @@ func (t *BTTracer) putSnapshotFile(path string) error {
 func (t *BTTracer) SetTracerPath(path string) {
 }
 
-// SetOutputPath is unsupported on macOS.
+// SetOutputPath is unsupported on this platform.
 func (t *BTTracer) SetOutputPath(path string, perm os.FileMode) error {
 	return fmt.Errorf("%w: tracer output", ErrUnsupportedPlatform)
 }
@@ -153,6 +152,13 @@ func (t *BTTracer) SetLogger(logger Log) {
 func (t *BTTracer) AddOptions(options []string, v ...string) []string {
 	if options != nil {
 		return append(options, v...)
+	}
+	return nil
+}
+
+func (t *BTTracer) AppendOptionWithPrefix(options []string, prefix string, v string) []string {
+	if options != nil {
+		return AppendOptionWithPrefix(options, prefix, v)
 	}
 	return nil
 }

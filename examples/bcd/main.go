@@ -2,11 +2,18 @@
 
 // Command bcd demonstrates the out-of-process tracer integration: signal
 // handling, panic recovery, and manual trace requests with snapshot upload.
+//
+// Snapshots go to BACKTRACE_ENDPOINT with BACKTRACE_TOKEN when both are set
+// (https://{universe}.sp.backtrace.io:6098 and a project token). Otherwise
+// they go to a local server that prints each upload it receives.
 package main
 
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"syscall"
@@ -33,16 +40,18 @@ func panicAndRecover() {
 }
 
 // raiseSignal sends SIGSEGV to this process; the registered tracer handles it.
-func raiseSignal() {
+func raiseSignal() bool {
 	p, err := os.FindProcess(os.Getpid())
 	if err != nil {
 		fmt.Printf("error: failed to find process object: %v\n", err)
-		return
+		return false
 	}
 
 	if err := p.Signal(syscall.SIGSEGV); err != nil {
 		fmt.Printf("error: failed to send signal: %v\n", err)
+		return false
 	}
+	return true
 }
 
 // requestTrace asks for a snapshot explicitly, without any fault.
@@ -61,6 +70,7 @@ func requestTrace() {
 			CallerOnly:        false,
 			ErrClassification: true,
 			Classifications:   []string{"example", "manual-trace"},
+			SpawnedGs:         &wg,
 		}); traceErr != nil {
 			fmt.Printf("Failed to trace: %v\n", traceErr)
 		}
@@ -100,9 +110,18 @@ func main() {
 		tracer.SetPipes(nil, logFile)
 	}
 
+	endpoint, token := os.Getenv("BACKTRACE_ENDPOINT"), os.Getenv("BACKTRACE_TOKEN")
+	if endpoint == "" || token == "" {
+		local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n, _ := io.Copy(io.Discard, r.Body)
+			fmt.Printf("snapshot upload received: %d bytes\n", n)
+		}))
+		defer local.Close()
+		endpoint, token = local.URL, "example-token"
+	}
 	if err := tracer.ConfigurePut(
-		"https://yourcompany.sp.backtrace.io:6098",
-		"project-token",
+		endpoint,
+		token,
 		bt.PutOptions{Unlink: true, OnTrace: true},
 	); err != nil {
 		fmt.Printf("Failed to enable put: %v\n", err)
@@ -120,10 +139,6 @@ func main() {
 	// Handle crash signals with the tracer's default signal set.
 	bt.Register(tracer)
 
-	fmt.Println("Sending signal...")
-	raiseSignal()
-	fmt.Println("Signal handled")
-
 	fmt.Println("Panicking...")
 	panicAndRecover()
 	fmt.Println("Panic recovered")
@@ -131,4 +146,10 @@ func main() {
 	requestTrace()
 
 	wg.Wait()
+
+	// The re-sent signal ends the process after the trace upload.
+	fmt.Println("Sending signal...")
+	if raiseSignal() {
+		select {}
+	}
 }

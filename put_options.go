@@ -1,5 +1,3 @@
-//go:build linux || freebsd || darwin
-
 package bt
 
 import (

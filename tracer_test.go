@@ -215,6 +215,118 @@ func TestTracerLoggerConcurrency(t *testing.T) {
 	wg.Wait()
 }
 
+type snapshotServer struct {
+	srv    *httptest.Server
+	mu     sync.Mutex
+	bodies []string
+}
+
+func newSnapshotServer(t *testing.T) *snapshotServer {
+	s := &snapshotServer{}
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		s.mu.Lock()
+		s.bodies = append(s.bodies, string(body))
+		s.mu.Unlock()
+		if string(body) == "reject-me" {
+			w.WriteHeader(http.StatusForbidden)
+		}
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func (s *snapshotServer) received() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.bodies...)
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPutDirRefusesSymlinksAndKeepsWalking(t *testing.T) {
+	srv := newSnapshotServer(t)
+	tr := New(NewOptions{})
+	if err := tr.ConfigurePut(srv.srv.URL, "tok", PutOptions{Unlink: true, MaxSnapshotBytes: 32}); err != nil {
+		t.Fatal(err)
+	}
+
+	secret := filepath.Join(t.TempDir(), "secret")
+	writeTestFile(t, secret, "db_password=hunter2")
+	dir := t.TempDir()
+	if err := os.Symlink(secret, filepath.Join(dir, "a-link.btt")); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "b-big.btt"), strings.Repeat("x", 64))
+	writeTestFile(t, filepath.Join(dir, "c-ok.btt"), "ok-1")
+	writeTestFile(t, filepath.Join(dir, "d-rejected.btt"), "reject-me")
+	writeTestFile(t, filepath.Join(dir, "e-ok.btt"), "ok-2")
+	writeTestFile(t, filepath.Join(dir, "notes.txt"), "not a snapshot")
+
+	err := tr.PutDir(dir)
+
+	if got := srv.received(); !slices.Equal(got, []string{"ok-1", "reject-me", "ok-2"}) {
+		t.Errorf("uploaded %q, want ok-1, reject-me, ok-2", got)
+	}
+	if err == nil {
+		t.Fatal("PutDir = nil, want the failed files joined")
+	}
+	msg := err.Error()
+	for _, want := range []string{"a-link.btt: not a regular file", "b-big.btt: snapshot exceeds", "d-rejected.btt: upload to", "403"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("PutDir error %q does not mention %q", msg, want)
+		}
+	}
+	for name, kept := range map[string]bool{
+		"a-link.btt": true, "b-big.btt": true, "c-ok.btt": false, "d-rejected.btt": true, "e-ok.btt": false,
+	} {
+		_, statErr := os.Lstat(filepath.Join(dir, name))
+		if exists := statErr == nil; exists != kept {
+			t.Errorf("%s exists = %v, want %v", name, exists, kept)
+		}
+	}
+}
+
+func TestPutDirReportsUnreadableDirectories(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads directories without permission bits")
+	}
+	srv := newSnapshotServer(t)
+	tr := New(NewOptions{})
+	if err := tr.ConfigurePut(srv.srv.URL, "tok", PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	locked := filepath.Join(dir, "a-locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(locked, "hidden.btt"), "hidden")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	writeTestFile(t, filepath.Join(dir, "b-ok.btt"), "ok")
+
+	err := tr.PutDir(dir)
+	if got := srv.received(); !slices.Equal(got, []string{"ok"}) {
+		t.Errorf("uploaded %q, want ok", got)
+	}
+	if err == nil || !strings.Contains(err.Error(), "a-locked") {
+		t.Errorf("PutDir = %v, want the unreadable directory reported", err)
+	}
+
+	if err := tr.PutDir(filepath.Join(dir, "missing")); err == nil {
+		t.Error("PutDir of a missing directory = nil")
+	}
+}
+
 // TestSnapshotUploadRefusesRedirects pins that an upload never follows a
 // redirect, and that the policy is applied to a copy of the client the
 // application passed in. Followed, a 302 turns the upload into a GET

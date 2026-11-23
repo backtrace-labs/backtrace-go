@@ -30,7 +30,6 @@ type pipes struct {
 const (
 	defaultPutTimeout             = 30 * time.Second
 	defaultMaxSnapshotBytes int64 = 1 << 30
-	defaultTraceTimeout           = 120 * time.Second
 )
 
 // uploader is the connection information and options used during Put
@@ -330,23 +329,27 @@ func (t *BTTracer) Put(snapshot []byte) error {
 // ConfigurePut should have returned successfully before calling
 // BTTracer.PutDir().
 //
-// Only files with the '.btt' suffix will be uploaded.
+// Only files with the '.btt' suffix will be uploaded. Symbolic links are
+// refused.
 //
-// The first error encountered terminates the directory walk, thus
-// skipping snapshots which would have been processed later in the walk.
+// A failed file does not stop the walk. PutDir returns the errors of all
+// failed files and unreadable directories, joined with errors.Join.
 func (t *BTTracer) PutDir(path string) error {
 	// Diagnostics name files, not locations: a path can carry a user or
 	// tenant name.
 	t.Logf(LogDebug, "Uploading snapshots from directory %s...\n", filepath.Base(path))
-	return filepath.Walk(path, putDirWalk(t))
+	var errs []error
+	walkErr := filepath.Walk(path, putDirWalk(t, &errs))
+	return errors.Join(append(errs, walkErr)...)
 }
 
-func putDirWalk(t *BTTracer) filepath.WalkFunc {
+func putDirWalk(t *BTTracer, errs *[]error) filepath.WalkFunc {
 	return func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			t.Logf(LogError, "Failed to walk put directory: %v\n",
 				err)
-			return err
+			*errs = append(*errs, err)
+			return nil
 		}
 
 		if info.IsDir() {
@@ -359,8 +362,19 @@ func putDirWalk(t *BTTracer) filepath.WalkFunc {
 			return nil
 		}
 
-		return t.putSnapshotFile(path)
+		if err := t.putSnapshotFile(path); err != nil {
+			*errs = append(*errs, fmt.Errorf("snapshot %s: %w", filepath.Base(path), err))
+		}
+		return nil
 	}
+}
+
+type snapshotFiles struct{}
+
+func (snapshotFiles) Stat(name string) (os.FileInfo, error) { return os.Lstat(name) }
+
+func (snapshotFiles) OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
+	return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 }
 
 func (t *BTTracer) putSnapshotFile(path string) (err error) {
@@ -382,21 +396,14 @@ func (t *BTTracer) putSnapshotFile(path string) (err error) {
 		return errors.New("snapshot upload is not configured")
 	}
 
-	body, err := os.Open(path)
+	// Snapshot files must be bounded regular files: FIFOs or devices
+	// would block or stream unbounded data.
+	body, info, err := openRegularFile(snapshotFiles{}, path)
 	if err != nil {
 		return err
 	}
 	defer body.Close()
 
-	// Snapshot files must be bounded regular files: FIFOs or devices
-	// would block or stream unbounded data.
-	info, err := body.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("snapshot is not a regular file")
-	}
 	if info.Size() > u.options.MaxSnapshotBytes {
 		return fmt.Errorf("snapshot exceeds %d-byte limit", u.options.MaxSnapshotBytes)
 	}
@@ -514,18 +521,6 @@ func (t *BTTracer) AddOptions(options []string, v ...string) []string {
 	return nil
 }
 
-// Append to an option with given prefix
-func AppendOptionWithPrefix(options []string, prefix string, v string) []string {
-	for i, opt := range options {
-		if strings.HasPrefix(opt, prefix) {
-			new_opt := opt + "," + v
-			options[i] = new_opt
-			return options
-		}
-	}
-	return append(options, prefix+v)
-}
-
 func (t *BTTracer) AppendOptionWithPrefix(options []string, prefix string, v string) []string {
 	if options != nil {
 		return AppendOptionWithPrefix(options, prefix, v)
@@ -591,9 +586,8 @@ func (t *BTTracer) DefaultTraceOptions() *TraceOptions {
 }
 
 // SetDefaultTraceOptions replaces the defaults used by bt.Trace when no
-// per-call options are supplied. A zero Timeout keeps the built-in default
-// (a zero default would make every Trace time out instantly); use a
-// negative Timeout to disable the deadline.
+// per-call options are supplied. A zero Timeout keeps the built-in default;
+// use a negative Timeout to disable the deadline.
 func (t *BTTracer) SetDefaultTraceOptions(opts TraceOptions) {
 	if opts.Timeout == 0 {
 		opts.Timeout = defaultTraceTimeout

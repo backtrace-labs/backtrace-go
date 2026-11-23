@@ -103,6 +103,7 @@ func (panickyError) Error() string { panic("hostile error") }
 // from any generic Tracer method that Trace calls becomes an error wrapping
 // ErrTracerCallback, never a process crash, and the global trace lock is
 // released: a well-behaved Trace right after it still runs.
+// A panic in Logf is ignored.
 func TestTraceContainsHostileTracer(t *testing.T) {
 	defer traceTestConfig()()
 
@@ -119,7 +120,7 @@ func TestTraceContainsHostileTracer(t *testing.T) {
 	cases := []struct {
 		method  string
 		options *TraceOptions
-		reached bool
+		wantErr bool
 	}{
 		// Read only when the caller passes no options.
 		{"DefaultTraceOptions", nil, true},
@@ -130,7 +131,7 @@ func TestTraceContainsHostileTracer(t *testing.T) {
 		{"AddKV", explicit, true},
 		{"AddClassifier", explicit, true},
 		{"Finalize", explicit, true},
-		{"Logf", explicit, true},
+		{"Logf", explicit, false},
 		{"PutOnTrace", explicit, true},
 		{"Put", explicit, true},
 	}
@@ -149,10 +150,10 @@ func TestTraceContainsHostileTracer(t *testing.T) {
 			select {
 			case err := <-done:
 				switch {
-				case c.reached && !errors.Is(err, ErrTracerCallback):
+				case c.wantErr && !errors.Is(err, ErrTracerCallback):
 					t.Errorf("a panic in %s gave %v, want an error wrapping ErrTracerCallback", c.method, err)
-				case !c.reached && err != nil:
-					t.Errorf("%s is not called on this platform, yet Trace failed: %v", c.method, err)
+				case !c.wantErr && err != nil:
+					t.Errorf("a panic in %s is ignored or %s is not called on this platform, yet Trace failed: %v", c.method, c.method, err)
 				}
 			case <-time.After(20 * time.Second):
 				t.Fatalf("Trace hung after a %s panic", c.method)
