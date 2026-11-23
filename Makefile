@@ -1,7 +1,7 @@
 .PHONY: help tools build test race vet fmt fmt-check lint vuln tidy check cover cross clean
 
 # Tool versions — keep in sync with .github/workflows/tests.yml.
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.15.0
 GOVULNCHECK_VERSION   ?= v1.1.4
 
 help: ## Show this help
@@ -30,8 +30,11 @@ fmt-check: ## Fail if any file needs formatting
 	@unformatted="$$(gofmt -l .)"; if [ -n "$$unformatted" ]; then \
 		echo "gofmt required for:"; echo "$$unformatted"; exit 1; fi
 
-lint: ## Run golangci-lint (requires golangci-lint v2)
-	golangci-lint run ./...
+lint: ## Run golangci-lint (requires golangci-lint v2) for linux, darwin, windows and freebsd
+	@for goos in linux darwin windows freebsd; do \
+		echo "golangci-lint GOOS=$$goos"; \
+		GOOS=$$goos golangci-lint run ./... || exit 1; \
+	done
 
 vuln: ## Scan for known vulnerabilities (requires govulncheck)
 	govulncheck ./...

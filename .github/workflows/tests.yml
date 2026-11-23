@@ -14,27 +14,35 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows, freebsd]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           check-latest: true
       - name: Check gofmt
+        if: matrix.goos == 'linux'
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
             echo "gofmt required for:"; echo "$unformatted"; exit 1
           fi
       - name: Verify go.mod/go.sum are tidy
+        if: matrix.goos == 'linux'
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        env:
+          GOOS: ${{ matrix.goos }}
         with:
-          version: v2.12.2
+          version: v2.15.0
 
   test:
     name: test (go ${{ matrix.go-version }}, ${{ matrix.os }})
@@ -43,7 +51,8 @@ jobs:
       matrix:
         # Support policy: the two most recent Go releases (go.mod
         # declares the minimum).
-        go-version: ['1.25.x', '1.26.x']
+        # The go.mod minimum (1.25.x) stays in the matrix.
+        go-version: ['1.25.x', '1.26.x', '1.27.x']
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -68,7 +77,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           check-latest: true
       - name: Scan for known vulnerabilities
         run: |
@@ -124,7 +133,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           check-latest: true
       - name: Fuzz parsers and redaction briefly
         run: |
@@ -151,7 +160,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           check-latest: true
       - name: Build
         run: |

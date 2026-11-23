@@ -2,26 +2,7 @@
 
 package bt
 
-import (
-	"os"
-	"strings"
-)
-
-// firstExistingFileLine returns the first non-empty line of the first
-// readable file in paths, capped at 4 KiB.
-func firstExistingFileLine(paths ...string) string {
-	for _, p := range paths {
-		data, err := readSmallFile(p, 4096)
-		if err != nil {
-			continue
-		}
-		line, _, _ := strings.Cut(strings.TrimSpace(string(data)), "\n")
-		if line != "" {
-			return line
-		}
-	}
-	return ""
-}
+import "os"
 
 // readSmallFile reads a regular file bounded by maxBytes.
 func readSmallFile(path string, maxBytes int64) ([]byte, error) {

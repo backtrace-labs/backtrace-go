@@ -40,7 +40,7 @@ func regString(root registry.Key, path, name string, d diag) string {
 		d.logf("machine attribute registry open %q failed: %v", path, err)
 		return ""
 	}
-	defer key.Close()
+	defer func() { _ = key.Close() }()
 	value, _, err := key.GetStringValue(name)
 	if err != nil {
 		d.logf("machine attribute registry read %q\\%s failed: %v", path, name, err)

@@ -217,7 +217,7 @@ and [examples/bcd/main.go](examples/bcd/main.go).
 
 ### Getting started (macOS)
 
-1. Install Go (1.25+ required; CI also tests 1.26) with [Homebrew](https://brew.sh):
+1. Install Go (1.25+ required; CI also tests 1.26 and 1.27) with [Homebrew](https://brew.sh):
 
    ```sh
    brew install go
@@ -235,7 +235,7 @@ and [examples/bcd/main.go](examples/bcd/main.go).
 3. Install the lint and vulnerability tools at the versions CI uses:
 
    ```sh
-   make tools   # golangci-lint v2.12.2 + govulncheck v1.1.4
+   make tools   # golangci-lint v2.15.0 + govulncheck v1.1.4
    ```
 
    You can also run `brew install golangci-lint`, but that installs the latest release, which may report different findings than CI.
