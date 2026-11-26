@@ -12,9 +12,9 @@ func Test_readKeyValueLinesIntoAttrs(t *testing.T) {
 		attrs := make(map[string]interface{})
 		readKeyValueLinesIntoAttrs(r, attrs)
 		requireSubmap(t, map[string]interface{}{
-			"system.memory.total": "1033457664",
-			"system.memory.free":  "149852160",
-			"system.memory.dirty": "20480",
+			"system.memory.total": int64(1033457664),
+			"system.memory.free":  int64(149852160),
+			"system.memory.dirty": int64(20480),
 		}, attrs)
 	})
 
@@ -23,10 +23,28 @@ func Test_readKeyValueLinesIntoAttrs(t *testing.T) {
 		attrs := make(map[string]interface{})
 		readKeyValueLinesIntoAttrs(r, attrs)
 		requireSubmap(t, map[string]interface{}{
-			"vm.vma.peak":      "9048064",
-			"descriptor.count": "256",
+			"vm.vma.peak":      int64(9048064),
+			"descriptor.count": int64(256),
 		}, attrs)
 	})
+}
+
+func Test_normalizeProcValue(t *testing.T) {
+	cases := []struct {
+		in   string
+		want interface{}
+	}{
+		{"   8836 kB", int64(9048064)},
+		{"256", int64(256)},
+		{"R (running)", "R (running)"},
+		{"0002", int64(2)},
+	}
+	for _, c := range cases {
+		if got := normalizeProcValue(c.in); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("normalizeProcValue(%q) = %v (%T), want %v (%T)",
+				c.in, got, got, c.want, c.want)
+		}
+	}
 }
 
 func requireSubmap[K comparable, V any](t *testing.T, submap map[K]V, actual map[K]V) {

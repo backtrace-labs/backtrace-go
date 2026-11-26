@@ -1,13 +1,7 @@
-// Package bt provides integration with out-of-process tracers. Using the
-// provided Tracer interface, applications may invoke tracer execution on
-// demand. Panic and signal handling integrations are provided.
-//
-// The Tracer interface is generic and will support any out-of-process tracer
-// implementing it. A default Tracer implementation, which uses the
-// Backtrace I/O platform, is provided.
 package bt
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -30,11 +24,19 @@ var (
 	state globalState
 )
 
+const (
+	defaultTraceTimeout = 120 * time.Second
+	maxTraceArgBytes    = 4 << 10
+)
+
 type globalState struct {
 	c GlobalConfig
 	m sync.RWMutex
 }
 
+// GlobalConfig holds configuration applicable to all tracer invocations.
+// UpdateConfig replaces the ENTIRE struct: populate every field (or start
+// from the documented defaults) rather than passing a partial literal.
 type GlobalConfig struct {
 	// If the tracer's timeout expires and the tracer cannot be killed,
 	// generate a run-time panic.
@@ -60,7 +62,8 @@ type GlobalConfig struct {
 	// If bt.Trace() has been configured to attempt an upload immediately,
 	// wait for the Tracer to finish uploading its results (instead of
 	// asynchronously uploading in a new goroutine) before returning
-	// from bt.Trace().
+	// from bt.Trace(). Signal traces started by Register always upload
+	// synchronously, before the signal is re-sent.
 	//
 	// Defaults to true.
 	SynchronousPut bool
@@ -80,12 +83,56 @@ func init() {
 			SynchronousPut:     true}}
 }
 
-// Update global Tracer configuration.
+// Update global Tracer configuration. Negative durations are treated as
+// zero.
 func UpdateConfig(c GlobalConfig) {
+	if c.RateLimit < 0 {
+		c.RateLimit = 0
+	}
+
 	state.m.Lock()
 	defer state.m.Unlock()
 
 	state.c = c
+}
+
+// logfSafe shields lock-critical paths from panicking Log implementations:
+// a diagnostic callback must never leak the global trace lock or kill a
+// helper goroutine. Note: containment stops panics, not a logger that
+// blocks forever — custom loggers are trusted to return promptly.
+func logfSafe(l Log, level LogPriority, format string, v ...interface{}) {
+	defer func() { _ = recover() }()
+	l.Logf(level, format, v...)
+}
+
+// ErrTracerCallback wraps a panic raised by application-supplied code on
+// the tracer path: a generic Tracer/TracerSig method, or the HTTP client
+// configured for snapshot uploads. Such a panic is turned into this error
+// rather than being allowed to crash the host. Test with errors.Is.
+// A panic in Logf is ignored.
+var ErrTracerCallback = errors.New("bt: tracer callback panicked")
+
+// killFailurePanic carries a deliberate PanicOnKillFailure failure through
+// trace's containment recover, so that it is told apart from a callback
+// panic and raised by the caller.
+type killFailurePanic struct{ err error }
+
+// killTracer stops a tracer process that outlived its deadline. A variable
+// so that tests can exercise the kill-failure paths.
+var killTracer = func(p *os.Process) error { return p.Kill() }
+
+// isNilTracer reports whether t is a nil interface or a typed-nil pointer.
+func isNilTracer(t Tracer) bool {
+	if t == nil {
+		return true
+	}
+	rv := reflect.ValueOf(t)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
 // A generic out-of-process tracer interface.
@@ -206,7 +253,8 @@ type TraceOptions struct {
 	// Amount of time to wait for the tracer to finish execution.
 	// If 0 is specified, Tracer.DefaultTraceOptions()'s timeout will be
 	// used. If <0 is specified, no timeout will be used; the Tracer command
-	// will run until it exits.
+	// will run until it exits. If the default timeout is 0 too, 120 seconds
+	// is used.
 	Timeout time.Duration
 
 	// If non-nil, any goroutines spawned during the Trace() request will
@@ -216,6 +264,8 @@ type TraceOptions struct {
 	SpawnedGs *sync.WaitGroup
 }
 
+// Log is the logging interface used by Tracers for execution status
+// messages.
 type Log interface {
 	// Logs the specified message if the specified log level is enabled.
 	Logf(level LogPriority, format string, v ...interface{})
@@ -225,8 +275,10 @@ type Log interface {
 	SetLogLevel(level LogPriority)
 }
 
+// LogPriority is a bitmask of tracer log levels.
 type LogPriority int
 
+// Tracer log levels; combine with bitwise OR, or use LogMax for everything.
 const (
 	LogDebug = 1 << iota
 	LogWarning
@@ -269,10 +321,21 @@ func (s *signalError) Error() string {
 // received through this handler, all handlers for that signal will be reset
 // with signal.Reset(s) after tracer execution completes. The signal will then
 // be resent to the default Go handler for that signal.
+//
+// A signal trace uses the signal name, such as "SIGABRT", as its first
+// classifier and is uploaded before the signal is resent. On Windows the
+// signal is not resent.
+//
+// Crashes do not come through here: a fault in cgo code, a runtime fatal
+// error or an unrecovered panic ends the process without calling this
+// handler. Use MonitorCrashes to report those.
 func Register(t TracerSig) {
+	if isNilTracer(t) {
+		return
+	}
 	ss := t.Sigset()
-	if ss == nil {
-		t.Logf(LogError, "Failed to register signal handler: empty "+
+	if len(ss) == 0 {
+		logfSafe(t, LogError, "Failed to register signal handler: empty "+
 			"sigset\n")
 		return
 	}
@@ -287,29 +350,33 @@ func Register(t TracerSig) {
 
 	signal.Notify(c, ss...)
 
-	t.Logf(LogDebug, "Registered tracer %s (signal set: %v)\n", t, ss)
-
-	state.m.RLock()
-	rs := state.c.ResendSignal
-	state.m.RUnlock()
+	logfSafe(t, LogDebug, "Registered tracer %s (signal set: %v)\n", t, ss)
 
 	go func(t TracerSig) {
+		// Raw Logf is unsafe here: a panicking logger would kill this
+		// goroutine (and with it, signal handling) — or the process.
 		for s := range c {
-			t.Logf(LogDebug, "Received %v; executing tracer\n", s)
+			logfSafe(t, LogDebug, "Received %v; executing tracer\n", s)
 
 			_ = Trace(t, &signalError{s}, nil)
+
+			// Read the configuration at signal time so that
+			// UpdateConfig calls made after Register are honored.
+			state.m.RLock()
+			rs := state.c.ResendSignal
+			state.m.RUnlock()
 
 			if !rs {
 				continue
 			}
 
-			t.Logf(LogDebug, "Resending %v to default handler\n", s)
+			logfSafe(t, LogDebug, "Resending %v to default handler\n", s)
 
 			// Re-handle the signal with the default Go behavior.
 			signal.Reset(s)
 			p, err := os.FindProcess(os.Getpid())
 			if err != nil {
-				t.Logf(LogError, "Failed to resend signal: "+
+				logfSafe(t, LogError, "Failed to resend signal: "+
 					"cannot find process object")
 				return
 			}
@@ -317,7 +384,7 @@ func Register(t TracerSig) {
 			_ = p.Signal(s)
 		}
 
-		t.Logf(LogDebug, "Signal channel closed; exiting goroutine\n")
+		logfSafe(t, LogDebug, "Signal channel closed; exiting goroutine\n")
 	}(t)
 }
 
@@ -333,20 +400,26 @@ func Unregister(t TracerSig) {
 }
 
 func unregisterInternal(t TracerSig, c chan os.Signal) {
-	t.Logf(LogDebug, "Stopping signal channel...\n")
+	logfSafe(t, LogDebug, "Stopping signal channel...\n")
 	signal.Stop(c)
 
-	t.Logf(LogDebug, "Closing signal channel...\n")
+	logfSafe(t, LogDebug, "Closing signal channel...\n")
 	close(c)
 
 	t.SetSigchan(nil)
-	t.Logf(LogDebug, "Tracer unregistered\n")
+	logfSafe(t, LogDebug, "Tracer unregistered\n")
 }
 
 type tracerResult struct {
-	stdOut []byte
-	err    error
+	stdOut  []byte
+	err     error
+	started bool
 }
+
+// testHookBeforeTracerStart, when non-nil, runs in the exec goroutine
+// immediately before Cmd.Start. Test-only: it makes the start-timeout
+// handoff path deterministic.
+var testHookBeforeTracerStart func()
 
 // Executes the specified Tracer on the current process.
 //
@@ -367,10 +440,63 @@ type tracerResult struct {
 // will be traced.
 //
 // Output of specific Tracer execution depends on the implementation; most
-// Tracers will have options for specifying output paths.
-func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
+// Tracers will have options for specifying output paths. When t.Finalize
+// returns nil, as BTTracer does outside Linux and FreeBSD, Trace returns an
+// error wrapping ErrUnsupportedPlatform.
+func Trace(t Tracer, e error, traceOptions *TraceOptions) error {
+	killFailure, err := trace(t, e, traceOptions)
+	if killFailure != nil {
+		// The documented PanicOnKillFailure behavior.
+		panic(killFailure)
+	}
+	return err
+}
+
+// trace is Trace without the PanicOnKillFailure panic: a tracer that could
+// not be killed is returned as killFailure for the caller to raise. trace
+// itself never panics.
+func trace(t Tracer, e error, traceOptions *TraceOptions) (killFailure, err error) {
+	// Containment boundary: any panic from a generic Tracer callback
+	// (DefaultTraceOptions, Options, Add*, Finalize, PutOnTrace, Put) is
+	// converted to an error return instead of crashing the host. Locks
+	// held at panic time are released by the conditionally-registered
+	// defers below (they run before this one).
+	defer func() {
+		if r := recover(); r != nil {
+			if kf, ok := r.(killFailurePanic); ok {
+				killFailure, err = kf.err, kf.err
+				return
+			}
+			err = fmt.Errorf("%w (%T)", ErrTracerCallback, r)
+		}
+	}()
+
+	if isNilTracer(t) {
+		return nil, errors.New("bt: nil Tracer")
+	}
+
 	if traceOptions == nil {
-		traceOptions = t.DefaultTraceOptions()
+		def := t.DefaultTraceOptions()
+		if def == nil {
+			return nil, errors.New("bt: Tracer.DefaultTraceOptions returned nil")
+		}
+		// Copy so a later mutation of the tracer's defaults cannot race
+		// this invocation, and detach the caller-owned slice.
+		resolved := *def
+		resolved.Classifications = append([]string(nil), def.Classifications...)
+		traceOptions = &resolved
+	}
+
+	sig, isSignal := e.(*signalError)
+	if isSignal {
+		// The calling goroutine is Register's handler, not the one that faulted.
+		signalOptions := *traceOptions
+		signalOptions.Faulted = false
+		signalOptions.CallerOnly = false
+		signalOptions.ErrClassification = false
+		signalOptions.Classifications = append([]string{osSignalName(sig.s)},
+			traceOptions.Classifications...)
+		traceOptions = &signalOptions
 	}
 
 	// If no timeouts are specified, the timeout channel will block
@@ -381,53 +507,51 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 	var timeout <-chan time.Time
 
 	if traceOptions.Timeout == 0 {
-		to := t.DefaultTraceOptions().Timeout
-		timeout = time.After(to)
-		t.Logf(LogDebug, "Tracer timeout: %v\n", to)
+		def := t.DefaultTraceOptions()
+		if def == nil {
+			return nil, errors.New("bt: Tracer.DefaultTraceOptions returned nil")
+		}
+		to := def.Timeout
+		if to == 0 {
+			to = defaultTraceTimeout
+		}
+		if to > 0 {
+			timeout = time.After(to)
+			logfSafe(t, LogDebug, "Tracer timeout: %v\n", to)
+		}
 	} else if traceOptions.Timeout > 0 {
 		timeout = time.After(traceOptions.Timeout)
-		t.Logf(LogDebug, "Tracer timeout: %v\n", traceOptions.Timeout)
+		logfSafe(t, LogDebug, "Tracer timeout: %v\n", traceOptions.Timeout)
 	}
 
 	// We create a new options slice to avoid modifying the base
 	// set of tracer options just for this particular trace
 	// invocation.
 	options := t.Options()
-
-	// If the caller has requested a trace with thread-specific options,
-	// then add the relevant thread specifications to the options list.
-	if traceOptions.CallerOnly || traceOptions.Faulted {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		if tid, err := gettid(); err == nil {
-			t.Logf(LogDebug, "Retrieved tid: %v\n", tid)
-
-			if traceOptions.CallerOnly {
-				options = t.AddThreadFilter(options, tid)
-			}
-
-			if traceOptions.Faulted {
-				options = t.AddFaultedThread(options, tid)
-			}
-		} else {
-			t.Logf(LogWarning, "Failed to retrieve tid: %v\n", err)
-		}
+	if options == nil {
+		// Add* with a nil slice would change the Tracer's base options.
+		options = []string{}
 	}
 
 	// Report caller's goid
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
-	if goid, err := strconv.Atoi(idField); err == nil {
-		t.Logf(LogDebug, "Retrieved goid: %v\n", goid)
-		options = t.AddCallerGo(options, goid)
-	} else {
-		t.Logf(LogWarning, "Failed to retrieve goid: %v\n", err)
+	if !isSignal {
+		var buf [64]byte
+		n := runtime.Stack(buf[:], false)
+		fields := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))
+		if len(fields) > 0 {
+			if goid, err := strconv.Atoi(fields[0]); err == nil {
+				logfSafe(t, LogDebug, "Retrieved goid: %v\n", goid)
+				options = t.AddCallerGo(options, goid)
+			} else {
+				logfSafe(t, LogWarning, "Failed to retrieve goid: %v\n", err)
+			}
+		} else {
+			logfSafe(t, LogWarning, "Failed to retrieve goid: empty stack header\n")
+		}
 	}
 
 	if e != nil {
-		options = t.AddKV(options, "error", e.Error())
+		options = t.AddKV(options, "error", traceArg(safeErrorString(e)))
 		if traceOptions.ErrClassification {
 			options = t.AddClassifier(options,
 				reflect.TypeOf(e).String())
@@ -435,7 +559,9 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 	}
 
 	for _, c := range traceOptions.Classifications {
-		options = t.AddClassifier(options, c)
+		if c = traceArg(c); c != "" {
+			options = t.AddClassifier(options, c)
+		}
 	}
 
 	state.m.RLock()
@@ -447,7 +573,7 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 	select {
 	case <-timeout:
 		err = errors.New("Tracer lock acquisition timed out")
-		t.Logf(LogError, "%v\n", err)
+		logfSafe(t, LogError, "%v\n", err)
 
 		return
 	case <-traceLock:
@@ -456,14 +582,50 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 
 	// We now hold the trace lock.
 	// Allow another tracer to execute (i.e. by re-populating the
-	// traceLock channel) as long as the current tracer has
-	// exited.
+	// traceLock channel) as long as the current tracer has exited. When a
+	// timeout fires before the subprocess start resolves, lock release is
+	// handed to a cleanup goroutine instead (see below), so a late child
+	// can never run concurrently with the next trace.
+	// A timeout kill also keeps the lock until the tracer is reaped.
+	unlockHandedOff := false
 	defer func() {
-		go traceUnlockRL(t, rl)
+		if !unlockHandedOff {
+			// Only reached when no tracer process ran.
+			unlockTrace(t, false, rl)
+		}
 	}()
 
+	// If the caller has requested a trace with thread-specific options,
+	// then add the relevant thread specifications to the options list.
+	if traceOptions.CallerOnly || traceOptions.Faulted {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		if tid, err := gettid(); err == nil {
+			logfSafe(t, LogDebug, "Retrieved tid: %v\n", tid)
+
+			if traceOptions.CallerOnly {
+				options = t.AddThreadFilter(options, tid)
+			}
+
+			if traceOptions.Faulted {
+				options = t.AddFaultedThread(options, tid)
+			}
+		} else {
+			logfSafe(t, LogWarning, "Failed to retrieve tid: %v\n", err)
+		}
+	}
+
 	done := make(chan tracerResult, 1)
+	started := make(chan struct{})
 	tracer := t.Finalize(options)
+	if tracer == nil {
+		// Stub tracers (e.g. on macOS) have no command to run; fail
+		// gracefully instead of dereferencing nil in the goroutine.
+		err = fmt.Errorf("%w: tracer unavailable", ErrUnsupportedPlatform)
+		logfSafe(t, LogWarning, "%v\n", err)
+		return
+	}
 
 	if traceOptions.SpawnedGs != nil {
 		traceOptions.SpawnedGs.Add(1)
@@ -474,46 +636,146 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 			defer traceOptions.SpawnedGs.Done()
 		}
 
-		t.Logf(LogDebug, "Starting tracer %v\n", tracer)
+		logfSafe(t, LogDebug, "Starting tracer %v\n", tracer)
 
 		var res tracerResult
+		var stdOut bytes.Buffer
 
-		res.stdOut, res.err = tracer.Output()
+		tracer.Stdout = &stdOut
+
+		if testHookBeforeTracerStart != nil {
+			testHookBeforeTracerStart()
+		}
+		if startErr := tracer.Start(); startErr != nil {
+			res.err = startErr
+			done <- res
+			return
+		}
+		close(started)
+
+		res.err = tracer.Wait()
+		res.stdOut = stdOut.Bytes()
+		res.started = true
 		done <- res
 
-		t.Logf(LogDebug, "Tracer finished execution\n")
+		logfSafe(t, LogDebug, "Tracer finished execution\n")
 	}()
 
-	t.Logf(LogDebug, "Waiting for tracer completion...\n")
+	logfSafe(t, LogDebug, "Waiting for tracer completion...\n")
 
 	var res tracerResult
 
 	select {
 	case <-timeout:
-		if err = tracer.Process.Kill(); err != nil {
-			t.Logf(LogError,
-				"Failed to kill tracer upon timeout: %v\n",
-				err)
+		// Only kill once the subprocess is known to have started;
+		// tracer.Process is nil before that (kill would panic). A
+		// result that is already available wins over the timeout.
+		select {
+		case res = <-done:
+			// The tracer failed to start or finished just as the
+			// timeout fired; fall through to result handling.
+			break
+		case <-started:
+			// One more non-blocking check: the tracer may have
+			// completed successfully between the two signals.
+			select {
+			case res = <-done:
+				break
+			default:
+				unlockHandedOff = true
+				go func() {
+					// An unkillable child must not hold the trace lock forever.
+					select {
+					case <-done:
+					case <-time.After(30 * time.Second):
+						logfSafe(t, LogError,
+							"Tracer not reaped after kill; releasing trace lock\n")
+					}
+					traceUnlockRL(t, rl)
+				}()
 
-			if kfPanic {
-				t.Logf(LogWarning,
-					"PanicOnKillFailure set; "+
-						"panicking\n")
-				panic(err)
+				// A process that exited on its own just as
+				// the timeout fired is not a kill failure.
+				if err = killTracer(tracer.Process); err != nil &&
+					!errors.Is(err, os.ErrProcessDone) {
+					logfSafe(t, LogError,
+						"Failed to kill tracer upon timeout: %v\n",
+						err)
+
+					if kfPanic {
+						logfSafe(t, LogWarning,
+							"PanicOnKillFailure set; "+
+								"panicking\n")
+						// Sentinel-wrapped so the containment
+						// recover hands it to the caller, which
+						// raises it, instead of reporting a
+						// callback panic.
+						panic(killFailurePanic{err})
+					}
+				}
+
+				err = errors.New("Tracer execution timed out")
+				logfSafe(t, LogError, "%v; process killed\n", err)
+
+				return
 			}
+		default:
+			// Cmd.Start itself has not resolved by the deadline.
+			// Return to the caller now; a cleanup goroutine deals
+			// with the late child and only then releases the trace
+			// lock, so no other trace can run alongside it.
+			unlockHandedOff = true
+			go func() {
+				select {
+				case <-time.After(30 * time.Second):
+					// Cmd.Start itself is wedged (e.g. a
+					// pathologically slow exec). Give up and
+					// release the lock rather than disabling
+					// tracing forever.
+					logfSafe(t, LogError,
+						"Tracer Start did not resolve; releasing trace lock\n")
+				case <-started:
+					if killErr := killTracer(tracer.Process); killErr != nil &&
+						!errors.Is(killErr, os.ErrProcessDone) {
+						logfSafe(t, LogError,
+							"Failed to kill late tracer: %v\n", killErr)
+						if kfPanic {
+							// Honors PanicOnKillFailure; in a
+							// goroutine this aborts the process,
+							// consistent with the option's intent.
+							panic(killErr)
+						}
+					}
+					// Bound the reap wait: an unkillable child must
+					// not hold the trace lock forever.
+					select {
+					case <-done:
+					case <-time.After(30 * time.Second):
+						logfSafe(t, LogError,
+							"Late tracer not reaped after kill; releasing trace lock\n")
+					}
+				case res := <-done:
+					unlockTrace(t, res.started, rl)
+					return
+				}
+				traceUnlockRL(t, rl)
+			}()
+
+			err = errors.New("Tracer start timed out")
+			logfSafe(t, LogError, "%v\n", err)
+
+			return
 		}
-
-		err = errors.New("Tracer execution timed out")
-		t.Logf(LogError, "%v; process killed\n", err)
-
-		return
 	case res = <-done:
 		break
 	}
 
 	// Tracer execution has completed by this point.
+	unlockHandedOff = true
+	unlockTrace(t, res.started, rl)
+
 	if res.err != nil {
-		t.Logf(LogError, "Tracer failed to run: %v\n",
+		logfSafe(t, LogError, "Tracer failed to run: %v\n",
 			res.err)
 		err = res.err
 
@@ -521,30 +783,30 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 	}
 
 	if !t.PutOnTrace() {
-		t.Logf(LogDebug, "Trace request complete\n")
+		logfSafe(t, LogDebug, "Trace request complete\n")
 
 		return
 	}
 
 	putFn := func() error {
-		t.Logf(LogDebug, "Uploading snapshot...")
+		logfSafe(t, LogDebug, "Uploading snapshot...")
 
 		if err := t.Put(res.stdOut); err != nil {
-			t.Logf(LogError, "Failed to upload snapshot: %s",
+			logfSafe(t, LogError, "Failed to upload snapshot: %s",
 				err)
 
 			return err
 		}
 
-		t.Logf(LogDebug, "Successfully uploaded snapshot\n")
+		logfSafe(t, LogDebug, "Successfully uploaded snapshot\n")
 
 		return nil
 	}
 
-	if synchronousPut {
+	if synchronousPut || isSignal {
 		err = putFn()
 	} else {
-		t.Logf(LogDebug, "Starting asynchronous put...\n")
+		logfSafe(t, LogDebug, "Starting asynchronous put...\n")
 
 		if traceOptions.SpawnedGs != nil {
 			traceOptions.SpawnedGs.Add(1)
@@ -554,21 +816,51 @@ func Trace(t Tracer, e error, traceOptions *TraceOptions) (err error) {
 			if traceOptions.SpawnedGs != nil {
 				defer traceOptions.SpawnedGs.Done()
 			}
+			// A panicking Put/Log implementation must not kill the
+			// process from this goroutine.
+			defer func() { _ = recover() }()
 
 			_ = putFn()
 		}()
 	}
 
-	t.Logf(LogDebug, "Trace request complete\n")
+	logfSafe(t, LogDebug, "Trace request complete\n")
 
 	return
 }
 
-func traceUnlockRL(t Tracer, rl time.Duration) {
-	t.Logf(LogDebug, "Waiting for ratelimit (%v)\n", rl)
-	<-time.After(rl)
-	t.Logf(LogDebug, "Unlocking traceLock\n")
+func unlockTrace(t Tracer, tracerRan bool, rl time.Duration) {
+	if tracerRan {
+		go traceUnlockRL(t, rl)
+		return
+	}
 	traceLock <- struct{}{}
+}
+
+func traceUnlockRL(t Tracer, rl time.Duration) {
+	if rl > 0 {
+		<-time.After(rl)
+	}
+	// Release the lock BEFORE logging: a diagnostic callback that panics
+	// or blocks must never leave the process-global trace lock consumed.
+	traceLock <- struct{}{}
+	logfSafe(t, LogDebug, "trace lock released\n")
+}
+
+func traceArg(s string) string {
+	return truncateUTF8(strings.ReplaceAll(s, "\x00", ""), maxTraceArgBytes)
+}
+
+// Append to an option with given prefix
+func AppendOptionWithPrefix(options []string, prefix string, v string) []string {
+	for i, opt := range options {
+		if strings.HasPrefix(opt, prefix) {
+			new_opt := opt + "," + v
+			options[i] = new_opt
+			return options
+		}
+	}
+	return append(options, prefix+v)
 }
 
 // Create a unique error type to use during panic recovery.
@@ -577,7 +869,7 @@ type panicError struct {
 }
 
 func (p *panicError) Error() string {
-	return fmt.Sprintf("%v", p.v)
+	return printValue(p.v)
 }
 
 // Establishes a panic handler that will execute the specified Tracer in
@@ -585,21 +877,31 @@ func (p *panicError) Error() string {
 // completes (with the original value returned by recover()).
 // This must be used with Go's defer, panic, and recover pattern; see
 // https://blog.golang.org/defer-panic-and-recover.
+//
+// A failure inside the trace (including a panicking Tracer implementation)
+// never replaces the original panic: the recovered value is always what is
+// re-raised when repanic is true. When repanic is false and the tracer could
+// not be killed, the PanicOnKillFailure panic is raised as it is by Trace.
 func Recover(t Tracer, repanic bool, options *TraceOptions) {
-	if r := recover(); r != nil {
-		err, ok := r.(error)
-		if !ok {
-			// We use the runtime type of the error object for
-			// classification (and thus potential grouping);
-			// *bt.PanicError is a more descriptive classifier
-			// than something like *errors.errorString.
-			err = &panicError{r}
-		}
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
 
-		_ = Trace(t, err, options)
+	err, ok := recovered.(error)
+	if !ok {
+		// The runtime type of the error object drives classification;
+		// *bt.panicError is more descriptive than *errors.errorString.
+		err = &panicError{recovered}
+	}
+	// trace never panics, so a failing tracer cannot escape here and mask
+	// the application's panic.
+	killFailure, _ := trace(t, err, options)
 
-		if repanic {
-			panic(r)
-		}
+	if repanic {
+		panic(recovered)
+	}
+	if killFailure != nil {
+		panic(killFailure)
 	}
 }
